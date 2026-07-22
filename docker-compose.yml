@@ -11,6 +11,8 @@ services:
     environment:
       PORNPIC_WEBUI_JOB_WORKERS: "2"
       PORNPIC_WEBUI_IMAGE_WORKERS: "6"
+      PORNPIC_WEBUI_FINDER_WORKERS: "1"
+      PORNPIC_WEBUI_FINDER_NETWORK_WORKERS: "3"
       PORNPIC_WEBUI_SORT_ROOT: /data/downloads
       PORNPIC_WEBUI_POSE_ROOT: /data/downloads/pose_pairs
 

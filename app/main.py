@@ -15,8 +15,16 @@ from . import __version__
 from .config import AppConfig, config as default_config
 from .db import Database, POSE_ROLES, PoseRevisionConflict
 from .downloader import ActiveDownloadError, DownloadManager, EventBroker
+from .finder import (
+    FinderConflict,
+    FinderNotFound,
+    FinderService,
+    FinderUnavailable,
+)
 from .models import (
     DownloadCreate,
+    FinderReviewPatch,
+    FinderScanCreate,
     GalleryPatch,
     LegacyDownloadRequest,
     LegacyIgnoreRequest,
@@ -55,6 +63,7 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
     events = EventBroker()
     downloads = DownloadManager(app_config, database, scraper, events)
     sorter = SorterService(app_config, database)
+    finder = FinderService(app_config, database, scraper, events)
     media_client: httpx.AsyncClient | None = None
 
     @asynccontextmanager
@@ -63,6 +72,7 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
         app_config.ensure_directories()
         database.initialize()
         sorter.ensure_schema()
+        finder.ensure_schema()
         stored = database.settings()
         request_timeout = stored.get("request_timeout")
         image_workers = stored.get("image_workers")
@@ -82,8 +92,10 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
         application.state.media_client = media_client
         try:
             await downloads.start()
+            await finder.start()
             yield
         finally:
+            await finder.stop()
             await downloads.stop()
             await media_client.aclose()
 
@@ -102,6 +114,7 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
     app.state.downloads = downloads
     app.state.events = events
     app.state.sorter = sorter
+    app.state.finder = finder
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
@@ -143,6 +156,18 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
     async def sort_not_found_handler(_: Request, exc: SortNotFound):
         return JSONResponse(status_code=404, content={"detail": str(exc)})
 
+    @app.exception_handler(FinderNotFound)
+    async def finder_not_found_handler(_: Request, exc: FinderNotFound):
+        return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+    @app.exception_handler(FinderConflict)
+    async def finder_conflict_handler(_: Request, exc: FinderConflict):
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.exception_handler(FinderUnavailable)
+    async def finder_unavailable_handler(_: Request, exc: FinderUnavailable):
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
+
     def media_url(remote_url: str) -> str:
         token = sign_media_url(remote_url, app_config.media_signing_key)
         return f"/api/media?url={quote(remote_url, safe='')}&token={token}"
@@ -156,6 +181,15 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
     def decorate_pose_draft(draft: dict) -> dict:
         draft["gallery_id"] = encode_gallery_id(draft["gallery_url"])
         return draft
+
+    def decorate_finder_result(item: dict) -> dict:
+        result = dict(item)
+        preview = result.pop("best_preview_remote_url", "")
+        thumbnail = result.pop("thumbnail_remote_url", "")
+        result["best_preview_url"] = media_url(preview) if preview else None
+        result["thumbnail_url"] = media_url(thumbnail) if thumbnail else None
+        result["gallery_id"] = encode_gallery_id(result["gallery_url"])
+        return result
 
     async def pose_gallery_images(gallery_url: str) -> list[dict]:
         images = database.gallery_images(gallery_url)
@@ -421,6 +455,76 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
             raise HTTPException(404, "Pose export job not found")
         job = downloads.cancel(job_id)
         return {"job": job}
+
+    @app.get("/api/finder/folders")
+    async def finder_folders() -> dict:
+        return {"items": await asyncio.to_thread(finder.folders)}
+
+    @app.get("/api/finder/status")
+    async def finder_status() -> dict:
+        return finder.status()
+
+    @app.post("/api/finder/scans", status_code=202)
+    async def create_finder_scan(payload: FinderScanCreate) -> dict:
+        scan = finder.create_scan(**payload.model_dump())
+        return {"scan": scan}
+
+    @app.get("/api/finder/scans")
+    async def list_finder_scans(
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict:
+        return {"items": finder.list_scans(limit)}
+
+    @app.get("/api/finder/scans/{scan_id}")
+    async def get_finder_scan(scan_id: str) -> dict:
+        scan = finder.get_scan(scan_id)
+        if not scan:
+            raise FinderNotFound("Finder scan not found")
+        return {"scan": scan}
+
+    @app.get("/api/finder/scans/{scan_id}/results")
+    async def finder_results(
+        scan_id: str,
+        review: str = Query(
+            default="pending", pattern="^(pending|accepted|rejected|all)$"
+        ),
+        min_score: float | None = Query(default=None, ge=0, le=1),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict:
+        items, total = finder.results(
+            scan_id,
+            review=review,
+            min_score=min_score,
+            limit=limit,
+            offset=offset,
+        )
+        return {
+            "items": [decorate_finder_result(item) for item in items],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    @app.patch("/api/finder/scans/{scan_id}/results/{result_id}")
+    async def review_finder_result(
+        scan_id: str, result_id: str, payload: FinderReviewPatch
+    ) -> dict:
+        item = finder.set_review(scan_id, result_id, payload.review)
+        return {"result": decorate_finder_result(item)}
+
+    @app.post("/api/finder/scans/{scan_id}/pause")
+    async def pause_finder_scan(scan_id: str) -> dict:
+        return {"scan": finder.pause(scan_id)}
+
+    @app.post("/api/finder/scans/{scan_id}/resume")
+    async def resume_finder_scan(scan_id: str) -> dict:
+        return {"scan": finder.resume(scan_id)}
+
+    @app.delete("/api/finder/scans/{scan_id}")
+    async def delete_finder_scan(scan_id: str) -> dict:
+        scan = finder.delete_or_cancel(scan_id)
+        return {"deleted": bool(scan.get("deleted")), "scan": scan}
 
     @app.get("/api/media")
     async def proxy_media(request: Request, url: str, token: str) -> StreamingResponse:

@@ -70,6 +70,18 @@ class PoseExportCreate(BaseModel):
     expected_revision: int = Field(ge=1)
 
 
+class FinderScanCreate(BaseModel):
+    example_directory: str = Field(min_length=1, max_length=500)
+    pose_tag_id: int = Field(gt=0)
+    source_url: str = Field(min_length=1, max_length=2_000)
+    page_limit: int = Field(default=5, ge=1, le=50)
+    minimum_score: float = Field(default=0.7, ge=0, le=1)
+
+
+class FinderReviewPatch(BaseModel):
+    review: Literal["pending", "accepted", "rejected"]
+
+
 class SettingsPatch(BaseModel):
     request_timeout: float | None = Field(default=None, ge=5, le=120)
     image_workers: int | None = Field(default=None, ge=1, le=24)

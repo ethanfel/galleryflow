@@ -1,8 +1,8 @@
 FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="GalleryFlow" \
-      org.opencontainers.image.description="Browser-only gallery downloader, pose-pair organizer, and visual sorter" \
-      org.opencontainers.image.version="2.1.0" \
+      org.opencontainers.image.description="Browser-only gallery downloader, visual pose finder, pose-pair organizer, and sorter" \
+      org.opencontainers.image.version="2.2.0" \
       org.opencontainers.image.source="https://github.com/ethanfel/galleryflow"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -11,6 +11,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORNPIC_WEBUI_DOWNLOAD_ROOT=/data/downloads
 
 WORKDIR /app
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app

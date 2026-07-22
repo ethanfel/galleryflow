@@ -7,6 +7,7 @@ A self-contained, server-side PornPics gallery browser and downloader. The compl
 - Browse the current PornPics catalog, search, paste a category URL, and keep loading additional pages into one portrait gallery grid.
 - Green complete, blue partial, and red ignored states, scoped correctly per profile.
 - Open original-resolution images in a full-screen lightbox with zoom and keyboard navigation, then download a whole gallery or select individual images in their original order.
+- Find hard-to-name poses from your own examples: a local DINOv2 vision model scans complete galleries, flags the gallery when any image is similar, and ranks the results by their best matching image.
 - Build training-ready pose pairs while browsing: assign one solo, couple, or group control to each target, add a pose tag, and export matched target/control folders with shared IDs.
 - Automatic profile folders with safe, server-controlled paths.
 - Persistent queue with live progress, cancellation, per-image results, retries for transient failures, and restart recovery.
@@ -94,6 +95,21 @@ services:
 
 Both `/data` and every mounted download, sorter, or pose-output directory must be writable by container UID/GID `10001:10001`. Do not include a space after the host path's colon in a Docker `-v` specification: use `/host/path:/pose-output`, not `/host/path: /pose-output`.
 
+Pose Finder reads confirmed examples from a separate, read-only mount. Put one pose in each subfolder, then expose their common parent to the container:
+
+```bash
+docker run -d --name galleryflow --restart unless-stopped \
+  -p 8100:8099 \
+  -v galleryflow-data:/data \
+  -v /path/to/pose-examples:/references:ro \
+  -e PORNPIC_WEBUI_FINDER_EXAMPLES_ROOT=/references \
+  ghcr.io/ethanfel/galleryflow:latest
+```
+
+There must be no space after either bind-mount colon. The examples need read permission, and their directories need traverse permission, for UID `10001`; GalleryFlow never changes them. The first scan needs outbound HTTPS access to Hugging Face and downloads the pinned 85 MB DINOv2-S ONNX model into `/data/models`, where the persistent data mount caches it for later scans. For an offline container, pre-provision the verified model at `/data/models/dinov2-small.onnx` instead.
+
+Finder uses the FP32 [DINOv2-S ONNX conversion](https://huggingface.co/onnx-community/dinov2-small-ONNX/tree/08c606e3123472a388efa59181b677d428f69bbd/onnx) pinned at revision `08c606e3123472a388efa59181b677d428f69bbd` and verifies SHA-256 `6266c3cd72db6953cecdcbfeab9422a9f783d96f1a4e296ba70ffbac43b54a18` before loading it. The upstream model is Apache-2.0 licensed; see the [Meta DINOv2 model card](https://github.com/facebookresearch/dinov2/blob/main/MODEL_CARD.md).
+
 ## Import the old history
 
 Always preview first:
@@ -148,6 +164,16 @@ Pairs are grouped by safe pose slug and use a shared deterministic ID:
 
 Gallery URLs and output paths are validated, symlinks and path traversal are rejected, and an existing file is never silently replaced. Re-exporting the same unchanged pair is idempotent. Changed content, a different role/control, or moving the same gallery image to another pose reports a conflict instead of overwriting the dataset. A failed or canceled multi-pair export rolls back only the files newly created by that job.
 
+## Pose Finder
+
+Open **Finder**, choose a folder containing images of one pose, select or create its pose tag, and enter the PornPics page from which scanning should begin. The page can be the home page, a search result, a category, or another supported browse page. Set the number of pages and the minimum similarity, then start the background scan.
+
+Finder opens every listed gallery and compares all of its preview images against all examples in the selected folder, including mirrored examples. A gallery is flagged when at least one image crosses the threshold. Its score is exactly the best individual-image cosine similarity; images from a gallery are not averaged together. Scores are useful for ranking candidates but are not statistical probabilities.
+
+Results remain ordinary galleries. **Open gallery** loads the complete gallery in Pose dataset mode, checks and highlights the matching image, and fills in the pose tag. You can then find the related solo, couple, or group control image in the same gallery and explicitly apply or export the pair. Accepting or rejecting a Finder suggestion only changes that scan's review state; it never downloads, globally ignores, or silently tags a gallery.
+
+Scans and results live in SQLite and survive browser or container restarts. They can be paused, resumed, canceled, and filtered by review state or similarity. Image embeddings are cached, so rescanning an unchanged image avoids another model pass.
+
 ## Configuration
 
 Environment variables:
@@ -158,6 +184,15 @@ Environment variables:
 | `PORNPIC_WEBUI_DOWNLOAD_ROOT` | `./data/downloads` | Profile libraries |
 | `PORNPIC_WEBUI_SORT_ROOT` | download root | Highest server folder exposed to the visual sorter |
 | `PORNPIC_WEBUI_POSE_ROOT` | `<sort-root>/pose_pairs` | Training-ready pose-pair datasets |
+| `PORNPIC_WEBUI_FINDER_EXAMPLES_ROOT` | `<data-dir>/references` | Read-only root containing Finder example folders |
+| `PORNPIC_WEBUI_FINDER_MODEL_PATH` | `<data-dir>/models/dinov2-small.onnx` | Cached or pre-provisioned DINOv2-S ONNX model |
+| `PORNPIC_WEBUI_FINDER_WORKERS` | `1` | Concurrent background Finder scans (maximum 2) |
+| `PORNPIC_WEBUI_FINDER_NETWORK_WORKERS` | `3` | Concurrent Finder preview requests (maximum 8) |
+| `PORNPIC_WEBUI_FINDER_REQUEST_DELAY` | `0.15` | Minimum delay between Finder network requests in seconds |
+| `PORNPIC_WEBUI_FINDER_MAX_EXAMPLES` | `500` | Maximum reference images in one example folder |
+| `PORNPIC_WEBUI_FINDER_MAX_GALLERY_IMAGES` | `2000` | Maximum images scored in one source gallery |
+| `PORNPIC_WEBUI_FINDER_MAX_IMAGE_BYTES` | `12582912` | Per-image Finder byte ceiling |
+| `PORNPIC_WEBUI_FINDER_MAX_IMAGE_PIXELS` | `40000000` | Per-image Finder decoded-pixel ceiling |
 | `PORNPIC_WEBUI_JOB_WORKERS` | `2` | Concurrent gallery jobs |
 | `PORNPIC_WEBUI_IMAGE_WORKERS` | `6` | Global concurrent image requests |
 | `PORNPIC_WEBUI_REQUEST_TIMEOUT` | `25` | Browse timeout in seconds |
@@ -173,6 +208,10 @@ Concurrency and theme can also be adjusted in the WebUI. A changed gallery-worke
 ```text
 data/
 ├── pornpic_webui.sqlite3
+├── models/
+│   └── dinov2-small.onnx
+├── references/
+│   └── <pose examples>/
 └── downloads/
     ├── pose_pairs/
     │   └── <pose-slug>/

@@ -43,6 +43,7 @@
     poseSavePromise: null,
     poseMutation: 0,
     poseAssignment: 'target',
+    galleryContext: null,
     lightboxIndex: -1,
     lightboxZoomed: false,
     lightboxTrigger: null,
@@ -57,9 +58,22 @@
     eventConnected: false,
     queueTimer: null,
     jobEventTimer: null,
+    finderEventTimer: null,
+    finderPollTimer: null,
     healthTimer: null,
     requestController: null,
     galleryObserver: null,
+    finderFolders: [],
+    finderTags: [],
+    finderStatus: null,
+    finderScans: [],
+    finderScan: null,
+    finderScanId: storage.get('finder-scan', ''),
+    finderResults: [],
+    finderReview: 'pending',
+    finderLoaded: false,
+    finderLoading: false,
+    finderBusy: false,
     sortFolders: [],
     sortProfiles: [],
     sortSession: null,
@@ -70,6 +84,7 @@
   };
 
   const POSE_ROLES = ['solo', 'couple', 'group'];
+  const FINDER_TERMINAL_STATES = ['completed', 'complete', 'done', 'failed', 'cancelled', 'canceled'];
   const poseRoleLabel = role => ({ solo: 'Solo', couple: 'Couple', group: 'Group' }[role] || 'Solo');
 
   class ApiError extends Error {
@@ -355,6 +370,20 @@
         } else if (state.view === 'discover') loadGalleries({ quiet: true });
       } catch (_) { /* the next refresh will reconcile state */ }
     });
+    const refreshFinderFromEvent = event => {
+      if (!state.finderScanId || state.finderEventTimer !== null) return;
+      try {
+        const change = JSON.parse(event.data || '{}');
+        const changedId = change.scan_id ?? change.id ?? change.scan?.id;
+        if (changedId !== undefined && String(changedId) !== String(state.finderScanId)) return;
+      } catch (_) { /* refresh the active scan when an event has no JSON payload */ }
+      state.finderEventTimer = window.setTimeout(() => {
+        state.finderEventTimer = null;
+        loadFinderScan({ quiet: true });
+      }, 180);
+    };
+    source.addEventListener('finder', refreshFinderFromEvent);
+    source.addEventListener('finder_scan', refreshFinderFromEvent);
     source.addEventListener('settings', () => loadSettings());
   }
 
@@ -846,7 +875,24 @@
     } finally { if (button) button.disabled = false; }
   }
 
-  async function openGallery(id) {
+  function finderSuggestionForImage(image, index) {
+    const suggestions = Array.isArray(state.galleryContext?.suggestions) ? state.galleryContext.suggestions : [];
+    return suggestions.find(suggestion => {
+      const targetUrl = String(suggestion.imageUrl || suggestion.image_url || '');
+      return (targetUrl && [image.url, image.fullUrl, image.previewUrl].includes(targetUrl))
+        || (Number(suggestion.ordinal || 0) === index + 1);
+    }) || null;
+  }
+
+  function scrollToFinderSuggestion() {
+    if (!state.galleryContext?.suggestions?.length) return;
+    window.requestAnimationFrame(() => {
+      const option = $$('.image-option', $('#image-grid')).find(item => item.classList.contains('is-finder-suggestion'));
+      option?.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'smooth' });
+    });
+  }
+
+  async function openGallery(id, context = null) {
     if (state.poseLoadedKey && (state.poseDirty || state.poseSaving)) {
       await flushPoseDraft();
       if (state.poseDirty) {
@@ -854,12 +900,14 @@
         return;
       }
     }
-    const summary = state.galleries.find(item => String(item.id) === String(id));
+    const summarySource = context?.summary || state.galleries.find(item => String(item.id) === String(id));
+    const summary = summarySource ? normalizeGallery(summarySource) : null;
     if (!summary) return;
     window.clearTimeout(state.poseSaveTimer);
     state.poseSaving = false;
     state.poseSavePromise = null;
     state.poseLoading = false;
+    state.galleryContext = context ? { ...context, suggestions: Array.isArray(context.suggestions) ? context.suggestions : [] } : null;
     state.gallery = { ...summary, images: [] };
     state.selectedImages = new Set();
     state.poseSelectedImages = new Set();
@@ -869,7 +917,11 @@
     state.poseDirty = false;
     state.poseMutation = 0;
     window.clearTimeout(state.poseSaveTimer);
-    setGalleryMode('download', { load: false, render: false });
+    $('#pose-tag-input').value = '';
+    $('#pose-control-role').value = 'solo';
+    const requestedMode = context?.mode === 'pose' ? 'pose' : 'download';
+    if (requestedMode === 'pose' && state.galleryContext?.suggestions.length) state.poseAssignment = 'target';
+    setGalleryMode(requestedMode, { load: false, render: false });
     state.loadingDetail = true;
     $('#gallery-modal-title').textContent = summary.title;
     $('#gallery-modal-kicker').textContent = 'Loading gallery';
@@ -887,11 +939,21 @@
       if (listItem) Object.assign(listItem, { saved: state.gallery.saved, ignored: state.gallery.ignored, imageCount: state.gallery.imageCount, thumbnailUrl: state.gallery.thumbnailUrl || listItem.thumbnailUrl });
       const pendingImages = state.gallery.images.filter(image => !image.downloaded);
       state.selectedImages = new Set((pendingImages.length ? pendingImages : state.gallery.images).map(image => image.url));
+      if (requestedMode === 'pose') {
+        state.poseSelectedImages = new Set(state.gallery.images
+          .map((image, index) => finderSuggestionForImage(image, index) ? image.url : '')
+          .filter(Boolean));
+        const poseTag = context?.poseTag;
+        if (poseTag?.label) $('#pose-tag-input').value = poseTag.label;
+        $('#pose-control-role').value = POSE_ROLES.includes(poseTag?.defaultRole) ? poseTag.defaultRole : 'solo';
+        setGalleryMode('pose', { load: true, render: false });
+      }
       renderGallerySummary();
       renderImages();
       renderGalleries();
       $('#gallery-modal-kicker').textContent = displayHost(state.gallery.url);
       $('#gallery-modal-title').textContent = state.gallery.title;
+      if (requestedMode === 'pose') scrollToFinderSuggestion();
     } catch (error) {
       $('#image-grid').replaceChildren();
       $('#images-empty').hidden = false;
@@ -1409,6 +1471,16 @@
         option.append(saved);
       }
       renderPoseBadge(option, image);
+      const finderSuggestion = finderSuggestionForImage(image, index);
+      if (finderSuggestion) {
+        option.classList.add('is-finder-suggestion');
+        const badge = document.createElement('span');
+        badge.className = 'finder-suggestion-badge';
+        const score = Number(finderSuggestion.score);
+        badge.innerHTML = '<svg><use href="#i-spark"></use></svg><span></span>';
+        $('span', badge).textContent = Number.isFinite(score) ? `Finder · ${score.toFixed(2)} similarity` : 'Finder suggestion';
+        option.append(badge);
+      }
       grid.append(option);
     });
     updateSelectionUi();
@@ -1716,6 +1788,625 @@
     const failures = results.filter(result => result.status === 'rejected').length;
     if (failures) toast('Some transfers could not be cleared', `${failures} entries remain.`, 'error');
     else toast('Completed transfers cleared', `${jobs.length} ${jobs.length === 1 ? 'entry' : 'entries'} removed.`, 'info');
+  }
+
+  function normalizeFinderFolder(item) {
+    if (typeof item === 'string') return { path: item, name: item.split('/').filter(Boolean).pop() || item, imageCount: 0 };
+    const path = String(item?.path || item?.relative_path || item?.directory || '');
+    return {
+      ...item,
+      path,
+      name: String(item?.name || path.split('/').filter(Boolean).pop() || path || 'Examples'),
+      imageCount: Number(item?.image_count ?? item?.count ?? item?.images ?? 0)
+    };
+  }
+
+  function normalizeFinderStatus(item) {
+    const data = item?.finder || item || {};
+    const model = data.model && typeof data.model === 'object' ? data.model : {};
+    const rawStatus = typeof data.status === 'string' ? data.status : typeof model.status === 'string' ? model.status : '';
+    const status = String(rawStatus || (data.ready || data.available || model.ready || model.available ? 'ready' : 'unavailable')).toLowerCase();
+    const serviceAvailable = data.available ?? model.available;
+    const reportedModelReady = data.model_ready ?? model.model_ready ?? data.ready ?? model.ready;
+    const modelReady = reportedModelReady === undefined ? Boolean(serviceAvailable) : Boolean(reportedModelReady);
+    const ready = serviceAvailable !== undefined
+      ? Boolean(serviceAvailable)
+      : reportedModelReady === undefined ? ['ready', 'available', 'loaded', 'ok'].includes(status) : modelReady;
+    const details = [
+      data.detail || data.message || model.detail || model.description || '',
+      data.device || model.device || '',
+      data.backend || model.backend || ''
+    ].filter(Boolean);
+    return {
+      ready,
+      modelReady,
+      status,
+      name: String(data.model_name || model.name || model.label || data.name || String(data.model_path || '').split('/').pop() || 'Similarity model'),
+      detail: details.join(' · ') || (modelReady ? 'Ready to compare images' : ready ? 'Model downloads automatically on the first scan' : data.error || model.error || 'Model unavailable'),
+      defaultSourceUrl: String(data.default_source_url || data.source_url || '')
+    };
+  }
+
+  function normalizeFinderReview(value) {
+    const review = String(value || 'pending').toLowerCase();
+    if (['accepted', 'accept', 'approved'].includes(review)) return 'accepted';
+    if (['rejected', 'reject', 'dismissed'].includes(review)) return 'rejected';
+    return 'pending';
+  }
+
+  function normalizeFinderScan(item) {
+    if (!item) return null;
+    const scan = item.scan || item;
+    const config = scan.config || {};
+    const progress = scan.progress && typeof scan.progress === 'object' ? scan.progress : {};
+    const reviewCounts = scan.review_counts || scan.counts || {};
+    let percentage = Number(scan.progress_percent ?? progress.percent ?? (typeof scan.progress === 'number' ? scan.progress : NaN));
+    const pagesTotal = Number(scan.pages_total ?? scan.total_pages ?? scan.page_limit ?? config.page_limit ?? config.pages ?? scan.pages ?? 0);
+    const pagesScanned = Number(scan.pages_completed ?? scan.pages_scanned ?? scan.completed_pages ?? progress.pages_completed ?? progress.pages_scanned ?? progress.completed ?? scan.current_page ?? 0);
+    if (!Number.isFinite(percentage)) percentage = pagesTotal ? (pagesScanned / pagesTotal) * 100 : 0;
+    if (percentage > 0 && percentage <= 1) percentage *= 100;
+    const poseTag = scan.pose_tag && typeof scan.pose_tag === 'object' ? scan.pose_tag : {};
+    return {
+      ...scan,
+      id: scan.id ?? scan.scan_id,
+      status: String(scan.status || scan.state || 'queued').toLowerCase(),
+      examplesFolder: String(scan.example_directory || scan.examples_folder || config.example_directory || config.examples_folder || scan.folder || ''),
+      poseTagId: scan.pose_tag_id ?? config.pose_tag_id ?? poseTag.id,
+      poseTagLabel: String(scan.pose_tag_label || config.pose_tag_label || poseTag.label || poseTag.name || ''),
+      poseTagSlug: String(scan.pose_tag_slug || poseTag.slug || ''),
+      poseDefaultRole: POSE_ROLES.includes(scan.pose_default_role || poseTag.default_role) ? (scan.pose_default_role || poseTag.default_role) : 'solo',
+      sourceUrl: String(scan.source_url || config.source_url || scan.url || ''),
+      pages: Number(scan.page_limit ?? config.page_limit ?? pagesTotal),
+      pagesScanned,
+      galleriesScanned: Number(scan.processed_galleries ?? scan.galleries_scanned ?? progress.processed_galleries ?? progress.galleries_scanned ?? progress.galleries ?? 0),
+      imagesScanned: Number(scan.processed_images ?? scan.images_scanned ?? progress.processed_images ?? progress.images_scanned ?? progress.images ?? 0),
+      totalGalleries: Number(scan.total_galleries ?? progress.total_galleries ?? 0),
+      failedGalleries: Number(scan.failed_galleries ?? progress.failed_galleries ?? 0),
+      candidateCount: Number(scan.candidate_count ?? scan.results_count ?? progress.candidates ?? reviewCounts.total ?? 0),
+      pendingCount: Number(scan.pending_count ?? reviewCounts.pending ?? 0),
+      acceptedCount: Number(scan.accepted_count ?? reviewCounts.accepted ?? 0),
+      rejectedCount: Number(scan.rejected_count ?? reviewCounts.rejected ?? 0),
+      minSimilarity: Number(scan.minimum_score ?? scan.min_similarity ?? scan.minimum_similarity ?? config.minimum_score ?? config.min_similarity ?? config.minimum_similarity ?? 0.65),
+      percentage: Math.max(0, Math.min(100, percentage)),
+      error: String(scan.error || scan.error_message || ''),
+      createdAt: scan.created_at || scan.started_at || '',
+      updatedAt: scan.updated_at || scan.finished_at || ''
+    };
+  }
+
+  function encodeFinderGalleryId(url) {
+    try {
+      const bytes = new TextEncoder().encode(String(url || ''));
+      let binary = '';
+      bytes.forEach(byte => { binary += String.fromCharCode(byte); });
+      return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+    } catch (_) { return ''; }
+  }
+
+  function normalizeFinderResult(item, index = 0) {
+    const source = item?.gallery && typeof item.gallery === 'object' ? item.gallery : {};
+    const best = item?.best_match && typeof item.best_match === 'object' ? item.best_match : {};
+    const galleryUrl = item?.gallery_url || source.url || source.gallery_url || '';
+    const galleryId = item?.gallery_id ?? source.gallery_id ?? source.id ?? encodeFinderGalleryId(galleryUrl);
+    const gallery = normalizeGallery({
+      ...source,
+      id: galleryId,
+      gallery_id: galleryId,
+      url: galleryUrl,
+      title: item?.title || source.title || source.name || 'Untitled gallery',
+      thumbnail_url: item?.best_preview_url || best.preview_url || source.thumbnail_url || source.thumbnail || '',
+      image_count: item?.image_count ?? source.image_count ?? source.total_images ?? 0
+    });
+    const score = Number(item?.score ?? item?.similarity ?? best.score ?? best.similarity ?? 0);
+    return {
+      ...gallery,
+      key: item?.result_id ?? item?.id ?? galleryId,
+      galleryId,
+      rank: Number(item?.rank ?? index + 1),
+      score: Number.isFinite(score) ? Math.max(0, Math.min(1, score)) : 0,
+      review: normalizeFinderReview(item?.review ?? item?.review_status),
+      bestImageUrl: String(item?.best_image_url || best.image_url || best.url || ''),
+      bestPreviewUrl: String(item?.best_preview_url || best.preview_url || gallery.thumbnailUrl || ''),
+      bestOrdinal: Number(item?.best_ordinal ?? best.ordinal ?? best.image_ordinal ?? 0),
+      matchCount: Number(item?.images_scored ?? item?.match_count ?? item?.matching_images ?? item?.candidate_images ?? 1)
+    };
+  }
+
+  function finderScanIsTerminal(scan = state.finderScan) {
+    return !scan || FINDER_TERMINAL_STATES.includes(scan.status);
+  }
+
+  function finderScanIsRunning(scan = state.finderScan) {
+    return Boolean(scan) && ['queued', 'starting', 'preparing', 'running', 'scanning', 'active'].includes(scan.status);
+  }
+
+  function finderDefaultSource() {
+    return state.sourceUrl || state.finderStatus?.defaultSourceUrl || state.settings.source_home || state.settings.default_source_url || 'https://www.pornpics.com/';
+  }
+
+  function finderTagForInput(value) {
+    const query = String(value || '').trim().toLocaleLowerCase();
+    if (!query) return null;
+    return state.finderTags.find(tag => tag.label.toLocaleLowerCase() === query || tag.slug.toLocaleLowerCase() === query) || null;
+  }
+
+  function renderFinderFolders() {
+    const select = $('#finder-folder');
+    const selected = select.value;
+    select.replaceChildren(new Option(state.finderFolders.length ? 'Choose an examples folder…' : 'No example folders found', ''));
+    state.finderFolders.forEach(folder => {
+      const count = folder.imageCount ? ` · ${formatNumber(folder.imageCount)} images` : '';
+      select.add(new Option(`${folder.name}${count}`, folder.path));
+    });
+    if (state.finderFolders.some(folder => folder.path === selected)) select.value = selected;
+  }
+
+  function renderFinderTags() {
+    const list = $('#finder-pose-tag-options');
+    list.replaceChildren();
+    [...state.finderTags].sort((a, b) => a.label.localeCompare(b.label)).forEach(tag => {
+      const option = document.createElement('option');
+      option.value = tag.label;
+      option.label = `${tag.label} · ${poseRoleLabel(tag.defaultRole)} control`;
+      list.append(option);
+    });
+  }
+
+  function renderFinderStatus() {
+    const model = state.finderStatus;
+    const card = $('#finder-model-card');
+    card.classList.toggle('is-ready', Boolean(model?.ready));
+    card.classList.toggle('is-error', Boolean(model && !model.ready));
+    $('#finder-model-name').textContent = model?.name || 'Model unavailable';
+    $('#finder-model-detail').textContent = model?.detail || 'Could not read model status';
+    $('#finder-model-state').textContent = model?.modelReady ? 'Ready' : model?.ready ? 'Available' : model ? model.status.replaceAll('_', ' ') : 'Offline';
+  }
+
+  function renderFinderScans() {
+    const select = $('#finder-scan-select');
+    const selected = state.finderScanId ? String(state.finderScanId) : '';
+    select.replaceChildren(new Option('New scan', ''));
+    const scans = [...state.finderScans];
+    if (state.finderScan?.id && !scans.some(scan => String(scan.id) === String(state.finderScan.id))) scans.unshift(state.finderScan);
+    scans.forEach(scan => {
+      const date = scan.createdAt ? relativeTime(scan.createdAt) : '';
+      const label = `${scan.poseTagLabel || 'Pose scan'} · ${scan.status.replaceAll('_', ' ')}${date ? ` · ${date}` : ''}`;
+      select.add(new Option(label, String(scan.id)));
+    });
+    if ([...select.options].some(option => option.value === selected)) select.value = selected;
+  }
+
+  function syncFinderConfigAvailability() {
+    const locked = Boolean(state.finderScan && !finderScanIsTerminal());
+    ['finder-folder', 'finder-pose-tag', 'finder-source', 'finder-pages', 'finder-min-similarity'].forEach(id => { $(`#${id}`).disabled = locked || state.finderBusy; });
+    $('#finder-use-current').disabled = locked || state.finderBusy;
+    const hasConfig = Boolean($('#finder-folder').value && $('#finder-pose-tag').value.trim() && $('#finder-source').value.trim());
+    $('#finder-start').hidden = locked;
+    $('#finder-start').disabled = state.finderLoading || state.finderBusy || !state.finderStatus?.ready || !hasConfig;
+  }
+
+  function applyFinderScanConfig(scan) {
+    if (!scan) return;
+    $('#finder-folder').value = scan.examplesFolder;
+    $('#finder-pose-tag').value = scan.poseTagLabel;
+    $('#finder-source').value = scan.sourceUrl || finderDefaultSource();
+    $('#finder-pages').value = Math.max(1, Math.min(50, scan.pages || 5));
+    $('#finder-min-similarity').value = scan.minSimilarity.toFixed(2);
+    $('#finder-result-threshold').value = scan.minSimilarity.toFixed(2);
+    $('#finder-min-output').textContent = scan.minSimilarity.toFixed(2);
+    $('#finder-filter-output').textContent = scan.minSimilarity.toFixed(2);
+  }
+
+  function renderFinderResults() {
+    const ranked = [...state.finderResults].sort((a, b) => b.score - a.score || a.rank - b.rank);
+    const counts = {
+      pending: ranked.filter(result => result.review === 'pending').length,
+      accepted: ranked.filter(result => result.review === 'accepted').length,
+      rejected: ranked.filter(result => result.review === 'rejected').length
+    };
+    $('#finder-pending-count').textContent = formatNumber(counts.pending);
+    $('#finder-accepted-count').textContent = formatNumber(counts.accepted);
+    $('#finder-rejected-count').textContent = formatNumber(counts.rejected);
+    $$('[data-finder-review]').forEach(button => {
+      const active = button.dataset.finderReview === state.finderReview;
+      button.classList.toggle('is-active', active);
+      button.setAttribute('aria-selected', String(active));
+    });
+    const threshold = Number($('#finder-result-threshold').value || 0);
+    $('#finder-filter-output').textContent = threshold.toFixed(2);
+    const results = ranked.filter(result => result.review === state.finderReview && result.score >= threshold);
+    const grid = $('#finder-result-grid');
+    grid.replaceChildren();
+    results.forEach(result => {
+      const fragment = $('#finder-card-template').content.cloneNode(true);
+      const card = $('.finder-card', fragment);
+      card.dataset.finderResult = String(result.key);
+      card.classList.toggle('is-high', result.score >= 0.85);
+      card.classList.toggle('is-likely', result.score >= 0.70 && result.score < 0.85);
+      card.classList.toggle('is-explore', result.score < 0.70);
+      card.classList.toggle('is-accepted', result.review === 'accepted');
+      card.classList.toggle('is-rejected', result.review === 'rejected');
+      loadImage($('.card-image img', card), result.bestPreviewUrl, `${result.title}, best matching image`);
+      $('.finder-rank', card).textContent = `#${String(result.rank || ranked.indexOf(result) + 1).padStart(2, '0')}`;
+      $('.finder-similarity', card).textContent = `${result.score.toFixed(2)} similarity`;
+      $('.finder-ordinal', card).textContent = result.bestOrdinal ? `Image ${String(result.bestOrdinal).padStart(2, '0')}` : 'Best image';
+      $('.finder-card-title', card).textContent = result.title;
+      const matchCopy = `${formatNumber(result.matchCount)} ${result.matchCount === 1 ? 'image' : 'images'} compared`;
+      $('.finder-card-copy p', card).textContent = `${matchCopy}${result.imageCount ? ` · ${formatNumber(result.imageCount)} total` : ''}`;
+      $$('.finder-card-open', card).forEach(button => {
+        button.dataset.finderAction = 'open';
+        button.dataset.finderResult = String(result.key);
+      });
+      $$('[data-finder-action]', card).forEach(button => { button.dataset.finderResult = String(result.key); });
+      const accept = $('.finder-accept', card);
+      const reject = $('.finder-reject', card);
+      accept.classList.toggle('is-active', result.review === 'accepted');
+      reject.classList.toggle('is-active', result.review === 'rejected');
+      accept.disabled = state.finderBusy || result.review === 'accepted';
+      reject.disabled = state.finderBusy || result.review === 'rejected';
+      grid.append(fragment);
+    });
+    const empty = $('#finder-empty');
+    empty.hidden = Boolean(results.length);
+    if (!results.length) {
+      $('h3', empty).textContent = state.finderResults.length ? 'No candidates in this view' : finderScanIsRunning() ? 'Scanning for candidates…' : 'No candidates found';
+      $('p', empty).textContent = state.finderResults.length
+        ? 'Lower the display threshold or choose another review tab.'
+        : finderScanIsRunning()
+          ? 'Results will appear here as galleries are compared.'
+          : 'Try more examples, a lower minimum similarity, or a wider source.';
+    }
+  }
+
+  function renderFinderWorkspace() {
+    renderFinderFolders();
+    renderFinderTags();
+    renderFinderStatus();
+    renderFinderScans();
+    const scan = state.finderScan;
+    const hasScan = Boolean(scan?.id);
+    $('#finder-welcome').hidden = hasScan;
+    $('#finder-results').hidden = !hasScan;
+    $('#finder-progress-wrap').hidden = !hasScan;
+    $('#finder-pause').hidden = !finderScanIsRunning(scan);
+    $('#finder-resume').hidden = scan?.status !== 'paused';
+    $('#finder-cancel').hidden = !hasScan || finderScanIsTerminal(scan) || scan?.status === 'canceling';
+    ['finder-pause', 'finder-resume', 'finder-cancel'].forEach(id => { $(`#${id}`).disabled = state.finderBusy; });
+    if (!hasScan) {
+      $('#finder-session-label').textContent = 'Configure a scan to begin';
+      syncFinderConfigAvailability();
+      return;
+    }
+    const status = scan.status.replaceAll('_', ' ');
+    $('#finder-session-label').textContent = `${scan.poseTagLabel || 'Pose scan'} · ${status}`;
+    $('#finder-pages-scanned').textContent = formatNumber(scan.pagesScanned);
+    $('#finder-pages-total').textContent = formatNumber(scan.pages || 0);
+    $('#finder-galleries-scanned').textContent = scan.totalGalleries
+      ? `${formatNumber(scan.galleriesScanned)} / ${formatNumber(scan.totalGalleries)}`
+      : formatNumber(scan.galleriesScanned);
+    $('#finder-images-scanned').textContent = formatNumber(scan.imagesScanned);
+    const visibleCandidates = state.finderResults.filter(result => result.score >= scan.minSimilarity).length;
+    $('#finder-candidates-found').textContent = formatNumber(Math.max(scan.candidateCount, visibleCandidates));
+    $('#finder-progress-state').textContent = `${status[0]?.toUpperCase() + status.slice(1)}${scan.failedGalleries ? ` · ${formatNumber(scan.failedGalleries)} failed` : ''}`;
+    $('#finder-progress-bar').style.width = `${scan.percentage}%`;
+    $('.finder-progress').setAttribute('aria-valuenow', String(Math.round(scan.percentage)));
+    $('#finder-scan-error').hidden = !scan.error;
+    $('#finder-scan-error').textContent = scan.error;
+    renderFinderResults();
+    syncFinderConfigAvailability();
+  }
+
+  function readFinderConfig({ validate = false } = {}) {
+    const exampleDirectory = $('#finder-folder').value;
+    const tagLabel = $('#finder-pose-tag').value.trim().replace(/\s+/g, ' ');
+    const sourceInput = $('#finder-source').value.trim();
+    const sourceUrl = /^https?:\/\//i.test(sourceInput) ? safeUrl(sourceInput) : '';
+    const requestedPages = Number.parseInt($('#finder-pages').value || '5', 10);
+    const pageLimit = Math.max(1, Math.min(50, Number.isFinite(requestedPages) ? requestedPages : 5));
+    const minimumScore = Math.max(0.4, Math.min(0.95, Number($('#finder-min-similarity').value || 0.65)));
+    if (validate && !exampleDirectory) {
+      toast('Choose an examples folder', 'Select the server folder that demonstrates this pose.', 'info');
+      $('#finder-folder').focus();
+      return null;
+    }
+    if (validate && !tagLabel) {
+      toast('Name the pose', 'Choose an existing pose tag or enter a new one.', 'info');
+      $('#finder-pose-tag').focus();
+      return null;
+    }
+    if (validate && !sourceUrl) {
+      toast('Enter a source URL', 'Use a complete http or https gallery, category, model, search, or home URL.', 'info');
+      $('#finder-source').focus();
+      return null;
+    }
+    if (validate && !state.finderStatus?.ready) {
+      toast('Finder model is not ready', state.finderStatus?.detail || 'Refresh after the model becomes available.', 'info');
+      return null;
+    }
+    $('#finder-pages').value = String(pageLimit);
+    return { exampleDirectory, tagLabel, sourceUrl, pageLimit, minimumScore };
+  }
+
+  async function ensureFinderPoseTag(label) {
+    const existing = finderTagForInput(label);
+    if (existing) return existing;
+    const data = await api('/api/pose-tags', { method: 'POST', body: { label, default_role: 'solo' } });
+    const tag = normalizePoseTag(data?.tag || data);
+    if (tag.id === undefined || !tag.label) throw new ApiError('The server did not return the new pose tag.');
+    state.finderTags.push(tag);
+    renderFinderTags();
+    toast('Pose created', `${tag.label} defaults to the ${poseRoleLabel(tag.defaultRole).toLowerCase()} control.`, 'success');
+    return tag;
+  }
+
+  function scheduleFinderPoll(delay = null) {
+    window.clearTimeout(state.finderPollTimer);
+    state.finderPollTimer = null;
+    if (!state.finderScanId || finderScanIsTerminal()) return;
+    const fallback = state.finderScan?.status === 'paused' ? 12000 : state.eventConnected ? 5000 : 1800;
+    state.finderPollTimer = window.setTimeout(() => loadFinderScan({ quiet: true }), delay ?? fallback);
+  }
+
+  async function loadFinderResults({ quiet = false } = {}) {
+    const scanId = state.finderScanId;
+    if (!scanId) {
+      state.finderResults = [];
+      renderFinderWorkspace();
+      return;
+    }
+    $('#finder-result-grid').setAttribute('aria-busy', 'true');
+    try {
+      const data = await api(withParams(`/api/finder/scans/${encodeURIComponent(scanId)}/results`, {
+        review: 'all',
+        min_score: 0,
+        limit: 500
+      }));
+      if (String(scanId) !== String(state.finderScanId)) return;
+      state.finderResults = apiItems(data, 'results').map(normalizeFinderResult);
+      renderFinderWorkspace();
+    } catch (error) {
+      if (!quiet) toast('Could not load Finder results', errorMessage(error), 'error');
+    } finally {
+      $('#finder-result-grid').setAttribute('aria-busy', 'false');
+    }
+  }
+
+  async function loadFinderScan({ quiet = false, applyConfig = false } = {}) {
+    const scanId = state.finderScanId;
+    if (!scanId) {
+      state.finderScan = null;
+      state.finderResults = [];
+      renderFinderWorkspace();
+      return;
+    }
+    try {
+      const data = await api(`/api/finder/scans/${encodeURIComponent(scanId)}`);
+      if (String(scanId) !== String(state.finderScanId)) return;
+      const scan = normalizeFinderScan(data?.scan || data);
+      if (!scan?.id) throw new ApiError('The server returned an invalid Finder scan.');
+      state.finderScan = scan;
+      const existing = state.finderScans.findIndex(item => String(item.id) === String(scan.id));
+      if (existing >= 0) state.finderScans[existing] = scan;
+      else state.finderScans.unshift(scan);
+      if (applyConfig) applyFinderScanConfig(scan);
+      renderFinderWorkspace();
+      await loadFinderResults({ quiet: true });
+      scheduleFinderPoll();
+    } catch (error) {
+      if (error.status === 404) {
+        state.finderScan = null;
+        state.finderScanId = '';
+        state.finderResults = [];
+        storage.set('finder-scan', '');
+        renderFinderWorkspace();
+      } else if (!quiet) toast('Could not load Finder scan', errorMessage(error), 'error');
+      scheduleFinderPoll(8000);
+    }
+  }
+
+  async function loadFinderWorkspace({ quiet = false } = {}) {
+    if (state.finderLoading) return;
+    state.finderLoading = true;
+    syncFinderConfigAvailability();
+    const requests = await Promise.allSettled([
+      api('/api/finder/folders'),
+      api('/api/finder/status'),
+      api('/api/pose-tags'),
+      api('/api/finder/scans')
+    ]);
+    const [foldersResult, statusResult, tagsResult, scansResult] = requests;
+    if (foldersResult.status === 'fulfilled') state.finderFolders = apiItems(foldersResult.value, 'folders').map(normalizeFinderFolder).filter(folder => folder.path);
+    if (statusResult.status === 'fulfilled') state.finderStatus = normalizeFinderStatus(statusResult.value);
+    else state.finderStatus = null;
+    if (tagsResult.status === 'fulfilled') state.finderTags = apiItems(tagsResult.value).map(normalizePoseTag).filter(tag => tag.id !== undefined && tag.label);
+    if (scansResult.status === 'fulfilled') state.finderScans = apiItems(scansResult.value, 'scans').map(normalizeFinderScan).filter(scan => scan?.id);
+    state.finderLoaded = foldersResult.status === 'fulfilled' || scansResult.status === 'fulfilled';
+    if (!$('#finder-source').value.trim()) $('#finder-source').value = finderDefaultSource();
+    const stored = state.finderScanId && state.finderScans.find(scan => String(scan.id) === String(state.finderScanId));
+    const active = state.finderScans.find(scan => !finderScanIsTerminal(scan));
+    const selected = stored || active || state.finderScans[0] || null;
+    if (selected?.id) {
+      state.finderScanId = selected.id;
+      storage.set('finder-scan', state.finderScanId);
+    }
+    renderFinderWorkspace();
+    state.finderLoading = false;
+    syncFinderConfigAvailability();
+    if (selected?.id) await loadFinderScan({ quiet: true, applyConfig: true });
+    const failures = requests.filter(result => result.status === 'rejected');
+    if (!quiet && failures.length) toast('Some Finder options are unavailable', errorMessage(failures[0].reason), 'error');
+  }
+
+  async function startFinderScan() {
+    const config = readFinderConfig({ validate: true });
+    if (!config || state.finderBusy) return;
+    const button = $('#finder-start');
+    state.finderBusy = true;
+    setButtonBusy(button, true, 'Starting…');
+    try {
+      const tag = await ensureFinderPoseTag(config.tagLabel);
+      const data = await api('/api/finder/scans', {
+        method: 'POST',
+        body: {
+          example_directory: config.exampleDirectory,
+          pose_tag_id: tag.id,
+          source_url: config.sourceUrl,
+          page_limit: config.pageLimit,
+          minimum_score: config.minimumScore
+        }
+      });
+      const scan = normalizeFinderScan(data?.scan || data);
+      if (!scan?.id) throw new ApiError('The server did not return a Finder scan ID.');
+      if (!scan.poseTagLabel) scan.poseTagLabel = tag.label;
+      if (!scan.poseTagId) scan.poseTagId = tag.id;
+      scan.poseDefaultRole = tag.defaultRole;
+      state.finderScan = scan;
+      state.finderScanId = scan.id;
+      state.finderResults = [];
+      state.finderReview = 'pending';
+      state.finderScans = [scan, ...state.finderScans.filter(item => String(item.id) !== String(scan.id))];
+      storage.set('finder-scan', state.finderScanId);
+      $('#finder-result-threshold').value = config.minimumScore.toFixed(2);
+      $('#finder-filter-output').textContent = config.minimumScore.toFixed(2);
+      toast('Finder scan started', `Scanning up to ${config.pageLimit} pages for “${tag.label}”.`, 'success');
+      await loadFinderScan({ quiet: true });
+    } catch (error) {
+      toast('Could not start Finder', errorMessage(error), 'error');
+    } finally {
+      state.finderBusy = false;
+      setButtonBusy(button, false);
+      renderFinderWorkspace();
+    }
+  }
+
+  async function performFinderScanAction(action, button) {
+    const scan = state.finderScan;
+    if (!scan?.id || state.finderBusy || !['pause', 'resume'].includes(action)) return;
+    state.finderBusy = true;
+    setButtonBusy(button, true, action === 'pause' ? 'Pausing…' : 'Resuming…');
+    try {
+      const data = await api(`/api/finder/scans/${encodeURIComponent(scan.id)}/${action}`, { method: 'POST' });
+      const updated = normalizeFinderScan(data?.scan || data);
+      if (updated?.id) state.finderScan = updated;
+      else await loadFinderScan({ quiet: true });
+      toast(action === 'pause' ? 'Finder paused' : 'Finder resumed', action === 'pause' ? 'Ranked results remain available for review.' : 'The server will continue from its saved progress.', 'info');
+    } catch (error) {
+      toast(action === 'pause' ? 'Could not pause Finder' : 'Could not resume Finder', errorMessage(error), 'error');
+    } finally {
+      state.finderBusy = false;
+      setButtonBusy(button, false);
+      renderFinderWorkspace();
+      scheduleFinderPoll();
+    }
+  }
+
+  async function cancelFinderScan() {
+    const scan = state.finderScan;
+    if (!scan?.id || finderScanIsTerminal(scan) || state.finderBusy) return;
+    if (!window.confirm('Cancel this Finder scan? Results already found will remain available.')) return;
+    const button = $('#finder-cancel');
+    state.finderBusy = true;
+    button.disabled = true;
+    try {
+      const data = await api(`/api/finder/scans/${encodeURIComponent(scan.id)}`, { method: 'DELETE' });
+      state.finderScan = data ? normalizeFinderScan(data?.scan || data) : { ...scan, status: 'cancelled' };
+      if (!state.finderScan?.id) state.finderScan = { ...scan, status: 'cancelled' };
+      toast('Finder scan cancelled', 'Existing candidates are still available for review.', 'info');
+    } catch (error) {
+      toast('Could not cancel Finder scan', errorMessage(error), 'error');
+    } finally {
+      state.finderBusy = false;
+      renderFinderWorkspace();
+      scheduleFinderPoll();
+    }
+  }
+
+  function recountFinderReviews() {
+    if (!state.finderScan) return;
+    state.finderScan.pendingCount = state.finderResults.filter(result => result.review === 'pending').length;
+    state.finderScan.acceptedCount = state.finderResults.filter(result => result.review === 'accepted').length;
+    state.finderScan.rejectedCount = state.finderResults.filter(result => result.review === 'rejected').length;
+  }
+
+  async function reviewFinderResult(result, review, button = null) {
+    if (!result || !['pending', 'accepted', 'rejected'].includes(review) || state.finderBusy) return;
+    const previous = result.review;
+    if (previous === review) return;
+    result.review = review;
+    recountFinderReviews();
+    renderFinderResults();
+    if (button) button.disabled = true;
+    try {
+      const data = await api(`/api/finder/scans/${encodeURIComponent(state.finderScan.id)}/results/${encodeURIComponent(result.key)}`, {
+        method: 'PATCH',
+        body: { review }
+      });
+      if (data) {
+        const updated = normalizeFinderResult(data?.result || data, result.rank - 1);
+        const index = state.finderResults.findIndex(item => String(item.key) === String(result.key));
+        if (index >= 0) state.finderResults[index] = {
+          ...result,
+          ...updated,
+          galleryId: updated.galleryId || result.galleryId,
+          url: updated.url || result.url,
+          title: updated.title === 'Untitled gallery' ? result.title : updated.title,
+          bestImageUrl: updated.bestImageUrl || result.bestImageUrl,
+          bestPreviewUrl: updated.bestPreviewUrl || result.bestPreviewUrl,
+          imageCount: updated.imageCount || result.imageCount
+        };
+      }
+      recountFinderReviews();
+      renderFinderWorkspace();
+      announce(`${result.title} ${review}`);
+    } catch (error) {
+      result.review = previous;
+      recountFinderReviews();
+      renderFinderWorkspace();
+      toast('Could not save review', errorMessage(error), 'error');
+    }
+  }
+
+  function finderPoseTagForScan(scan = state.finderScan) {
+    const existing = state.finderTags.find(tag => String(tag.id) === String(scan?.poseTagId));
+    if (existing) return existing;
+    return {
+      id: scan?.poseTagId,
+      label: scan?.poseTagLabel || 'Pose target',
+      slug: scan?.poseTagSlug || '',
+      defaultRole: POSE_ROLES.includes(scan?.poseDefaultRole) ? scan.poseDefaultRole : 'solo'
+    };
+  }
+
+  async function openFinderResult(result) {
+    if (!result?.galleryId) {
+      toast('Gallery unavailable', 'This Finder result has no gallery identifier.', 'error');
+      return;
+    }
+    await openGallery(result.galleryId, {
+      summary: {
+        id: result.galleryId,
+        url: result.url,
+        title: result.title,
+        thumbnail_url: result.bestPreviewUrl,
+        image_count: result.imageCount
+      },
+      mode: 'pose',
+      poseTag: finderPoseTagForScan(),
+      suggestions: [{ imageUrl: result.bestImageUrl, ordinal: result.bestOrdinal, score: result.score }]
+    });
+  }
+
+  async function selectFinderScan(scanId) {
+    state.finderScanId = scanId;
+    storage.set('finder-scan', scanId);
+    if (!scanId) {
+      state.finderScan = null;
+      state.finderResults = [];
+      window.clearTimeout(state.finderPollTimer);
+      renderFinderWorkspace();
+      return;
+    }
+    await loadFinderScan({ applyConfig: true });
   }
 
   function normalizeSortFolder(item) {
@@ -2146,7 +2837,7 @@
   }
 
   function setView(view, { updateHash = true } = {}) {
-    if (!['discover', 'queue', 'profiles', 'sort', 'settings'].includes(view)) view = 'discover';
+    if (!['discover', 'finder', 'queue', 'profiles', 'sort', 'settings'].includes(view)) view = 'discover';
     state.view = view;
     $$('[data-view-panel]').forEach(panel => {
       const active = panel.dataset.viewPanel === view;
@@ -2163,6 +2854,7 @@
     });
     if (updateHash) history.replaceState(null, '', `#${view}`);
     window.scrollTo({ top: 0, left: 0, behavior: 'instant' });
+    if (view === 'finder' && !state.finderLoaded) loadFinderWorkspace();
     if (view === 'queue') loadJobs({ quiet: true });
     if (view === 'profiles') loadProfiles({ quiet: true });
     if (view === 'sort' && !state.sortLoaded) loadSortWorkspace();
@@ -2173,6 +2865,7 @@
   async function refreshCurrent() {
     $('#refresh-button').classList.add('is-spinning');
     if (state.view === 'discover') await loadGalleries();
+    else if (state.view === 'finder') await loadFinderWorkspace();
     else if (state.view === 'queue') await loadJobs();
     else if (state.view === 'profiles') await loadProfiles();
     else if (state.view === 'sort') await loadSortWorkspace({ restoreSession: true });
@@ -2252,6 +2945,37 @@
       } else if (open) openGallery(open.dataset.galleryId);
     });
     $('#page-next').addEventListener('click', loadMoreGalleries);
+    $('#finder-refresh').addEventListener('click', () => loadFinderWorkspace());
+    $('#finder-use-current').addEventListener('click', () => {
+      $('#finder-source').value = finderDefaultSource();
+      syncFinderConfigAvailability();
+      $('#finder-source').focus();
+    });
+    ['finder-folder', 'finder-pose-tag', 'finder-source', 'finder-pages'].forEach(id => {
+      $(`#${id}`).addEventListener('input', syncFinderConfigAvailability);
+      $(`#${id}`).addEventListener('change', syncFinderConfigAvailability);
+    });
+    $('#finder-min-similarity').addEventListener('input', event => {
+      $('#finder-min-output').textContent = Number(event.currentTarget.value).toFixed(2);
+    });
+    $('#finder-result-threshold').addEventListener('input', renderFinderResults);
+    $('#finder-scan-select').addEventListener('change', event => selectFinderScan(event.currentTarget.value));
+    $('#finder-start').addEventListener('click', startFinderScan);
+    $('#finder-pause').addEventListener('click', event => performFinderScanAction('pause', event.currentTarget));
+    $('#finder-resume').addEventListener('click', event => performFinderScanAction('resume', event.currentTarget));
+    $('#finder-cancel').addEventListener('click', cancelFinderScan);
+    $$('[data-finder-review]').forEach(button => button.addEventListener('click', () => {
+      state.finderReview = button.dataset.finderReview;
+      renderFinderResults();
+    }));
+    $('#finder-result-grid').addEventListener('click', event => {
+      const button = event.target.closest('[data-finder-action]');
+      if (!button) return;
+      const result = state.finderResults.find(item => String(item.key) === String(button.dataset.finderResult));
+      if (!result) return;
+      if (button.dataset.finderAction === 'open') openFinderResult(result);
+      else reviewFinderResult(result, button.dataset.finderAction, button);
+    });
     $('#active-profile').addEventListener('change', event => selectProfile(event.target.value));
     $('#modal-profile-select').addEventListener('change', event => selectProfile(event.target.value, false));
     $('#refresh-button').addEventListener('click', refreshCurrent);
@@ -2396,6 +3120,7 @@
     $('#gallery-modal').addEventListener('close', () => {
       closeModal($('#lightbox-modal'));
       flushPoseDraft();
+      state.galleryContext = null;
     });
     $('#modal-ignore').addEventListener('click', () => {
       if (!state.gallery) return;
@@ -2410,6 +3135,7 @@
       if (!document.hidden) {
         checkHealth();
         loadJobs({ quiet: true });
+        if (state.finderScanId) loadFinderScan({ quiet: true });
       }
     });
     document.addEventListener('keydown', handleKeyboard);
@@ -2459,7 +3185,7 @@
     $$('.density-switch button').forEach(button => button.classList.toggle('is-active', button.dataset.density === state.density));
     renderGallerySkeletons();
     const hashView = location.hash.slice(1);
-    setView(['discover', 'queue', 'profiles', 'sort', 'settings'].includes(hashView) ? hashView : 'discover', { updateHash: !hashView });
+    setView(['discover', 'finder', 'queue', 'profiles', 'sort', 'settings'].includes(hashView) ? hashView : 'discover', { updateHash: !hashView });
     connectEvents();
     await Promise.all([checkHealth(), loadSettings(), loadProfiles({ quiet: true }), loadJobs({ quiet: true })]);
     await loadHistory();
