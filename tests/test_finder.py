@@ -338,14 +338,87 @@ def test_finder_folder_confinement_and_symlink_rejection(
     (root / "linked").symlink_to(outside, target_is_directory=True)
     service = FinderService(config, database, FakeScraper(), EventBroker())
 
-    assert {item["path"] for item in service.folders()} == {".", "nested", "pose"}
-    with pytest.raises(ValueError, match="inside"):
+    listing = service.folders()
+    assert listing["root"] == str(root)
+    assert listing["current"]["path"] == "."
+    assert listing["current"]["image_count"] == 1
+    assert {item["path"] for item in listing["items"]} == {"nested", "pose"}
+    nested = service.folders("nested")
+    assert nested["path"] == "nested"
+    assert nested["parent"] == "."
+    assert nested["current"]["image_count"] == 1
+    with pytest.raises(ValueError, match="cannot contain"):
         service._resolve_example_directory("../outside")
     with pytest.raises(ValueError, match="Symlinked"):
         service._resolve_example_directory("linked")
     (root / "linked-image.png").symlink_to(outside / "secret.png")
     with pytest.raises(ValueError, match="Symlinked"):
         service._example_files(root)
+
+
+def test_finder_accepts_free_relative_and_confined_absolute_library_paths(
+    tmp_path: Path,
+) -> None:
+    library = tmp_path / "library"
+    config = AppConfig(
+        data_dir=tmp_path / "data",
+        download_root=library,
+        sort_root=library,
+        finder_model_path=tmp_path / "models" / "dinov2.onnx",
+        sqlite_vfs=None,
+    )
+    config.ensure_directories()
+    relative = "sorted_outpaint/mating press - backview/selected_target_upscaled"
+    target = library / relative
+    target.mkdir(parents=True)
+    (target / "example.png").write_bytes(image_bytes("red"))
+    database = Database(config.db_path)
+    database.initialize()
+    tag = database.create_pose_tag("Mating press backview", "couple")
+    service = FinderService(config, database, FakeScraper(), EventBroker())
+    service.ensure_schema()
+
+    assert config.finder_examples_root == library.resolve()
+    assert service.status()["folder_root"] == str(library.resolve())
+    assert service._resolve_example_directory(relative) == (target, relative)
+    assert service._resolve_example_directory(str(target)) == (target, relative)
+    assert service._resolve_example_directory(str(library)) == (library, ".")
+
+    first = service.create_scan(
+        example_directory=relative,
+        pose_tag_id=int(tag["id"]),
+        source_url=ROOT,
+        page_limit=1,
+        minimum_score=0,
+    )
+    second = service.create_scan(
+        example_directory=str(target),
+        pose_tag_id=int(tag["id"]),
+        source_url=ROOT,
+        page_limit=1,
+        minimum_score=0,
+    )
+    assert first["example_directory"] == relative
+    assert second["example_directory"] == relative
+
+    sibling_prefix = tmp_path / "library2"
+    sibling_prefix.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    for forbidden in (
+        str(sibling_prefix),
+        str(outside),
+        "/mnt/user/Davinci/Qwen_edit_lora/pornpic",
+    ):
+        with pytest.raises(ValueError, match="inside"):
+            service._resolve_example_directory(forbidden)
+    with pytest.raises(ValueError, match="cannot contain"):
+        service._resolve_example_directory("sorted_outpaint/../outside")
+
+    linked = library / "linked"
+    linked.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="Symlinked"):
+        service._resolve_example_directory("linked")
 
 
 @pytest.mark.asyncio
@@ -370,6 +443,20 @@ async def test_finder_api_signs_best_preview(tmp_path: Path, monkeypatch) -> Non
         async with httpx.AsyncClient(
             transport=transport, base_url="http://testserver"
         ) as client:
+            folder_response = await client.get("/api/finder/folders")
+            assert folder_response.status_code == 200
+            folders = folder_response.json()
+            assert folders["root"] == str(config.finder_examples_root)
+            assert folders["path"] == "."
+            assert folders["current"]["image_count"] == 1
+            assert folders["items"] == []
+            finder_status = (await client.get("/api/finder/status")).json()
+            assert finder_status["folder_root"] == str(config.finder_examples_root)
+            assert finder_status["examples_root"] == finder_status["folder_root"]
+            outside_response = await client.get(
+                "/api/finder/folders", params={"path": str(tmp_path)}
+            )
+            assert outside_response.status_code == 400
             empty_scans = await client.get("/api/finder/scans")
             assert empty_scans.status_code == 200
             assert empty_scans.json()["items"] == []

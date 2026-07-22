@@ -95,18 +95,22 @@ services:
 
 Both `/data` and every mounted download, sorter, or pose-output directory must be writable by container UID/GID `10001:10001`. Do not include a space after the host path's colon in a Docker `-v` specification: use `/host/path:/pose-output`, not `/host/path: /pose-output`.
 
-Pose Finder reads confirmed examples from a separate, read-only mount. Put one pose in each subfolder, then expose their common parent to the container:
+Pose Finder can read any image folder already inside the mounted library. With this existing library mapping:
 
 ```bash
 docker run -d --name galleryflow --restart unless-stopped \
   -p 8100:8099 \
   -v galleryflow-data:/data \
-  -v /path/to/pose-examples:/references:ro \
-  -e PORNPIC_WEBUI_FINDER_EXAMPLES_ROOT=/references \
+  -v /path/to/existing/library:/library \
+  -e PORNPIC_WEBUI_SORT_ROOT=/library \
   ghcr.io/ethanfel/galleryflow:latest
 ```
 
-There must be no space after either bind-mount colon. The examples need read permission, and their directories need traverse permission, for UID `10001`; GalleryFlow never changes them. The first scan needs outbound HTTPS access to Hugging Face and downloads the pinned 85 MB DINOv2-S ONNX model into `/data/models`, where the persistent data mount caches it for later scans. For an offline container, pre-provision the verified model at `/data/models/dinov2-small.onnx` instead.
+You can paste either `sorted_outpaint/mating press - backview/selected_target_upscaled` or the full container path `/library/sorted_outpaint/mating press - backview/selected_target_upscaled` into Finder. No specially named folder, additional mount, or container restart is required. Finder only reads its examples; the files need read permission and their directories need traverse permission for UID `10001`.
+
+If you previously added `PORNPIC_WEBUI_FINDER_EXAMPLES_ROOT=/references` or pointed it at a special examples folder, remove that variable once so Finder defaults to the complete `PORNPIC_WEBUI_SORT_ROOT`. Keeping the variable intentionally confines Finder to that older root.
+
+There must be no space after either bind-mount colon. The first scan needs outbound HTTPS access to Hugging Face and downloads the pinned 85 MB DINOv2-S ONNX model into `/data/models`, where the persistent data mount caches it for later scans. For an offline container, pre-provision the verified model at `/data/models/dinov2-small.onnx` instead.
 
 Finder uses the FP32 [DINOv2-S ONNX conversion](https://huggingface.co/onnx-community/dinov2-small-ONNX/tree/08c606e3123472a388efa59181b677d428f69bbd/onnx) pinned at revision `08c606e3123472a388efa59181b677d428f69bbd` and verifies SHA-256 `6266c3cd72db6953cecdcbfeab9422a9f783d96f1a4e296ba70ffbac43b54a18` before loading it. The upstream model is Apache-2.0 licensed; see the [Meta DINOv2 model card](https://github.com/facebookresearch/dinov2/blob/main/MODEL_CARD.md).
 
@@ -166,7 +170,7 @@ Gallery URLs and output paths are validated, symlinks and path traversal are rej
 
 ## Pose Finder
 
-Open **Finder**, choose a folder containing images of one pose, select or create its pose tag, and enter the PornPics page from which scanning should begin. The page can be the home page, a search result, a category, or another supported browse page. Set the number of pages and the minimum similarity, then start the background scan.
+Open **Finder**, type or paste the path of any example folder inside the configured library root, select or create its pose tag, and enter the PornPics page from which scanning should begin. Both library-relative paths and full container paths under that root are accepted; spaces and hyphens are preserved. The page can be the home page, a search result, a category, or another supported browse page. Set the number of pages and the minimum similarity, then start the background scan.
 
 Finder opens every listed gallery and compares all of its preview images against all examples in the selected folder, including mirrored examples. A gallery is flagged when at least one image crosses the threshold. Its score is exactly the best individual-image cosine similarity; images from a gallery are not averaged together. Scores are useful for ranking candidates but are not statistical probabilities.
 
@@ -184,7 +188,7 @@ Environment variables:
 | `PORNPIC_WEBUI_DOWNLOAD_ROOT` | `./data/downloads` | Profile libraries |
 | `PORNPIC_WEBUI_SORT_ROOT` | download root | Highest server folder exposed to the visual sorter |
 | `PORNPIC_WEBUI_POSE_ROOT` | `<sort-root>/pose_pairs` | Training-ready pose-pair datasets |
-| `PORNPIC_WEBUI_FINDER_EXAMPLES_ROOT` | `<data-dir>/references` | Read-only root containing Finder example folders |
+| `PORNPIC_WEBUI_FINDER_EXAMPLES_ROOT` | sort root | Optional override for the highest folder Finder may read; normally unnecessary |
 | `PORNPIC_WEBUI_FINDER_MODEL_PATH` | `<data-dir>/models/dinov2-small.onnx` | Cached or pre-provisioned DINOv2-S ONNX model |
 | `PORNPIC_WEBUI_FINDER_WORKERS` | `1` | Concurrent background Finder scans (maximum 2) |
 | `PORNPIC_WEBUI_FINDER_NETWORK_WORKERS` | `3` | Concurrent Finder preview requests (maximum 8) |
@@ -210,8 +214,6 @@ data/
 ├── pornpic_webui.sqlite3
 ├── models/
 │   └── dinov2-small.onnx
-├── references/
-│   └── <pose examples>/
 └── downloads/
     ├── pose_pairs/
     │   └── <pose-slug>/

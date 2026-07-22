@@ -185,7 +185,8 @@
             <div class="finder-panel-heading"><div><span class="sort-step">01</span><div><h2 id="finder-setup-title">Configure scan</h2><p>Examples stay on this server.</p></div></div></div>
 
             <label class="field"><span>Recent scan</span><select id="finder-scan-select"><option value="">New scan</option></select></label>
-            <label class="field"><span>Examples folder</span><small>Images that demonstrate the pose you want to find.</small><select id="finder-folder"><option value="">Loading folders…</option></select></label>
+            <label class="field"><span>Examples folder</span><small class="finder-folder-hint" id="finder-folder-hint">Use a library-relative path such as poses/matting-press, or paste the full container path. Existing folders are suggestions only.</small><input id="finder-folder" type="text" list="finder-folder-options" maxlength="500" placeholder="sorted_outpaint/mating press - backview/selected_target_upscaled" autocomplete="off" spellcheck="false"></label>
+            <datalist id="finder-folder-options"></datalist>
             <label class="field"><span>Pose tag</span><small>Existing tags are reused; a new tag is created when the scan starts.</small><input id="finder-pose-tag" type="text" list="finder-pose-tag-options" maxlength="80" placeholder="e.g. standing profile" autocomplete="off"></label>
             <datalist id="finder-pose-tag-options"></datalist>
             <label class="field"><span>Source URL <button class="field-inline-action" id="finder-use-current" type="button">Use current</button></span><small>A gallery, category, model, search page, or the site home page.</small><input id="finder-source" type="url" inputmode="url" spellcheck="false" placeholder="https://www.pornpics.com/"></label>

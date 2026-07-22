@@ -495,6 +495,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .finder-panel-heading p, .finder-results-header p { margin: 2px 0 0; overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .field-inline-action { padding: 0; border: 0; background: transparent; color: var(--accent); font-size: 9px; font-weight: 650; }
 .field-inline-action:hover { color: #ff9fb4; }
+.finder-folder-hint { line-height: 1.4; overflow-wrap: anywhere; }
 .finder-config-row { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 10px; align-items: end; }
 .finder-config-row .field { margin-top: 16px; }
 .finder-slider-field input[type="range"], .finder-threshold input[type="range"] { height: 22px; padding: 0; border: 0; background: transparent; accent-color: var(--accent); cursor: pointer; }

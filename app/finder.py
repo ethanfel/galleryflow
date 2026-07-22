@@ -270,74 +270,187 @@ class FinderService:
             "model_ready": self._ready,
             "error": self._prepare_error,
             "model_path": str(self.model_path),
+            "folder_root": str(self.examples_root),
+            # Kept for clients written against the 2.2 API.
             "examples_root": str(self.examples_root),
             "queue_depth": self.queue.qsize(),
             "active": sum(counts.get(item, 0) for item in ACTIVE_STATUSES),
             "paused": counts.get("paused", 0),
         }
 
-    def folders(self) -> list[dict[str, Any]]:
-        items: list[dict[str, Any]] = []
-        if not self.examples_root.is_dir():
-            return items
-        for current, directories, filenames in os.walk(
-            self.examples_root, followlinks=False
-        ):
-            current_path = Path(current)
-            directories[:] = [
-                name
-                for name in directories
-                if not (current_path / name).is_symlink()
-            ]
-            image_count = sum(
-                1
-                for name in filenames
-                if (current_path / name).suffix.lower() in IMAGE_EXTENSIONS
-                and not (current_path / name).is_symlink()
-            )
-            if not image_count:
+    @staticmethod
+    def _directory_flags() -> int:
+        return (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        )
+
+    def _open_example_directory(self, directory: Path) -> int:
+        """Open a directory one component at a time without following links."""
+
+        try:
+            relative = directory.relative_to(self.examples_root)
+        except ValueError as exc:
+            raise ValueError(
+                "Example directory escapes the Finder folder root"
+            ) from exc
+        try:
+            descriptor = os.open(self.examples_root, self._directory_flags())
+            for part in relative.parts:
+                try:
+                    child = os.open(
+                        part,
+                        self._directory_flags(),
+                        dir_fd=descriptor,
+                    )
+                except Exception:
+                    os.close(descriptor)
+                    raise
+                os.close(descriptor)
+                descriptor = child
+            return descriptor
+        except OSError as exc:
+            raise ValueError("Could not safely open the example directory") from exc
+
+    @staticmethod
+    def _directory_summary(descriptor: int) -> tuple[int, bool]:
+        image_count = 0
+        has_children = False
+        for name in os.listdir(descriptor):
+            try:
+                details = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            except OSError:
                 continue
-            relative = current_path.resolve().relative_to(self.examples_root)
-            path = "." if relative == Path(".") else relative.as_posix()
-            items.append(
-                {
-                    "path": path,
-                    "name": "References root" if path == "." else current_path.name,
-                    "image_count": image_count,
-                }
-            )
-        return sorted(items, key=lambda item: (item["path"] != ".", item["path"].casefold()))
+            if stat.S_ISDIR(details.st_mode):
+                has_children = True
+            elif (
+                stat.S_ISREG(details.st_mode)
+                and Path(name).suffix.lower() in IMAGE_EXTENSIONS
+            ):
+                image_count += 1
+        return image_count, has_children
+
+    def folders(self, value: str = ".") -> dict[str, Any]:
+        """Return one safe, shallow level for the optional folder browser."""
+
+        current, normalized = self._resolve_example_directory(value)
+        descriptor = self._open_example_directory(current)
+        try:
+            image_count, has_children = self._directory_summary(descriptor)
+            items: list[dict[str, Any]] = []
+            for name in sorted(
+                os.listdir(descriptor), key=lambda item: (item.casefold(), item)
+            ):
+                try:
+                    details = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                    if not stat.S_ISDIR(details.st_mode):
+                        continue
+                    child_descriptor = os.open(
+                        name,
+                        self._directory_flags(),
+                        dir_fd=descriptor,
+                    )
+                except OSError:
+                    # This also excludes symlinked and inaccessible directories.
+                    continue
+                try:
+                    child_images, child_has_children = self._directory_summary(
+                        child_descriptor
+                    )
+                finally:
+                    os.close(child_descriptor)
+                path = name if normalized == "." else f"{normalized}/{name}"
+                items.append(
+                    {
+                        "path": path,
+                        "absolute_path": str(self.examples_root / path),
+                        "name": name,
+                        "image_count": child_images,
+                        "has_children": child_has_children,
+                    }
+                )
+        finally:
+            os.close(descriptor)
+        parent = None
+        if normalized != ".":
+            parent_path = Path(normalized).parent
+            parent = "." if parent_path == Path(".") else parent_path.as_posix()
+        return {
+            "root": str(self.examples_root),
+            "path": normalized,
+            "parent": parent,
+            "current": {
+                "path": normalized,
+                "absolute_path": str(current),
+                "name": "Library root" if normalized == "." else current.name,
+                "image_count": image_count,
+                "has_children": has_children,
+            },
+            "items": items,
+        }
 
     def _resolve_example_directory(self, value: str) -> tuple[Path, str]:
         raw = (value or "").strip()
         if not raw:
             raise ValueError("Example directory is required")
-        relative = Path(raw)
-        if relative.is_absolute() or ".." in relative.parts:
-            raise ValueError("Example directory must stay inside the references root")
-        lexical = self.examples_root if raw == "." else self.examples_root / relative
+        supplied = Path(raw)
+        if ".." in supplied.parts:
+            raise ValueError("Example directory cannot contain '..'")
+        if supplied.is_absolute():
+            try:
+                relative = supplied.relative_to(self.examples_root)
+            except ValueError as exc:
+                raise ValueError(
+                    "Absolute example directory must stay inside the Finder folder root"
+                ) from exc
+        else:
+            relative = supplied
+        lexical = self.examples_root / relative
         current = self.examples_root
-        for part in (() if raw == "." else relative.parts):
+        for part in relative.parts:
             current = current / part
             if current.is_symlink():
                 raise ValueError("Symlinked example directories are not allowed")
-        resolved = lexical.resolve()
-        if resolved != self.examples_root and self.examples_root not in resolved.parents:
-            raise ValueError("Example directory escapes the references root")
+        try:
+            resolved = lexical.resolve(strict=True)
+        except OSError as exc:
+            raise ValueError("Example directory does not exist") from exc
+        if (
+            resolved != self.examples_root
+            and self.examples_root not in resolved.parents
+        ):
+            raise ValueError("Example directory escapes the Finder folder root")
         if not resolved.is_dir():
             raise ValueError("Example directory does not exist")
-        normalized = "." if resolved == self.examples_root else resolved.relative_to(self.examples_root).as_posix()
+        normalized = (
+            "."
+            if resolved == self.examples_root
+            else resolved.relative_to(self.examples_root).as_posix()
+        )
         return resolved, normalized
 
     def _example_files(self, directory: Path) -> list[Path]:
         files: list[Path] = []
-        for path in sorted(directory.iterdir(), key=lambda item: item.name.casefold()):
-            if path.is_symlink():
-                raise ValueError("Symlinked example images are not allowed")
-            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
-                if path.stat().st_size > self.config.finder_max_image_bytes:
-                    raise ValueError(f"Example image is too large: {path.name}")
-                files.append(path)
+        descriptor = self._open_example_directory(directory)
+        try:
+            for name in sorted(
+                os.listdir(descriptor), key=lambda item: (item.casefold(), item)
+            ):
+                try:
+                    details = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                except OSError as exc:
+                    raise ValueError(f"Could not inspect example file: {name}") from exc
+                if stat.S_ISLNK(details.st_mode):
+                    raise ValueError("Symlinked example images are not allowed")
+                path = directory / name
+                if (
+                    stat.S_ISREG(details.st_mode)
+                    and path.suffix.lower() in IMAGE_EXTENSIONS
+                ):
+                    if details.st_size > self.config.finder_max_image_bytes:
+                        raise ValueError(f"Example image is too large: {path.name}")
+                    files.append(path)
+        finally:
+            os.close(descriptor)
         if not files:
             raise ValueError("Example directory contains no supported images")
         if len(files) > self.config.finder_max_examples:
@@ -347,11 +460,16 @@ class FinderService:
         return files
 
     def _read_example_file(self, path: Path) -> bytes:
+        directory_descriptor = self._open_example_directory(path.parent)
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         try:
-            descriptor = os.open(path, flags)
+            descriptor = os.open(path.name, flags, dir_fd=directory_descriptor)
         except OSError as exc:
-            raise ValueError(f"Could not safely open example image: {path.name}") from exc
+            raise ValueError(
+                f"Could not safely open example image: {path.name}"
+            ) from exc
+        finally:
+            os.close(directory_descriptor)
         try:
             details = os.fstat(descriptor)
             if not stat.S_ISREG(details.st_mode):

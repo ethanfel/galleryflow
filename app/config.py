@@ -109,7 +109,11 @@ class AppConfig:
 
     def __post_init__(self) -> None:
         if self.finder_examples_root is None:
-            self.finder_examples_root = (self.data_dir / "references").resolve()
+            # Finder paths share the same server-side boundary as the sorter by
+            # default.  This lets a user point Finder at any existing library
+            # folder without adding another Docker bind mount.  The dedicated
+            # environment variable remains an opt-in compatibility override.
+            self.finder_examples_root = self.sort_root_path
         if self.finder_model_path is None:
             self.finder_model_path = (
                 self.data_dir / "models" / "dinov2-small.onnx"

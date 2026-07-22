@@ -457,8 +457,10 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
         return {"job": job}
 
     @app.get("/api/finder/folders")
-    async def finder_folders() -> dict:
-        return {"items": await asyncio.to_thread(finder.folders)}
+    async def finder_folders(
+        path: str = Query(default=".", min_length=1, max_length=500),
+    ) -> dict:
+        return await asyncio.to_thread(finder.folders, path)
 
     @app.get("/api/finder/status")
     async def finder_status() -> dict:

@@ -1823,7 +1823,8 @@
       status,
       name: String(data.model_name || model.name || model.label || data.name || String(data.model_path || '').split('/').pop() || 'Similarity model'),
       detail: details.join(' · ') || (modelReady ? 'Ready to compare images' : ready ? 'Model downloads automatically on the first scan' : data.error || model.error || 'Model unavailable'),
-      defaultSourceUrl: String(data.default_source_url || data.source_url || '')
+      defaultSourceUrl: String(data.default_source_url || data.source_url || ''),
+      folderRoot: String(data.folder_root || model.folder_root || '')
     };
   }
 
@@ -1931,14 +1932,15 @@
   }
 
   function renderFinderFolders() {
-    const select = $('#finder-folder');
-    const selected = select.value;
-    select.replaceChildren(new Option(state.finderFolders.length ? 'Choose an examples folder…' : 'No example folders found', ''));
-    state.finderFolders.forEach(folder => {
+    const list = $('#finder-folder-options');
+    list.replaceChildren();
+    [...state.finderFolders].sort((a, b) => a.path.localeCompare(b.path)).forEach(folder => {
       const count = folder.imageCount ? ` · ${formatNumber(folder.imageCount)} images` : '';
-      select.add(new Option(`${folder.name}${count}`, folder.path));
+      const option = document.createElement('option');
+      option.value = folder.path;
+      option.label = `${folder.name}${count}`;
+      list.append(option);
     });
-    if (state.finderFolders.some(folder => folder.path === selected)) select.value = selected;
   }
 
   function renderFinderTags() {
@@ -1960,6 +1962,12 @@
     $('#finder-model-name').textContent = model?.name || 'Model unavailable';
     $('#finder-model-detail').textContent = model?.detail || 'Could not read model status';
     $('#finder-model-state').textContent = model?.modelReady ? 'Ready' : model?.ready ? 'Available' : model ? model.status.replaceAll('_', ' ') : 'Offline';
+    const root = model?.folderRoot;
+    const normalizedRoot = root ? root.replace(/\/+$/, '') || '/' : '';
+    const fullExample = normalizedRoot === '/' ? '/poses/matting-press' : `${normalizedRoot}/poses/matting-press`;
+    $('#finder-folder-hint').textContent = normalizedRoot
+      ? `Use poses/matting-press relative to ${normalizedRoot}, or paste ${fullExample}. Existing folders are suggestions only.`
+      : 'Use a library-relative path such as poses/matting-press, or paste the full container path. Existing folders are suggestions only.';
   }
 
   function renderFinderScans() {
@@ -1980,7 +1988,7 @@
     const locked = Boolean(state.finderScan && !finderScanIsTerminal());
     ['finder-folder', 'finder-pose-tag', 'finder-source', 'finder-pages', 'finder-min-similarity'].forEach(id => { $(`#${id}`).disabled = locked || state.finderBusy; });
     $('#finder-use-current').disabled = locked || state.finderBusy;
-    const hasConfig = Boolean($('#finder-folder').value && $('#finder-pose-tag').value.trim() && $('#finder-source').value.trim());
+    const hasConfig = Boolean($('#finder-folder').value.trim() && $('#finder-pose-tag').value.trim() && $('#finder-source').value.trim());
     $('#finder-start').hidden = locked;
     $('#finder-start').disabled = state.finderLoading || state.finderBusy || !state.finderStatus?.ready || !hasConfig;
   }
@@ -2097,7 +2105,7 @@
   }
 
   function readFinderConfig({ validate = false } = {}) {
-    const exampleDirectory = $('#finder-folder').value;
+    const exampleDirectory = $('#finder-folder').value.trim();
     const tagLabel = $('#finder-pose-tag').value.trim().replace(/\s+/g, ' ');
     const sourceInput = $('#finder-source').value.trim();
     const sourceUrl = /^https?:\/\//i.test(sourceInput) ? safeUrl(sourceInput) : '';
@@ -2105,7 +2113,8 @@
     const pageLimit = Math.max(1, Math.min(50, Number.isFinite(requestedPages) ? requestedPages : 5));
     const minimumScore = Math.max(0.4, Math.min(0.95, Number($('#finder-min-similarity').value || 0.65)));
     if (validate && !exampleDirectory) {
-      toast('Choose an examples folder', 'Select the server folder that demonstrates this pose.', 'info');
+      const root = state.finderStatus?.folderRoot || 'the library root';
+      toast('Enter an examples folder', `Use any folder inside ${root}, as a relative path or full container path.`, 'info');
       $('#finder-folder').focus();
       return null;
     }
@@ -2204,7 +2213,7 @@
     }
   }
 
-  async function loadFinderWorkspace({ quiet = false } = {}) {
+  async function loadFinderWorkspace({ quiet = false, preserveConfig = false } = {}) {
     if (state.finderLoading) return;
     state.finderLoading = true;
     syncFinderConfigAvailability();
@@ -2232,7 +2241,7 @@
     renderFinderWorkspace();
     state.finderLoading = false;
     syncFinderConfigAvailability();
-    if (selected?.id) await loadFinderScan({ quiet: true, applyConfig: true });
+    if (selected?.id) await loadFinderScan({ quiet: true, applyConfig: !preserveConfig });
     const failures = requests.filter(result => result.status === 'rejected');
     if (!quiet && failures.length) toast('Some Finder options are unavailable', errorMessage(failures[0].reason), 'error');
   }
@@ -2865,7 +2874,7 @@
   async function refreshCurrent() {
     $('#refresh-button').classList.add('is-spinning');
     if (state.view === 'discover') await loadGalleries();
-    else if (state.view === 'finder') await loadFinderWorkspace();
+    else if (state.view === 'finder') await loadFinderWorkspace({ preserveConfig: true });
     else if (state.view === 'queue') await loadJobs();
     else if (state.view === 'profiles') await loadProfiles();
     else if (state.view === 'sort') await loadSortWorkspace({ restoreSession: true });
@@ -2945,7 +2954,7 @@
       } else if (open) openGallery(open.dataset.galleryId);
     });
     $('#page-next').addEventListener('click', loadMoreGalleries);
-    $('#finder-refresh').addEventListener('click', () => loadFinderWorkspace());
+    $('#finder-refresh').addEventListener('click', () => loadFinderWorkspace({ preserveConfig: true }));
     $('#finder-use-current').addEventListener('click', () => {
       $('#finder-source').value = finderDefaultSource();
       syncFinderConfigAvailability();
