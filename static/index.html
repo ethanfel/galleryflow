@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0b10">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="A fast, private gallery browser and download manager.">
+  <title>GalleryFlow</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <svg class="svg-sprite" aria-hidden="true">
+    <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></symbol>
+    <symbol id="i-queue" viewBox="0 0 24 24"><path d="M5 6h14M5 12h9M5 18h6"/><circle cx="18" cy="17" r="3"/><path d="M18 15.5V17l1 1"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3.5 7.5v10a2 2 0 0 0 2 2h13a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2h-7l-2-3h-4a2 2 0 0 0-2 2v1Z"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1.03 1.56V21h-4v-.08A1.7 1.7 0 0 0 9 19.36a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.63 15a1.7 1.7 0 0 0-1.56-1.03H3v-4h.08A1.7 1.7 0 0 0 4.64 9a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.63a1.7 1.7 0 0 0 1.03-1.56V3h4v.08A1.7 1.7 0 0 0 15 4.64a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.37 9a1.7 1.7 0 0 0 1.56 1.03H21v4h-.08A1.7 1.7 0 0 0 19.4 15Z"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7-7l-1.15 1.15M14 11a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7 7l1.15-1.15"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-5-5 5 5-5 5"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 20h16"/></symbol>
+    <symbol id="i-eye-off" viewBox="0 0 24 24"><path d="m3 3 18 18M10.6 10.7a2 2 0 0 0 2.7 2.7M9.9 4.2A10.8 10.8 0 0 1 12 4c5.5 0 9 6 9 6a16 16 0 0 1-2.1 2.9M6.6 6.6C4.3 8.1 3 10 3 10s3.5 6 9 6a9.8 9.8 0 0 0 3.4-.6"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24"><path d="M3 12s3.5-6 9-6 9 6 9 6-3.5 6-9 6-9-6-9-6Z"/><circle cx="12" cy="12" r="2.5"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 3h6l1 4H8l1-4Zm-2 4 1 14h8l1-14M10 11v6m4-6v6"/></symbol>
+    <symbol id="i-edit" viewBox="0 0 24 24"><path d="m14 5 5 5M4 20l4.5-1 10-10a2.1 2.1 0 0 0-3-3l-10 10L4 20Z"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5M6.1 8A7 7 0 0 1 18 6l2 6M18 16a7 7 0 0 1-11.9 2L4 12"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><path d="M9 5v14M15 5v14"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5Z"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/></symbol>
+    <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8" cy="9" r="1.5"/><path d="m4 17 5-5 4 4 2-2 5 4"/></symbol>
+    <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9M18 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h6"/></symbol>
+    <symbol id="i-keyboard" viewBox="0 0 24 24"><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M7 10h.01M11 10h.01M15 10h.01M7 14h10"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+    <symbol id="i-spark" viewBox="0 0 24 24"><path d="m12 3 1.2 4.2L17 9l-3.8 1.8L12 15l-1.2-4.2L7 9l3.8-1.8L12 3ZM6 14l.8 2.2L9 17l-2.2.8L6 20l-.8-2.2L3 17l2.2-.8L6 14Zm12-1 .8 2.2 2.2.8-2.2.8L18 19l-.8-2.2L15 16l2.2-.8L18 13Z"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
+    <symbol id="i-sort" viewBox="0 0 24 24"><path d="M4 6h10M4 12h7M4 18h4M17 4v16m-4-4 4 4 4-4"/></symbol>
+    <symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 7 4 12l5 5M5 12h8a6 6 0 0 1 6 6"/></symbol>
+  </svg>
+
+  <a class="skip-link" href="#main-content">Skip to content</a>
+
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Primary navigation">
+      <a class="brand" href="#discover" data-route="discover" aria-label="GalleryFlow home">
+        <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+        <span class="brand-copy"><strong>GalleryFlow</strong><small>Private library</small></span>
+      </a>
+
+      <nav class="side-nav">
+        <button class="nav-item is-active" type="button" data-view="discover" aria-current="page">
+          <svg><use href="#i-grid"></use></svg><span>Discover</span>
+        </button>
+        <button class="nav-item" type="button" data-view="queue">
+          <svg><use href="#i-queue"></use></svg><span>Queue</span><span class="nav-count" id="nav-queue-count" hidden>0</span>
+        </button>
+        <button class="nav-item" type="button" data-view="profiles">
+          <svg><use href="#i-folder"></use></svg><span>Profiles</span>
+        </button>
+        <button class="nav-item" type="button" data-view="sort">
+          <svg><use href="#i-sort"></use></svg><span>Sort</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-spacer"></div>
+      <button class="nav-item" type="button" data-view="settings">
+        <svg><use href="#i-settings"></use></svg><span>Settings</span>
+      </button>
+      <div class="server-pill" id="server-pill" role="status">
+        <span class="status-dot"></span>
+        <span><strong id="server-label">Connecting</strong><small id="server-detail">Checking server…</small></span>
+      </div>
+    </aside>
+
+    <main class="main" id="main-content">
+      <header class="topbar">
+        <div class="mobile-brand">
+          <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+          <strong>GalleryFlow</strong>
+        </div>
+        <div class="topbar-spacer"></div>
+        <label class="profile-switcher" for="active-profile">
+          <span>Save to</span>
+          <select id="active-profile" aria-label="Active download profile">
+            <option value="">Loading profiles…</option>
+          </select>
+        </label>
+        <button class="icon-button refresh-button" id="refresh-button" type="button" title="Refresh (R)" aria-label="Refresh current view">
+          <svg><use href="#i-refresh"></use></svg>
+        </button>
+      </header>
+
+      <section class="view is-active" id="view-discover" data-view-panel="discover" aria-labelledby="discover-title">
+        <div class="page-intro discover-intro">
+          <div>
+            <span class="eyebrow"><svg><use href="#i-spark"></use></svg> Browser workspace</span>
+            <h1 id="discover-title">Find your next gallery</h1>
+            <p>Paste any supported page, or search the live PornPics catalogue from one private workspace.</p>
+          </div>
+        </div>
+
+        <form class="source-bar" id="source-form">
+          <div class="source-mode" role="tablist" aria-label="Browse method">
+            <button class="mode-button is-active" type="button" role="tab" aria-selected="true" data-mode="url">
+              <svg><use href="#i-link"></use></svg> Source URL
+            </button>
+            <button class="mode-button" type="button" role="tab" aria-selected="false" data-mode="search">
+              <svg><use href="#i-search"></use></svg> Search
+            </button>
+          </div>
+          <div class="source-input-wrap">
+            <svg class="input-leading-icon"><use href="#i-link"></use></svg>
+            <input id="source-input" name="source" type="url" autocomplete="off" spellcheck="false" placeholder="https://www.pornpics.com/…" aria-label="Source URL">
+            <button class="clear-input" id="clear-source" type="button" aria-label="Clear" hidden><svg><use href="#i-close"></use></svg></button>
+            <button class="button button-primary source-submit" id="source-submit" type="submit">
+              <span>Browse</span><svg><use href="#i-arrow"></use></svg>
+            </button>
+          </div>
+          <div class="source-hint" id="source-hint">
+            <svg><use href="#i-info"></use></svg>
+            Paste a gallery, category, model, or search-result URL. Everything is fetched by the server.
+          </div>
+        </form>
+
+        <div class="collection-header">
+          <div>
+            <h2 id="collection-title">Recent galleries</h2>
+            <p id="collection-summary">Galleries discovered by the server</p>
+          </div>
+          <div class="collection-actions">
+            <div class="filter-menu-wrap">
+              <button class="button button-quiet filter-trigger" id="filter-trigger" type="button" aria-haspopup="true" aria-expanded="false">
+                <svg><use href="#i-eye"></use></svg><span>Visibility</span><span class="filter-count" id="filter-count" hidden></span>
+              </button>
+              <div class="filter-popover" id="filter-popover" hidden>
+                <strong>Show in results</strong>
+                <label class="check-row"><input id="show-saved" type="checkbox" checked><span class="custom-check"><svg><use href="#i-check"></use></svg></span><span><b>Saved galleries</b><small>Already downloaded</small></span></label>
+                <label class="check-row"><input id="show-ignored" type="checkbox"><span class="custom-check"><svg><use href="#i-check"></use></svg></span><span><b>Ignored galleries</b><small>Hidden by default</small></span></label>
+              </div>
+            </div>
+            <div class="density-switch" aria-label="Gallery density">
+              <button class="is-active" type="button" data-density="comfortable" aria-label="Comfortable grid" title="Comfortable grid"><svg><use href="#i-grid"></use></svg></button>
+              <button type="button" data-density="compact" aria-label="Compact grid" title="Compact grid"><svg><use href="#i-image"></use></svg></button>
+            </div>
+          </div>
+        </div>
+
+        <div class="notice-banner" id="discover-notice" hidden>
+          <svg><use href="#i-info"></use></svg><span></span><button type="button" aria-label="Dismiss"><svg><use href="#i-close"></use></svg></button>
+        </div>
+
+        <div class="gallery-grid" id="gallery-grid" aria-live="polite" aria-busy="true"></div>
+        <div class="empty-state" id="gallery-empty" hidden>
+          <div class="empty-illustration"><svg><use href="#i-image"></use></svg><span></span></div>
+          <h3>No galleries here yet</h3>
+          <p>Paste a supported source URL above to discover galleries, or adjust your visibility filters.</p>
+          <button class="button button-primary" id="empty-focus-source" type="button"><svg><use href="#i-link"></use></svg> Add a source</button>
+        </div>
+        <div class="pagination" id="pagination" hidden>
+          <button class="button button-quiet" id="page-prev" type="button"><svg class="flip"><use href="#i-chevron"></use></svg> Previous</button>
+          <span id="page-status">Page 1</span>
+          <button class="button button-quiet" id="page-next" type="button">Next <svg><use href="#i-chevron"></use></svg></button>
+        </div>
+      </section>
+
+      <section class="view" id="view-queue" data-view-panel="queue" aria-labelledby="queue-title" hidden>
+        <div class="page-intro section-intro">
+          <div><span class="eyebrow"><svg><use href="#i-queue"></use></svg> Download manager</span><h1 id="queue-title">Queue</h1><p>Follow active transfers and review recently completed galleries.</p></div>
+          <div class="intro-actions">
+            <button class="button button-quiet" id="clear-completed" type="button"><svg><use href="#i-trash"></use></svg> Clear completed</button>
+            <button class="button button-quiet" id="refresh-queue" type="button"><svg><use href="#i-refresh"></use></svg> Refresh</button>
+          </div>
+        </div>
+        <div class="stat-strip" id="queue-stats">
+          <div><span class="stat-icon active"><svg><use href="#i-download"></use></svg></span><span><strong id="stat-active">0</strong><small>Active</small></span></div>
+          <div><span class="stat-icon queued"><svg><use href="#i-clock"></use></svg></span><span><strong id="stat-pending">0</strong><small>Waiting</small></span></div>
+          <div><span class="stat-icon done"><svg><use href="#i-check"></use></svg></span><span><strong id="stat-completed">0</strong><small>Completed today</small></span></div>
+          <div><span class="stat-icon data"><svg><use href="#i-folder"></use></svg></span><span><strong id="stat-data">0</strong><small>Images saved</small></span></div>
+        </div>
+        <div class="panel queue-panel">
+          <div class="panel-heading"><div><h2>Transfers</h2><p id="queue-summary">Nothing downloading</p></div><div class="segmented" role="group" aria-label="Queue filter"><button class="is-active" type="button" data-job-filter="all">All</button><button type="button" data-job-filter="active">Active</button><button type="button" data-job-filter="complete">Complete</button></div></div>
+          <div class="job-list" id="job-list" aria-live="polite"></div>
+          <div class="empty-state compact" id="queue-empty" hidden><div class="empty-illustration"><svg><use href="#i-queue"></use></svg><span></span></div><h3>Your queue is clear</h3><p>Downloads you start from Discover will appear here.</p><button class="button button-primary" type="button" data-go-discover>Browse galleries</button></div>
+        </div>
+      </section>
+
+      <section class="view" id="view-profiles" data-view-panel="profiles" aria-labelledby="profiles-title" hidden>
+        <div class="page-intro section-intro">
+          <div><span class="eyebrow"><svg><use href="#i-folder"></use></svg> Destination presets</span><h1 id="profiles-title">Profiles</h1><p>Keep galleries organised by routing each download to the right folder.</p></div>
+          <button class="button button-primary" id="new-profile" type="button"><svg><use href="#i-plus"></use></svg> New profile</button>
+        </div>
+        <div class="profile-grid" id="profile-grid" aria-live="polite"></div>
+        <div class="empty-state" id="profiles-empty" hidden><div class="empty-illustration"><svg><use href="#i-folder"></use></svg><span></span></div><h3>Create your first profile</h3><p>Profiles map downloads to a named folder on the server.</p><button class="button button-primary" type="button" id="empty-new-profile"><svg><use href="#i-plus"></use></svg> New profile</button></div>
+      </section>
+
+      <section class="view sort-view" id="view-sort" data-view-panel="sort" aria-labelledby="sort-title" hidden>
+        <div class="page-intro section-intro sort-intro">
+          <div><span class="eyebrow"><svg><use href="#i-sort"></use></svg> Visual file sorter</span><h1 id="sort-title">Match related images</h1><p>Compare a target folder against your reference folders, then organise each set without leaving the browser.</p></div>
+          <div class="intro-actions sort-intro-actions">
+            <button class="button button-quiet" id="sort-rescan" type="button" disabled><svg><use href="#i-refresh"></use></svg> Rescan</button>
+            <button class="button button-primary" id="sort-start" type="button" disabled><svg><use href="#i-play"></use></svg> Start sorting</button>
+          </div>
+        </div>
+
+        <div class="sort-workspace">
+          <aside class="panel sort-setup" aria-labelledby="sort-setup-title">
+            <div class="sort-panel-heading"><div><span class="sort-step">01</span><h2 id="sort-setup-title">Set up this run</h2></div><span id="sort-root-label" class="sort-root-label">Loading folders…</span></div>
+
+            <div class="sort-profile-row">
+              <label class="field"><span>Saved setup</span><select id="sort-profile-select"><option value="">Custom setup</option></select></label>
+              <button class="icon-button sort-profile-delete" id="sort-profile-delete" type="button" aria-label="Delete saved setup" title="Delete saved setup" disabled><svg><use href="#i-trash"></use></svg></button>
+            </div>
+
+            <label class="field"><span>Target folder</span><small>The images you want to classify.</small><select id="sort-target"><option value="">Choose a target folder…</option></select></label>
+
+            <fieldset class="sort-controls-fieldset">
+              <legend>Reference folders <small id="sort-control-help">Optional — leave empty to compare sibling folders automatically.</small></legend>
+              <div class="sort-folder-list" id="sort-control-list"><div class="sort-folder-loading"><svg class="spin"><use href="#i-refresh"></use></svg> Finding folders…</div></div>
+            </fieldset>
+
+            <div class="sort-form-grid">
+              <fieldset class="sort-mode-fieldset">
+                <legend>Match by</legend>
+                <div class="sort-mode-switch">
+                  <label><input type="radio" name="sort-mode" value="time" checked><span><svg><use href="#i-clock"></use></svg>Time</span></label>
+                  <label><input type="radio" name="sort-mode" value="stem"><span><svg><use href="#i-image"></use></svg>Filename</span></label>
+                </div>
+              </fieldset>
+              <label class="field sort-threshold-field"><span>Time threshold</span><div class="sort-number-input"><input id="sort-threshold" type="number" min="0" step="1" value="50" inputmode="numeric"><span>sec</span></div></label>
+            </div>
+
+            <label class="toggle-row sort-toggle"><span><b>Add paired IDs</b><small>Prefix matched files with a shared identifier.</small></span><input id="sort-add-ids" type="checkbox" checked><span class="toggle"></span></label>
+
+            <div class="sort-profile-save">
+              <label class="field"><span>Save this setup</span><input id="sort-profile-name" type="text" maxlength="64" placeholder="e.g. Main library" autocomplete="off"></label>
+              <button class="button button-quiet" id="sort-profile-save" type="button"><svg><use href="#i-check"></use></svg> Save</button>
+            </div>
+          </aside>
+
+          <section class="panel sort-stage-panel" aria-labelledby="sort-stage-title">
+            <header class="sort-stage-header">
+              <div><span class="sort-step">02</span><div><h2 id="sort-stage-title">Decision desk</h2><p id="sort-session-label">Ready when you are</p></div></div>
+              <button class="button button-quiet sort-undo" id="sort-undo" type="button" disabled><svg><use href="#i-undo"></use></svg> Undo</button>
+            </header>
+
+            <div class="sort-progress-wrap" id="sort-progress-wrap" hidden>
+              <div class="sort-progress-copy"><span><b id="sort-processed">0</b> of <b id="sort-total">0</b> reviewed</span><span id="sort-remaining">0 remaining</span></div>
+              <div class="sort-progress" role="progressbar" aria-label="Sorting progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="sort-progress-bar"></span></div>
+            </div>
+
+            <div class="sort-welcome" id="sort-welcome">
+              <div class="sort-welcome-art"><svg><use href="#i-sort"></use></svg><span></span></div>
+              <h3 id="sort-welcome-title">Build a focused sorting queue</h3>
+              <p id="sort-welcome-copy">Choose your folders and matching method, then start. Your active session is remembered on this browser.</p>
+              <div class="sort-shortcut-preview"><span><kbd>Z</kbd> Undo</span><span><kbd>N</kbd> No match</span><span><kbd>S</kbd> Skip</span></div>
+            </div>
+
+            <div class="sort-decision" id="sort-decision" hidden>
+              <article class="sort-target-card">
+                <div class="sort-target-media"><div class="image-placeholder"><svg><use href="#i-image"></use></svg></div><img id="sort-target-preview" alt="Current target image"><span class="sort-media-badge">Target</span></div>
+                <div class="sort-target-copy"><div><span id="sort-target-date">Current file</span><h3 id="sort-target-name">—</h3><p id="sort-target-path">—</p></div><span class="sort-current-count" id="sort-current-count">1 / 1</span></div>
+              </article>
+
+              <div class="sort-match-heading"><div><h3>Best candidates</h3><p id="sort-match-summary">Choose the related reference image.</p></div><span class="sort-key-hint"><kbd>Z</kbd> undo last</span></div>
+              <div class="sort-match-grid" id="sort-match-grid" aria-live="polite"></div>
+
+              <div class="sort-action-bar">
+                <button class="button sort-action-none" id="sort-action-none" type="button"><svg><use href="#i-eye-off"></use></svg> No match <kbd>N</kbd></button>
+                <button class="button button-quiet sort-action-skip" id="sort-action-skip" type="button"><svg><use href="#i-arrow"></use></svg> Skip <kbd>S</kbd></button>
+              </div>
+            </div>
+
+            <div class="sort-complete" id="sort-complete" hidden>
+              <span class="sort-complete-icon"><svg><use href="#i-check"></use></svg></span><h3>Folder reviewed</h3><p id="sort-complete-summary">Every target has a decision.</p><button class="button button-primary" id="sort-complete-rescan" type="button"><svg><use href="#i-refresh"></use></svg> Scan again</button>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" id="view-settings" data-view-panel="settings" aria-labelledby="settings-title" hidden>
+        <div class="page-intro section-intro"><div><span class="eyebrow"><svg><use href="#i-settings"></use></svg> Server preferences</span><h1 id="settings-title">Settings</h1><p>Control downloads, discovery, and the way this browser behaves.</p></div></div>
+        <form id="settings-form" class="settings-layout">
+          <div class="settings-column">
+            <section class="panel settings-card">
+              <div class="settings-card-heading"><span class="settings-icon"><svg><use href="#i-download"></use></svg></span><div><h2>Downloads</h2><p>Transfer defaults for all profiles</p></div></div>
+              <label class="field"><span>Concurrent image downloads</span><small>Higher values are faster but use more bandwidth.</small><input id="setting-workers" name="image_workers" type="number" min="1" max="24" value="6"></label>
+              <label class="field"><span>Concurrent gallery jobs</span><small>How many galleries the server processes at once.</small><input id="setting-job-workers" name="job_workers" type="number" min="1" max="8" value="2"></label>
+              <label class="field"><span>Request timeout <em>seconds</em></span><input id="setting-timeout" name="request_timeout" type="number" min="5" max="120" value="30"></label>
+            </section>
+            <section class="panel settings-card">
+              <div class="settings-card-heading"><span class="settings-icon violet"><svg><use href="#i-grid"></use></svg></span><div><h2>Discovery</h2><p>Gallery browsing preferences</p></div></div>
+              <label class="field"><span>Gallery density</span><select id="setting-density" name="density"><option value="comfortable">Comfortable</option><option value="compact">Compact</option></select></label>
+              <label class="toggle-row"><span><b>Hide ignored by default</b><small>Ignored galleries stay out of browse results.</small></span><input id="setting-hide-ignored" name="hide_ignored" type="checkbox" checked><span class="toggle"></span></label>
+              <label class="toggle-row"><span><b>Show saved by default</b><small>Include previously downloaded galleries.</small></span><input id="setting-show-saved" name="show_saved" type="checkbox" checked><span class="toggle"></span></label>
+            </section>
+          </div>
+          <div class="settings-column">
+            <section class="panel settings-card">
+              <div class="settings-card-heading"><span class="settings-icon green"><svg><use href="#i-folder"></use></svg></span><div><h2>Storage</h2><p>Server-side library location</p></div></div>
+              <label class="field"><span>Download root</span><small>Configured on the server through PORNPIC_WEBUI_DOWNLOAD_ROOT.</small><input id="setting-root" name="download_root" type="text" placeholder="/path/to/downloads" readonly></label>
+              <label class="field"><span>Sorter root</span><small>The highest folder available in the Sort workspace.</small><input id="setting-sort-root" name="sort_root" type="text" placeholder="/path/to/sort-library" readonly></label>
+              <div class="path-preview"><svg><use href="#i-info"></use></svg><span>Configure storage roots with server environment variables.</span></div>
+            </section>
+            <section class="panel settings-card about-card">
+              <div class="settings-card-heading"><span class="settings-icon amber"><svg><use href="#i-spark"></use></svg></span><div><h2>About</h2><p>GalleryFlow WebUI</p></div></div>
+              <dl class="about-list"><div><dt>Web interface</dt><dd>v2.0</dd></div><div><dt>Server</dt><dd id="about-server">Checking…</dd></div><div><dt>Keyboard shortcuts</dt><dd><button type="button" id="show-shortcuts">View</button></dd></div></dl>
+            </section>
+          </div>
+          <div class="settings-savebar"><span id="settings-status">Settings are saved on the server.</span><button class="button button-primary" id="save-settings" type="submit"><svg><use href="#i-check"></use></svg> Save changes</button></div>
+        </form>
+      </section>
+    </main>
+
+    <nav class="mobile-nav" aria-label="Mobile navigation">
+      <button class="is-active" type="button" data-view="discover"><svg><use href="#i-grid"></use></svg><span>Discover</span></button>
+      <button type="button" data-view="queue"><span class="mobile-nav-icon"><svg><use href="#i-queue"></use></svg><i id="mobile-queue-count" hidden></i></span><span>Queue</span></button>
+      <button type="button" data-view="profiles"><svg><use href="#i-folder"></use></svg><span>Profiles</span></button>
+      <button type="button" data-view="sort"><svg><use href="#i-sort"></use></svg><span>Sort</span></button>
+      <button type="button" data-view="settings"><svg><use href="#i-settings"></use></svg><span>Settings</span></button>
+    </nav>
+  </div>
+
+  <dialog class="modal gallery-modal" id="gallery-modal" aria-labelledby="gallery-modal-title">
+    <div class="modal-shell">
+      <header class="modal-header">
+        <div class="modal-title-wrap">
+          <span class="modal-kicker" id="gallery-modal-kicker">Gallery details</span>
+          <h2 id="gallery-modal-title">Loading gallery…</h2>
+        </div>
+        <div class="modal-header-actions">
+          <a class="icon-button" id="gallery-source-link" href="#" target="_blank" rel="noopener noreferrer" title="Open source" aria-label="Open original source"><svg><use href="#i-external"></use></svg></a>
+          <button class="icon-button" type="button" data-close-modal aria-label="Close gallery"><svg><use href="#i-close"></use></svg></button>
+        </div>
+      </header>
+      <div class="modal-body gallery-modal-body">
+        <aside class="gallery-summary" id="gallery-summary">
+          <div class="summary-cover" id="summary-cover"><div class="image-placeholder"><svg><use href="#i-image"></use></svg></div></div>
+          <div class="summary-meta">
+            <div class="summary-status" id="summary-status"></div>
+            <dl><div><dt>Images</dt><dd id="summary-image-count">—</dd></div><div><dt>Source</dt><dd id="summary-source">—</dd></div><div><dt>Profile</dt><dd id="summary-profile">Not saved</dd></div></dl>
+          </div>
+          <button class="button button-quiet button-full" id="modal-ignore" type="button"><svg><use href="#i-eye-off"></use></svg><span>Ignore gallery</span></button>
+        </aside>
+        <section class="image-picker" aria-labelledby="image-picker-title">
+          <div class="image-picker-header">
+            <div><h3 id="image-picker-title">Choose images</h3><p id="selection-summary">Loading images…</p></div>
+            <div class="picker-actions"><button class="text-button" id="select-all" type="button">Select all</button><span></span><button class="text-button" id="select-none" type="button">Clear</button></div>
+          </div>
+          <div class="image-grid" id="image-grid" aria-live="polite" aria-busy="true"></div>
+          <div class="empty-state compact" id="images-empty" hidden><div class="empty-illustration"><svg><use href="#i-image"></use></svg><span></span></div><h3>No images found</h3><p>The server could not find downloadable images on this page.</p></div>
+        </section>
+      </div>
+      <footer class="modal-footer gallery-footer">
+        <div class="selection-total"><span id="selected-count">0</span><span>images selected</span></div>
+        <label class="modal-profile"><span>Download to</span><select id="modal-profile-select" aria-label="Download profile"></select></label>
+        <button class="button button-primary button-download" id="queue-download" type="button" disabled><svg><use href="#i-download"></use></svg><span>Add to queue</span></button>
+      </footer>
+    </div>
+  </dialog>
+
+  <dialog class="modal form-modal" id="profile-modal" aria-labelledby="profile-modal-title">
+    <form class="modal-shell" id="profile-form" method="dialog">
+      <header class="modal-header"><div class="modal-title-wrap"><span class="modal-kicker">Destination preset</span><h2 id="profile-modal-title">New profile</h2></div><button class="icon-button" type="button" data-close-modal aria-label="Close"><svg><use href="#i-close"></use></svg></button></header>
+      <div class="modal-body form-modal-body">
+        <input id="profile-id" type="hidden">
+        <label class="field"><span>Profile name</span><small>A short label shown throughout the app.</small><input id="profile-name" type="text" required maxlength="64" placeholder="e.g. Favourites" autocomplete="off"></label>
+        <label class="field"><span>Server folder</span><small>Generated safely from the profile name; renaming keeps the existing folder.</small><div class="folder-input"><span id="root-prefix">…/</span><input id="profile-folder" type="text" readonly aria-readonly="true" tabindex="-1" placeholder="Favourites"></div></label>
+        <label class="toggle-row boxed"><span><b>Use as default</b><small>Preselect this profile for new downloads.</small></span><input id="profile-default" type="checkbox"><span class="toggle"></span></label>
+      </div>
+      <footer class="modal-footer"><button class="button button-quiet" type="button" data-close-modal>Cancel</button><button class="button button-primary" id="save-profile" type="submit"><svg><use href="#i-check"></use></svg> Save profile</button></footer>
+    </form>
+  </dialog>
+
+  <dialog class="modal form-modal shortcut-modal" id="shortcut-modal" aria-labelledby="shortcut-title">
+    <div class="modal-shell">
+      <header class="modal-header"><div class="modal-title-wrap"><span class="modal-kicker">Move faster</span><h2 id="shortcut-title">Keyboard shortcuts</h2></div><button class="icon-button" type="button" data-close-modal aria-label="Close"><svg><use href="#i-close"></use></svg></button></header>
+      <div class="modal-body shortcut-list"><div><span>Focus source or search</span><kbd>/</kbd></div><div><span>Refresh current view</span><kbd>R</kbd></div><div><span>Close an open dialog</span><kbd>Esc</kbd></div><div><span>Select all gallery images</span><kbd>A</kbd></div><div><span>Queue selected images</span><kbd>Enter</kbd></div><div><span>Undo last sort decision</span><kbd>Z</kbd></div><div><span>Mark current target unmatched</span><kbd>N</kbd></div><div><span>Skip current sort target</span><kbd>S</kbd></div></div>
+    </div>
+  </dialog>
+
+  <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="false"></div>
+  <div class="sr-only" id="aria-status" aria-live="polite"></div>
+
+  <template id="gallery-card-template">
+    <article class="gallery-card">
+      <button class="gallery-open" type="button" aria-label="Open gallery details">
+        <div class="card-image"><div class="image-placeholder"><svg><use href="#i-image"></use></svg></div><img alt="" loading="lazy" decoding="async"><span class="card-status"></span><span class="image-count"><svg><use href="#i-image"></use></svg><b></b></span><span class="card-open-hint">View gallery <svg><use href="#i-arrow"></use></svg></span></div>
+      </button>
+      <div class="card-content">
+        <div class="card-copy"><button class="card-title gallery-open-text" type="button"></button><p class="card-meta"></p></div>
+        <button class="card-ignore icon-button" type="button" aria-label="Ignore gallery" title="Ignore gallery"><svg><use href="#i-eye-off"></use></svg></button>
+      </div>
+    </article>
+  </template>
+
+  <template id="job-template">
+    <article class="job-row">
+      <div class="job-thumb"><div class="image-placeholder"><svg><use href="#i-image"></use></svg></div><img alt="" loading="lazy"></div>
+      <div class="job-main"><div class="job-heading"><div><h3></h3><p></p></div><span class="job-state"></span></div><div class="job-progress"><span></span></div><div class="job-detail"><span class="job-progress-label"></span><span class="job-speed"></span></div><div class="job-error" hidden></div></div>
+      <div class="job-actions"><button class="icon-button job-toggle" type="button" title="Pause" aria-label="Pause download"><svg><use href="#i-pause"></use></svg></button><button class="icon-button job-remove" type="button" title="Remove" aria-label="Remove from queue"><svg><use href="#i-close"></use></svg></button></div>
+    </article>
+  </template>
+
+  <template id="profile-card-template">
+    <article class="profile-card">
+      <div class="profile-card-top"><span class="profile-folder-icon"><svg><use href="#i-folder"></use></svg></span><span class="default-badge" hidden>Default</span><div class="card-menu"><button class="icon-button profile-menu-trigger" type="button" aria-label="Profile actions" aria-haspopup="true"><svg><use href="#i-more"></use></svg></button><div class="card-menu-popover" hidden><button type="button" data-profile-action="edit"><svg><use href="#i-edit"></use></svg>Edit</button><button type="button" data-profile-action="default"><svg><use href="#i-check"></use></svg>Make default</button><button class="danger" type="button" data-profile-action="delete"><svg><use href="#i-trash"></use></svg>Delete</button></div></div></div>
+      <h2></h2><p class="profile-path"></p><div class="profile-card-footer"><span><b class="profile-count">0</b> galleries</span><button class="text-button profile-use" type="button">Use profile <svg><use href="#i-arrow"></use></svg></button></div>
+    </article>
+  </template>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

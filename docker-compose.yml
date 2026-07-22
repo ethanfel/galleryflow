@@ -1,0 +1,17 @@
+services:
+  pornpic-webui:
+    image: ghcr.io/ethanfel/pornpic-webui:latest
+    build: .
+    container_name: pornpic-webui
+    restart: unless-stopped
+    ports:
+      - "8099:8099"
+    volumes:
+      - pornpic-data:/data
+    environment:
+      PORNPIC_WEBUI_JOB_WORKERS: "2"
+      PORNPIC_WEBUI_IMAGE_WORKERS: "6"
+      PORNPIC_WEBUI_SORT_ROOT: /data/downloads
+
+volumes:
+  pornpic-data:
