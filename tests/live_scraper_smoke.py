@@ -18,6 +18,14 @@ async def check(download: bool = False) -> None:
     listing = await scraper.browse(query="pov", page=1)
     if not listing["items"]:
         raise RuntimeError("Live search returned no galleries")
+    if not listing["next_url"]:
+        raise RuntimeError("Live search did not expose another page")
+    second_page = await scraper.browse(url=listing["next_url"], page=2)
+    if not second_page["items"]:
+        raise RuntimeError("Live search page two returned no galleries")
+    first_keys = {item["key"] for item in listing["items"]}
+    if first_keys.intersection(item["key"] for item in second_page["items"]):
+        raise RuntimeError("Live search pagination repeated page-one galleries")
     first = listing["items"][0]
     gallery = await scraper.gallery(first["url"])
     if not gallery["images"]:
@@ -30,6 +38,7 @@ async def check(download: bool = False) -> None:
         raise RuntimeError("Pasted gallery URL did not resolve to one gallery card")
     result = {
         "search_items": len(listing["items"]),
+        "second_page_items": len(second_page["items"]),
         "direct_gallery_items": len(direct_gallery["items"]),
         "gallery_key": gallery["key"],
         "gallery_images": len(gallery["images"]),

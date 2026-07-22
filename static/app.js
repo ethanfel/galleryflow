@@ -20,11 +20,9 @@
     browseMode: 'url',
     galleries: [],
     page: 1,
-    pages: 1,
     total: 0,
     sourceUrl: '',
     nextUrl: '',
-    previousUrl: '',
     query: '',
     profiles: [],
     activeProfile: storage.get('active-profile', ''),
@@ -44,6 +42,7 @@
     queueTimer: null,
     healthTimer: null,
     requestController: null,
+    galleryObserver: null,
     sortFolders: [],
     sortProfiles: [],
     sortSession: null,
@@ -531,46 +530,67 @@
     } catch (error) { toast('Could not delete profile', errorMessage(error), 'error'); }
   }
 
-  function galleryQuery() {
+  function galleryQuery({ url = state.sourceUrl, page = 1 } = {}) {
     return withParams('/api/galleries', {
-      url: state.sourceUrl,
+      url,
       q: state.query,
-      page: state.page,
+      page,
       profile: state.activeProfile,
       show_saved: state.filters.showSaved,
       show_ignored: state.filters.showIgnored
     });
   }
 
-  async function loadGalleries({ quiet = false } = {}) {
+  async function loadGalleries({ quiet = false, append = false } = {}) {
+    if (state.loadingGalleries || (append && !state.nextUrl)) return;
     if (state.requestController) state.requestController.abort();
     state.requestController = new AbortController();
     state.loadingGalleries = true;
-    renderGallerySkeletons();
+    const requestedPage = append ? state.page + 1 : 1;
+    const requestedUrl = append ? state.nextUrl : state.sourceUrl;
+    const moreButton = $('#page-next');
+    if (append) {
+      setButtonBusy(moreButton, true, 'Loading…');
+      $('#gallery-grid').setAttribute('aria-busy', 'true');
+    } else {
+      renderGallerySkeletons();
+    }
     hideNotice();
     try {
-      const data = await api(galleryQuery(), { signal: state.requestController.signal });
-      state.galleries = apiItems(data, 'galleries').map(normalizeGallery);
-      state.total = Number(data?.total ?? state.galleries.length);
-      state.page = Number(data?.page ?? state.page ?? 1);
-      state.pages = Math.max(1, Number(data?.pages ?? data?.total_pages ?? 1));
-      state.sourceUrl = data?.source_url || state.sourceUrl;
+      const data = await api(galleryQuery({ url: requestedUrl, page: requestedPage }), { signal: state.requestController.signal });
+      const incoming = apiItems(data, 'galleries').map(normalizeGallery);
+      if (append) {
+        const seen = new Set(state.galleries.map(gallery => String(gallery.id || normalizeHistoryUrl(gallery.url))));
+        incoming.forEach(gallery => {
+          const identity = String(gallery.id || normalizeHistoryUrl(gallery.url));
+          if (!seen.has(identity)) {
+            seen.add(identity);
+            state.galleries.push(gallery);
+          }
+        });
+      } else {
+        state.galleries = incoming;
+      }
+      state.total = state.galleries.length;
+      state.page = Number(data?.page ?? requestedPage);
+      if (!append) state.sourceUrl = data?.source_url || state.sourceUrl;
       state.nextUrl = data?.next_url || '';
-      state.previousUrl = data?.previous_url || '';
       if (state.sourceUrl && state.browseMode === 'url') $('#source-input').value = state.sourceUrl;
       renderGalleries();
-      announce(`${state.total} galleries loaded`);
+      announce(`${state.galleries.length} galleries loaded`);
       setServerState(true, $('#server-detail').textContent === 'Unable to connect' ? 'Ready' : $('#server-detail').textContent);
     } catch (error) {
       if (error.name === 'AbortError') return;
-      state.galleries = [];
+      if (!append) state.galleries = [];
       renderGalleries();
       showNotice(errorMessage(error));
-      if (!quiet) toast('Could not load galleries', errorMessage(error), 'error');
+      if (!quiet) toast(append ? 'Could not load more galleries' : 'Could not load galleries', errorMessage(error), 'error');
     } finally {
       state.loadingGalleries = false;
       $('#gallery-grid').setAttribute('aria-busy', 'false');
       state.requestController = null;
+      if (append) setButtonBusy(moreButton, false);
+      renderPagination();
       $('#refresh-button').classList.remove('is-spinning');
     }
   }
@@ -645,18 +665,19 @@
 
     const context = state.query ? `Search results for “${state.query}”` : state.sourceUrl ? displayHost(state.sourceUrl) : 'Recent galleries';
     $('#collection-title').textContent = context;
-    $('#collection-summary').textContent = state.total ? `${formatNumber(state.total)} ${state.total === 1 ? 'gallery' : 'galleries'}${hiddenCount ? ` · ${hiddenCount} hidden` : ''}` : 'No matching galleries';
+    $('#collection-summary').textContent = state.total ? `${formatNumber(state.total)} ${state.total === 1 ? 'gallery' : 'galleries'} loaded${hiddenCount ? ` · ${hiddenCount} hidden` : ''}` : 'No matching galleries';
     renderPagination();
   }
 
   function renderPagination() {
-    const hasPrev = state.page > 1 || Boolean(state.previousUrl);
-    const hasNext = state.page < state.pages || Boolean(state.nextUrl);
-    const show = hasPrev || hasNext;
-    $('#pagination').hidden = !show;
-    $('#page-prev').disabled = !hasPrev;
-    $('#page-next').disabled = !hasNext;
-    $('#page-status').textContent = state.pages > 1 ? `Page ${state.page} of ${state.pages}` : `Page ${state.page}`;
+    const hasNext = Boolean(state.nextUrl);
+    $('#pagination').hidden = !hasNext && state.page <= 1;
+    $('#page-next').hidden = !hasNext;
+    $('#page-next').disabled = !hasNext || state.loadingGalleries;
+    $('#page-status').textContent = `${formatNumber(state.galleries.length)} ${state.galleries.length === 1 ? 'gallery' : 'galleries'} loaded`;
+    $('#page-hint').textContent = hasNext
+      ? `Through page ${state.page} · more load automatically as you scroll`
+      : `All available results loaded through page ${state.page}`;
   }
 
   function loadImage(image, source, alt = '') {
@@ -703,7 +724,6 @@
     }
     state.page = 1;
     state.nextUrl = '';
-    state.previousUrl = '';
     await loadGalleries();
   }
 
@@ -738,22 +758,21 @@
     input.focus();
   }
 
-  async function changePage(direction) {
-    if (direction > 0) {
-      if (state.nextUrl && state.sourceUrl) {
-        state.sourceUrl = state.nextUrl;
-        state.page += 1;
-      } else if (state.page < state.pages) state.page += 1;
-      else return;
-    } else {
-      if (state.previousUrl && state.sourceUrl) {
-        state.sourceUrl = state.previousUrl;
-        state.page = Math.max(1, state.page - 1);
-      } else if (state.page > 1) state.page -= 1;
-      else return;
-    }
-    await loadGalleries();
-    $('#collection-title').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  async function loadMoreGalleries() {
+    await loadGalleries({ append: true });
+  }
+
+  function setupGalleryAutoLoad() {
+    if (!('IntersectionObserver' in window)) return;
+    state.galleryObserver = new IntersectionObserver(entries => {
+      if (
+        entries.some(entry => entry.isIntersecting)
+        && state.view === 'discover'
+        && state.nextUrl
+        && !state.loadingGalleries
+      ) loadGalleries({ append: true, quiet: true });
+    }, { rootMargin: '500px 0px' });
+    state.galleryObserver.observe($('#pagination'));
   }
 
   async function toggleIgnore(gallery, button = null) {
@@ -1590,8 +1609,7 @@
         if (gallery) toggleIgnore(gallery, ignore);
       } else if (open) openGallery(open.dataset.galleryId);
     });
-    $('#page-prev').addEventListener('click', () => changePage(-1));
-    $('#page-next').addEventListener('click', () => changePage(1));
+    $('#page-next').addEventListener('click', loadMoreGalleries);
     $('#active-profile').addEventListener('change', event => selectProfile(event.target.value));
     $('#modal-profile-select').addEventListener('change', event => selectProfile(event.target.value, false));
     $('#refresh-button').addEventListener('click', refreshCurrent);
@@ -1726,6 +1744,7 @@
 
   async function init() {
     bindEvents();
+    setupGalleryAutoLoad();
     syncFilterControls();
     $$('.density-switch button').forEach(button => button.classList.toggle('is-active', button.dataset.density === state.density));
     renderGallerySkeletons();

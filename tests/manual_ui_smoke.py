@@ -21,7 +21,7 @@ from app.main import create_app
 from app.security import encode_gallery_id, gallery_key
 
 
-def build_visual_app(temp_root: Path):
+def build_visual_app(temp_root: Path, *, load_more: bool = False):
     config = AppConfig(
         data_dir=temp_root / "data",
         download_root=temp_root / "downloads",
@@ -49,7 +49,7 @@ def build_visual_app(temp_root: Path):
     )
     sample_image = "https://cdni.pornpics.com/460/7/343/79186222/79186222_001_d325.jpg"
     galleries = []
-    for index in range(6):
+    for index in range(12):
         remote_id = 79186222 + index
         url = f"https://www.pornpics.com/galleries/sample-gallery-{remote_id}/"
         galleries.append(
@@ -64,7 +64,7 @@ def build_visual_app(temp_root: Path):
                     "Soft focus summer collection",
                     "Classic monochrome session",
                     "Warm sunset portrait set",
-                ][index],
+                ][index % 6],
                 "thumbnail_remote_url": sample_image,
                 "image_count": 20 + index,
             }
@@ -87,12 +87,19 @@ def build_visual_app(temp_root: Path):
         1234,
     )
 
-    async def fake_browse(**_: object) -> dict:
+    async def fake_browse(**kwargs: object) -> dict:
+        page = int(kwargs.get("page", 1))
+        source = str(kwargs.get("url") or "")
+        if "offset=20" in source:
+            page = 2
+        start = 6 if page > 1 else 0
         return {
-            "items": [dict(item) for item in galleries],
+            "items": [dict(item) for item in galleries[start : start + 6]],
             "source_url": "https://www.pornpics.com/",
-            "next_url": "https://www.pornpics.com/?offset=20&limit=20",
-            "previous_url": None,
+            "next_url": (
+                "https://www.pornpics.com/?offset=20&limit=20" if page == 1 else None
+            ),
+            "previous_url": "https://www.pornpics.com/" if page > 1 else None,
         }
 
     app.state.scraper.browse = fake_browse
@@ -107,6 +114,8 @@ def build_visual_app(temp_root: Path):
     async def fake_bootstrap() -> Response:
         session_id = json.dumps(sort_session["id"])
         script = f"localStorage.setItem('galleryflow:sort-session', JSON.stringify({session_id}));"
+        if load_more:
+            script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const button=document.querySelector('#page-next');if(button&&!button.hidden&&!button.disabled){button.click();clearInterval(poll)}},50)});"
         return Response(script, media_type="application/javascript")
 
     async def fake_index() -> Response:
@@ -136,9 +145,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mobile", action="store_true")
     parser.add_argument("--sort", action="store_true")
+    parser.add_argument("--load-more", action="store_true")
     args = parser.parse_args()
     suffix = (
-        "sort-mobile"
+        "load-more"
+        if args.load_more
+        else "sort-mobile"
         if args.sort and args.mobile
         else "sort"
         if args.sort
@@ -151,7 +163,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="pornpic-webui-") as directory:
         server = uvicorn.Server(
             uvicorn.Config(
-                build_visual_app(Path(directory)),
+                build_visual_app(Path(directory), load_more=args.load_more),
                 host="127.0.0.1",
                 port=18101,
                 log_level="warning",

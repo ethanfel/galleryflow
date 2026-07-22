@@ -4,7 +4,7 @@ A self-contained, server-side PornPics gallery browser and downloader. The compl
 
 ## Highlights
 
-- Browse the current PornPics catalog, search, paste a category URL, and paginate without leaving the WebUI.
+- Browse the current PornPics catalog, search, paste a category URL, and keep loading additional pages into one portrait gallery grid.
 - Green complete, blue partial, and red ignored states, scoped correctly per profile.
 - Download a whole gallery or select individual images in their original order.
 - Automatic profile folders with safe, server-controlled paths.
