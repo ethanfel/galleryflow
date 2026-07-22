@@ -22,7 +22,11 @@ from app.security import encode_gallery_id, gallery_key
 
 
 def build_visual_app(
-    temp_root: Path, *, load_more: bool = False, open_gallery: bool = False
+    temp_root: Path,
+    *,
+    load_more: bool = False,
+    open_gallery: bool = False,
+    open_lightbox: bool = False,
 ):
     config = AppConfig(
         data_dir=temp_root / "data",
@@ -114,6 +118,7 @@ def build_visual_app(
                 {
                     "url": f"https://cdni.pornpics.com/1280/manual/{index:03d}.jpg",
                     "preview_remote_url": f"https://cdni.pornpics.com/460/manual/{index:03d}.jpg",
+                    "filename": f"manual-{index:03d}.jpg",
                     "ordinal": index,
                 }
                 for index in range(1, 22)
@@ -136,6 +141,8 @@ def build_visual_app(
             script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const button=document.querySelector('#page-next');if(button&&!button.hidden&&!button.disabled){button.click();clearInterval(poll)}},50)});"
         if open_gallery:
             script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const button=document.querySelector('.gallery-open');if(button){button.click();clearInterval(poll)}},50)});"
+        if open_lightbox:
+            script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const button=document.querySelector('.image-preview-button');if(button){button.click();clearInterval(poll)}},50)});"
         return Response(script, media_type="application/javascript")
 
     async def fake_index() -> Response:
@@ -167,9 +174,14 @@ def main() -> None:
     parser.add_argument("--sort", action="store_true")
     parser.add_argument("--load-more", action="store_true")
     parser.add_argument("--gallery", action="store_true")
+    parser.add_argument("--lightbox", action="store_true")
     args = parser.parse_args()
     suffix = (
-        "gallery"
+        "lightbox-mobile"
+        if args.lightbox and args.mobile
+        else "lightbox"
+        if args.lightbox
+        else "gallery"
         if args.gallery
         else "load-more"
         if args.load_more
@@ -182,14 +194,21 @@ def main() -> None:
         else "smoke"
     )
     output = Path(f"/tmp/pornpic-webui-{suffix}.png")
-    viewport = "390,844" if args.mobile else "1920,969" if args.gallery else "1440,1100"
+    viewport = (
+        "390,844"
+        if args.mobile
+        else "1920,969"
+        if args.gallery or args.lightbox
+        else "1440,1100"
+    )
     with tempfile.TemporaryDirectory(prefix="pornpic-webui-") as directory:
         server = uvicorn.Server(
             uvicorn.Config(
                 build_visual_app(
                     Path(directory),
                     load_more=args.load_more,
-                    open_gallery=args.gallery,
+                    open_gallery=args.gallery or args.lightbox,
+                    open_lightbox=args.lightbox,
                 ),
                 host="127.0.0.1",
                 port=18101,
@@ -220,8 +239,9 @@ def main() -> None:
                 "--disable-component-update",
                 "--disable-default-apps",
                 "--disable-sync",
+                "--force-prefers-reduced-motion",
                 "--no-first-run",
-                "--virtual-time-budget=1000",
+                f"--virtual-time-budget={3000 if args.lightbox else 1000}",
                 f"--user-data-dir={Path(directory) / 'chrome-profile'}",
                 f"--window-size={viewport}",
                 f"--screenshot={output}",

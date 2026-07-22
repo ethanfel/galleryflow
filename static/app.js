@@ -31,6 +31,10 @@
     jobFilter: 'all',
     gallery: null,
     selectedImages: new Set(),
+    lightboxIndex: -1,
+    lightboxZoomed: false,
+    lightboxTrigger: null,
+    lightboxLoadToken: 0,
     filters: storage.get('filters', { showSaved: true, showIgnored: false }),
     density: storage.get('density', 'comfortable'),
     settings: {},
@@ -173,11 +177,12 @@
   function normalizeDetail(item) {
     const gallery = normalizeGallery(item || {});
     gallery.images = apiItems(item?.images || []).map((image, index) => {
-      if (typeof image === 'string') return { url: image, previewUrl: image, filename: `Image ${index + 1}` };
+      if (typeof image === 'string') return { url: image, previewUrl: image, fullUrl: image, filename: `Image ${index + 1}` };
       return {
         ...image,
         url: image.url || image.image_url || image.src || '',
         previewUrl: image.preview_url || image.thumbnail_url || image.url || '',
+        fullUrl: image.full_url || image.fullUrl || image.preview_url || image.url || '',
         filename: image.filename || image.name || `Image ${index + 1}`
       };
     }).filter(image => image.url);
@@ -881,15 +886,21 @@
     const images = state.gallery?.images || [];
     $('#images-empty').hidden = Boolean(images.length);
     images.forEach((image, index) => {
-      const label = document.createElement('label');
-      label.className = `image-option${state.selectedImages.has(image.url) ? ' is-selected' : ''}`;
-      label.classList.toggle('is-downloaded', Boolean(image.downloaded));
-      label.dataset.imageUrl = image.url;
-      label.title = image.filename;
+      const option = document.createElement('div');
+      option.className = `image-option${state.selectedImages.has(image.url) ? ' is-selected' : ''}`;
+      option.classList.toggle('is-downloaded', Boolean(image.downloaded));
+      option.dataset.imageUrl = image.url;
+      option.dataset.imageIndex = String(index);
+      option.title = image.filename;
       const input = document.createElement('input');
+      input.id = `gallery-image-${index}`;
       input.type = 'checkbox';
       input.checked = state.selectedImages.has(image.url);
       input.setAttribute('aria-label', `Select ${image.filename}`);
+      const previewButton = document.createElement('button');
+      previewButton.className = 'image-preview-button';
+      previewButton.type = 'button';
+      previewButton.setAttribute('aria-label', `View ${image.filename} full size, image ${index + 1} of ${images.length}`);
       const placeholder = document.createElement('div');
       placeholder.className = 'image-placeholder';
       placeholder.innerHTML = '<svg><use href="#i-image"></use></svg>';
@@ -897,22 +908,120 @@
       preview.loading = 'lazy';
       preview.decoding = 'async';
       loadImage(preview, image.previewUrl, image.filename);
-      const check = document.createElement('span');
+      const previewHint = document.createElement('span');
+      previewHint.className = 'image-preview-hint';
+      previewHint.innerHTML = '<svg><use href="#i-maximize"></use></svg><span>Full size</span>';
+      previewButton.append(placeholder, preview, previewHint);
+      const check = document.createElement('label');
       check.className = 'image-check';
+      check.htmlFor = input.id;
+      check.setAttribute('aria-label', `Select ${image.filename}`);
       check.innerHTML = '<svg><use href="#i-check"></use></svg>';
       const number = document.createElement('span');
       number.className = 'image-number';
       number.textContent = String(index + 1).padStart(2, '0');
-      label.append(input, placeholder, preview, check, number);
+      option.append(input, previewButton, check, number);
       if (image.downloaded) {
         const saved = document.createElement('span');
         saved.className = 'image-saved';
         saved.innerHTML = '<svg><use href="#i-check"></use></svg> Saved';
-        label.append(saved);
+        option.append(saved);
       }
-      grid.append(label);
+      grid.append(option);
     });
     updateSelectionUi();
+  }
+
+  function setLightboxZoom(zoomed) {
+    state.lightboxZoomed = Boolean(zoomed);
+    const modal = $('#lightbox-modal');
+    modal.classList.toggle('is-zoomed', state.lightboxZoomed);
+    const button = $('#lightbox-zoom');
+    button.setAttribute('aria-pressed', String(state.lightboxZoomed));
+    $('#lightbox-zoom-label').textContent = state.lightboxZoomed ? 'Fit image' : 'Actual size';
+    $('use', button).setAttribute('href', state.lightboxZoomed ? '#i-minimize' : '#i-maximize');
+    if (!state.lightboxZoomed) $('#lightbox-stage').scrollTo({ top: 0, left: 0 });
+  }
+
+  function renderLightboxImage() {
+    const images = state.gallery?.images || [];
+    if (!images.length || state.lightboxIndex < 0) return;
+    state.lightboxIndex = ((state.lightboxIndex % images.length) + images.length) % images.length;
+    const image = images[state.lightboxIndex];
+    setLightboxZoom(false);
+
+    $('#lightbox-counter').textContent = `Image ${state.lightboxIndex + 1} of ${images.length}`;
+    $('#lightbox-title').textContent = image.filename;
+    const sourceLink = $('#lightbox-source-link');
+    const sourceUrl = safeUrl(image.fullUrl || image.previewUrl);
+    sourceLink.href = sourceUrl || '#';
+    sourceLink.hidden = !sourceUrl;
+    $('#lightbox-previous').disabled = images.length < 2;
+    $('#lightbox-next').disabled = images.length < 2;
+
+    const placeholder = $('#lightbox-stage .image-placeholder');
+    placeholder.classList.remove('is-loaded', 'is-error');
+    const previous = $('#lightbox-image');
+    const loadToken = ++state.lightboxLoadToken;
+    const display = document.createElement('img');
+    display.id = 'lightbox-image';
+    display.alt = `${image.filename}, full-resolution preview`;
+    display.decoding = 'async';
+    previous.removeAttribute('src');
+    previous.replaceWith(display);
+
+    const candidates = [...new Set([safeUrl(image.fullUrl), safeUrl(image.previewUrl)].filter(Boolean))];
+    let candidateIndex = 0;
+    const loadCandidate = () => {
+      const source = candidates[candidateIndex];
+      if (!source) {
+        display.hidden = true;
+        display.removeAttribute('src');
+        placeholder.classList.add('is-error');
+        return;
+      }
+      display.hidden = false;
+      display.src = source;
+    };
+    display.addEventListener('load', () => {
+      if (loadToken === state.lightboxLoadToken) placeholder.classList.add('is-loaded');
+    });
+    display.addEventListener('error', () => {
+      if (loadToken !== state.lightboxLoadToken) return;
+      candidateIndex += 1;
+      loadCandidate();
+    });
+    loadCandidate();
+    announce(`Viewing image ${state.lightboxIndex + 1} of ${images.length}: ${image.filename}`);
+  }
+
+  function openLightbox(index, trigger = null) {
+    const images = state.gallery?.images || [];
+    if (!images[index]) return;
+    state.lightboxIndex = index;
+    state.lightboxTrigger = trigger;
+    renderLightboxImage();
+    const dialog = $('#lightbox-modal');
+    if (!dialog.open) dialog.showModal();
+  }
+
+  function navigateLightbox(offset) {
+    const images = state.gallery?.images || [];
+    if (images.length < 2) return;
+    state.lightboxIndex += offset;
+    renderLightboxImage();
+  }
+
+  function resetLightbox() {
+    const trigger = state.lightboxTrigger;
+    state.lightboxLoadToken += 1;
+    state.lightboxIndex = -1;
+    state.lightboxTrigger = null;
+    setLightboxZoom(false);
+    const image = $('#lightbox-image');
+    image?.removeAttribute('src');
+    $('#lightbox-stage .image-placeholder')?.classList.remove('is-loaded', 'is-error');
+    if ($('#gallery-modal').open && trigger?.isConnected) trigger.focus({ preventScroll: true });
   }
 
   function toggleImage(url, checked) {
@@ -961,6 +1070,7 @@
       const count = state.selectedImages.size;
       const item = state.galleries.find(candidate => String(candidate.id) === String(gallery.id));
       if (item) item.queued = true;
+      closeModal($('#lightbox-modal'));
       $('#gallery-modal').close();
       renderGalleries();
       toast('Added to queue', `${formatNumber(count)} images will download to “${profile}”.`);
@@ -1698,6 +1808,20 @@
     $('#image-grid').addEventListener('change', event => {
       if (event.target.matches('input[type="checkbox"]')) toggleImage(event.target.closest('.image-option').dataset.imageUrl, event.target.checked);
     });
+    $('#image-grid').addEventListener('click', event => {
+      const trigger = event.target.closest('.image-preview-button');
+      if (!trigger) return;
+      const option = trigger.closest('.image-option');
+      openLightbox(Number(option.dataset.imageIndex), trigger);
+    });
+    $('#lightbox-previous').addEventListener('click', () => navigateLightbox(-1));
+    $('#lightbox-next').addEventListener('click', () => navigateLightbox(1));
+    $('#lightbox-zoom').addEventListener('click', () => setLightboxZoom(!state.lightboxZoomed));
+    $('#lightbox-stage').addEventListener('click', event => {
+      if (event.target.matches('#lightbox-image')) setLightboxZoom(!state.lightboxZoomed);
+    });
+    $('#lightbox-modal').addEventListener('close', resetLightbox);
+    $('#gallery-modal').addEventListener('close', () => closeModal($('#lightbox-modal')));
     $('#modal-ignore').addEventListener('click', () => {
       if (!state.gallery) return;
       const listItem = state.galleries.find(item => String(item.id) === String(state.gallery.id)) || state.gallery;
@@ -1719,9 +1843,16 @@
     const target = event.target;
     const editing = target.matches('input, textarea, select, [contenteditable="true"]');
     const galleryOpen = $('#gallery-modal').open;
+    const lightboxOpen = $('#lightbox-modal').open;
     const anyDialogOpen = Boolean($('dialog[open]'));
     const key = event.key.toLowerCase();
-    if (state.view === 'sort' && !editing && !anyDialogOpen && !event.ctrlKey && !event.metaKey && !event.altKey && ['z', 'n', 's'].includes(key)) {
+    if (lightboxOpen && !editing && event.key === 'ArrowLeft') {
+      event.preventDefault();
+      navigateLightbox(-1);
+    } else if (lightboxOpen && !editing && event.key === 'ArrowRight') {
+      event.preventDefault();
+      navigateLightbox(1);
+    } else if (state.view === 'sort' && !editing && !anyDialogOpen && !event.ctrlKey && !event.metaKey && !event.altKey && ['z', 'n', 's'].includes(key)) {
       event.preventDefault();
       if (key === 'z' && !$('#sort-undo').disabled) undoSortAction();
       else if (key === 'n' && state.sortSession?.current) performSortAction('no_control', null, $('#sort-action-none'));
@@ -1733,10 +1864,10 @@
     } else if (key === 'r' && !editing && !galleryOpen) {
       event.preventDefault();
       refreshCurrent();
-    } else if (galleryOpen && key === 'a' && !editing) {
+    } else if (galleryOpen && !lightboxOpen && key === 'a' && !editing) {
       event.preventDefault();
       selectAllImages(true);
-    } else if (galleryOpen && event.key === 'Enter' && !editing && !$('#queue-download').disabled) {
+    } else if (galleryOpen && !lightboxOpen && event.key === 'Enter' && !editing && !$('#queue-download').disabled) {
       event.preventDefault();
       queueGallery();
     }

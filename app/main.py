@@ -200,6 +200,7 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
         for image in detail["images"]:
             remote = image.pop("preview_remote_url")
             image["preview_url"] = media_url(remote)
+            image["full_url"] = media_url(image["url"])
             image["downloaded"] = image["url"] in downloaded_images
         detail.update(status)
         return detail

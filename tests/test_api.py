@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import anyio.to_thread
 import httpx
@@ -10,7 +11,7 @@ from PIL import Image
 
 from app.config import AppConfig
 from app.main import create_app
-from app.security import encode_gallery_id
+from app.security import encode_gallery_id, verify_media_signature
 
 
 GALLERY = "https://www.pornpics.com/galleries/sample-79186222/"
@@ -66,7 +67,26 @@ async def test_api_profile_browse_ignore_and_settings(
             "previous_url": None,
         }
 
+    original_image = "https://cdni.pornpics.com/1280/sample-full.jpg"
+    preview_image = "https://cdni.pornpics.com/460/sample-preview.jpg"
+
+    async def fake_gallery(url: str) -> dict:
+        return {
+            "id": encode_gallery_id(url),
+            "url": url,
+            "title": "Sample",
+            "images": [
+                {
+                    "url": original_image,
+                    "preview_remote_url": preview_image,
+                    "filename": "sample-full.jpg",
+                    "ordinal": 1,
+                }
+            ],
+        }
+
     monkeypatch.setattr(app.state.scraper, "browse", fake_browse)
+    monkeypatch.setattr(app.state.scraper, "gallery", fake_gallery)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
@@ -82,6 +102,24 @@ async def test_api_profile_browse_ignore_and_settings(
             assert card["thumbnail_url"].startswith("/api/media?")
 
             gallery_id = encode_gallery_id(GALLERY)
+            detail_response = await client.get(
+                f"/api/galleries/{gallery_id}", params={"profile": "POV"}
+            )
+            assert detail_response.status_code == 200
+            image = detail_response.json()["images"][0]
+            assert image["url"] == original_image
+            assert "preview_remote_url" not in image
+            for field, expected_url in (
+                ("preview_url", preview_image),
+                ("full_url", original_image),
+            ):
+                assert image[field].startswith("/api/media?")
+                params = parse_qs(urlsplit(image[field]).query)
+                assert params["url"] == [expected_url]
+                assert verify_media_signature(
+                    params["url"][0], params["token"][0], config.media_signing_key
+                )
+
             assert (
                 await client.patch(
                     f"/api/galleries/{gallery_id}",

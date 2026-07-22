@@ -6,12 +6,12 @@ A self-contained, server-side PornPics gallery browser and downloader. The compl
 
 - Browse the current PornPics catalog, search, paste a category URL, and keep loading additional pages into one portrait gallery grid.
 - Green complete, blue partial, and red ignored states, scoped correctly per profile.
-- Download a whole gallery or select individual images in their original order.
+- Open original-resolution images in a full-screen lightbox with zoom and keyboard navigation, then download a whole gallery or select individual images in their original order.
 - Automatic profile folders with safe, server-controlled paths.
 - Persistent queue with live progress, cancellation, per-image results, retries for transient failures, and restart recovery.
 - Global ignore/unignore, hide-saved and hide-ignored filters, history, profile management, and responsive mobile/desktop layouts.
 - Integrated visual sorter with timestamp or filename matching, reusable setups, ranked previews, paired IDs, collision-safe moves, keyboard shortcuts, and persistent undo.
-- SQLite persistence, signed same-origin thumbnail proxying, strict upstream host checks, download size limits, image validation, and atomic `.part` files.
+- SQLite persistence, signed same-origin image proxying, strict upstream host checks, download size limits, image validation, and atomic `.part` files.
 - Compatibility endpoints for the old client and an idempotent legacy importer for history, ignores, profiles, and usable sorter presets.
 
 Only download material you are legally permitted to access and retain. Site availability and terms remain outside this application.
@@ -54,10 +54,9 @@ Build from the checkout:
 docker compose up -d --build
 ```
 
-Or use the published GitHub Container Registry image (authenticate first because the repository and package are private):
+Or use the public GitHub Container Registry image:
 
 ```bash
-gh auth token | docker login ghcr.io -u ethanfel --password-stdin
 docker pull ghcr.io/ethanfel/galleryflow:latest
 docker run -d --name galleryflow --restart unless-stopped \
   -p 8100:8099 -v galleryflow-data:/data \
