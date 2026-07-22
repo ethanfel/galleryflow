@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="GalleryFlow" \
       org.opencontainers.image.description="Browser-only PornPics gallery downloader and visual sorter" \
-      org.opencontainers.image.version="2.0.1" \
+      org.opencontainers.image.version="2.0.2" \
       org.opencontainers.image.source="https://github.com/ethanfel/galleryflow"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

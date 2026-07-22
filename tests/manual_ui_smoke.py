@@ -21,7 +21,9 @@ from app.main import create_app
 from app.security import encode_gallery_id, gallery_key
 
 
-def build_visual_app(temp_root: Path, *, load_more: bool = False):
+def build_visual_app(
+    temp_root: Path, *, load_more: bool = False, open_gallery: bool = False
+):
     config = AppConfig(
         data_dir=temp_root / "data",
         download_root=temp_root / "downloads",
@@ -104,6 +106,22 @@ def build_visual_app(temp_root: Path, *, load_more: bool = False):
 
     app.state.scraper.browse = fake_browse
 
+    async def fake_gallery(url: str) -> dict:
+        gallery = next((item for item in galleries if item["url"] == url), galleries[0])
+        return {
+            **gallery,
+            "images": [
+                {
+                    "url": f"https://cdni.pornpics.com/1280/manual/{index:03d}.jpg",
+                    "preview_remote_url": f"https://cdni.pornpics.com/460/manual/{index:03d}.jpg",
+                    "ordinal": index,
+                }
+                for index in range(1, 22)
+            ],
+        }
+
+    app.state.scraper.gallery = fake_gallery
+
     async def fake_media(request=None, url: str = "", token: str = "") -> Response:
         svg = b"""<svg xmlns='http://www.w3.org/2000/svg' width='800' height='1100'><defs><linearGradient id='g' x2='1' y2='1'><stop stop-color='#31295a'/><stop offset='1' stop-color='#121825'/></linearGradient></defs><rect width='800' height='1100' fill='url(#g)'/><circle cx='570' cy='310' r='190' fill='#9b7bfa' opacity='.18'/><path d='M90 860 330 540l150 170 105-125 140 275Z' fill='#ffffff' opacity='.13'/></svg>"""
         return Response(svg, media_type="image/svg+xml")
@@ -116,6 +134,8 @@ def build_visual_app(temp_root: Path, *, load_more: bool = False):
         script = f"localStorage.setItem('galleryflow:sort-session', JSON.stringify({session_id}));"
         if load_more:
             script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const button=document.querySelector('#page-next');if(button&&!button.hidden&&!button.disabled){button.click();clearInterval(poll)}},50)});"
+        if open_gallery:
+            script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const button=document.querySelector('.gallery-open');if(button){button.click();clearInterval(poll)}},50)});"
         return Response(script, media_type="application/javascript")
 
     async def fake_index() -> Response:
@@ -146,9 +166,12 @@ def main() -> None:
     parser.add_argument("--mobile", action="store_true")
     parser.add_argument("--sort", action="store_true")
     parser.add_argument("--load-more", action="store_true")
+    parser.add_argument("--gallery", action="store_true")
     args = parser.parse_args()
     suffix = (
-        "load-more"
+        "gallery"
+        if args.gallery
+        else "load-more"
         if args.load_more
         else "sort-mobile"
         if args.sort and args.mobile
@@ -159,11 +182,15 @@ def main() -> None:
         else "smoke"
     )
     output = Path(f"/tmp/pornpic-webui-{suffix}.png")
-    viewport = "390,844" if args.mobile else "1440,1100"
+    viewport = "390,844" if args.mobile else "1920,969" if args.gallery else "1440,1100"
     with tempfile.TemporaryDirectory(prefix="pornpic-webui-") as directory:
         server = uvicorn.Server(
             uvicorn.Config(
-                build_visual_app(Path(directory), load_more=args.load_more),
+                build_visual_app(
+                    Path(directory),
+                    load_more=args.load_more,
+                    open_gallery=args.gallery,
+                ),
                 host="127.0.0.1",
                 port=18101,
                 log_level="warning",
