@@ -44,6 +44,9 @@ class AppConfig:
     sort_root: Path | None = field(
         default_factory=lambda: _optional_path_from_env("PORNPIC_WEBUI_SORT_ROOT")
     )
+    pose_root: Path | None = field(
+        default_factory=lambda: _optional_path_from_env("PORNPIC_WEBUI_POSE_ROOT")
+    )
     source_home: str = os.getenv(
         "PORNPIC_WEBUI_SOURCE_HOME", "https://www.pornpics.com"
     )
@@ -79,10 +82,15 @@ class AppConfig:
     def sort_root_path(self) -> Path:
         return (self.sort_root or self.download_root).resolve()
 
+    @property
+    def pose_root_path(self) -> Path:
+        return (self.pose_root or self.sort_root_path / "pose_pairs").resolve()
+
     def ensure_directories(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.download_root.mkdir(parents=True, exist_ok=True)
         self.sort_root_path.mkdir(parents=True, exist_ok=True)
+        self.pose_root_path.mkdir(parents=True, exist_ok=True)
 
 
 config = AppConfig()

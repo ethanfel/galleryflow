@@ -1,14 +1,31 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
+import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
 from .security import gallery_key
+
+
+POSE_ROLES = ("solo", "couple", "group")
+
+
+class PoseRevisionConflict(RuntimeError):
+    def __init__(self, current: dict[str, Any]):
+        super().__init__("The pose draft was changed in another browser")
+        self.current = current
+
+
+def pose_slug(label: str) -> str:
+    normalized = unicodedata.normalize("NFKD", label)
+    ascii_label = normalized.encode("ascii", "ignore").decode("ascii").lower()
+    return re.sub(r"[^a-z0-9]+", "-", ascii_label).strip("-") or "pose"
 
 
 def utc_now() -> str:
@@ -81,6 +98,10 @@ class Database:
                     destination TEXT NOT NULL DEFAULT '',
                     error TEXT NOT NULL DEFAULT '',
                     cancel_requested INTEGER NOT NULL DEFAULT 0,
+                    kind TEXT NOT NULL DEFAULT 'download',
+                    payload TEXT,
+                    pair_count INTEGER NOT NULL DEFAULT 0,
+                    pose_revision INTEGER,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY (profile) REFERENCES profiles(name) ON UPDATE CASCADE
@@ -121,12 +142,47 @@ class Database:
                     PRIMARY KEY (job_id, image_url),
                     FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS pose_tags (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    label TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                    slug TEXT NOT NULL UNIQUE,
+                    default_role TEXT NOT NULL CHECK(default_role IN ('solo', 'couple', 'group')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS pose_drafts (
+                    gallery_key TEXT NOT NULL,
+                    gallery_url TEXT NOT NULL,
+                    profile TEXT NOT NULL COLLATE NOCASE,
+                    revision INTEGER NOT NULL,
+                    controls TEXT NOT NULL,
+                    targets TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (gallery_key, profile),
+                    FOREIGN KEY (profile) REFERENCES profiles(name)
+                        ON UPDATE CASCADE ON DELETE CASCADE
+                );
                 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_history_profile ON history(profile, completed_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_profile_images_gallery
                     ON profile_images(profile, gallery_key);
                 """
             )
+            job_columns = {
+                row[1] for row in db.execute("PRAGMA table_info(jobs)").fetchall()
+            }
+            if "kind" not in job_columns:
+                db.execute(
+                    "ALTER TABLE jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'download'"
+                )
+            if "payload" not in job_columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN payload TEXT")
+            if "pair_count" not in job_columns:
+                db.execute(
+                    "ALTER TABLE jobs ADD COLUMN pair_count INTEGER NOT NULL DEFAULT 0"
+                )
+            if "pose_revision" not in job_columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN pose_revision INTEGER")
             db.execute(
                 "INSERT OR IGNORE INTO profiles(name, directory, created_at) VALUES (?, ?, ?)",
                 ("Default", "Default", utc_now()),
@@ -309,6 +365,178 @@ class Database:
                     ),
                 )
 
+    def gallery_images(self, gallery_url: str) -> list[dict[str, Any]]:
+        key = gallery_key(gallery_url)
+        with self._lock, self.connect() as db:
+            return self._rows(
+                db.execute(
+                    """SELECT image_url AS url, ordinal, filename
+                       FROM gallery_images WHERE gallery_key = ? ORDER BY ordinal""",
+                    (key,),
+                ).fetchall()
+            )
+
+    def list_pose_tags(self) -> list[dict[str, Any]]:
+        with self._lock, self.connect() as db:
+            return self._rows(
+                db.execute(
+                    "SELECT * FROM pose_tags ORDER BY label COLLATE NOCASE"
+                ).fetchall()
+            )
+
+    def get_pose_tag(self, tag_id: int) -> dict[str, Any] | None:
+        with self._lock, self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM pose_tags WHERE id = ?", (tag_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def create_pose_tag(self, label: str, default_role: str) -> dict[str, Any]:
+        label = " ".join(label.split())
+        if not label:
+            raise ValueError("Pose label cannot be empty")
+        if default_role not in POSE_ROLES:
+            raise ValueError("Invalid control role")
+        base = pose_slug(label)
+        now = utc_now()
+        with self._lock, self.connect() as db:
+            candidate = base
+            suffix = 2
+            while db.execute(
+                "SELECT 1 FROM pose_tags WHERE slug = ?", (candidate,)
+            ).fetchone():
+                candidate = f"{base}-{suffix}"
+                suffix += 1
+            db.execute(
+                """INSERT INTO pose_tags(label, slug, default_role, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (label, candidate, default_role, now, now),
+            )
+            tag_id = int(db.execute("SELECT last_insert_rowid()").fetchone()[0])
+        return self.get_pose_tag(tag_id) or {}
+
+    def update_pose_tag(
+        self,
+        tag_id: int,
+        *,
+        label: str | None = None,
+        default_role: str | None = None,
+    ) -> dict[str, Any] | None:
+        values: dict[str, Any] = {}
+        if label is not None:
+            label = " ".join(label.split())
+            if not label:
+                raise ValueError("Pose label cannot be empty")
+            values["label"] = label
+        if default_role is not None:
+            if default_role not in POSE_ROLES:
+                raise ValueError("Invalid control role")
+            values["default_role"] = default_role
+        if not values:
+            return self.get_pose_tag(tag_id)
+        values["updated_at"] = utc_now()
+        columns = ", ".join(f"{key} = ?" for key in values)
+        with self._lock, self.connect() as db:
+            result = db.execute(
+                f"UPDATE pose_tags SET {columns} WHERE id = ?",
+                [*values.values(), tag_id],
+            )
+            if result.rowcount == 0:
+                return None
+        return self.get_pose_tag(tag_id)
+
+    @staticmethod
+    def _decode_pose_draft(row: dict[str, Any]) -> dict[str, Any]:
+        row["controls"] = json.loads(row["controls"])
+        row["targets"] = json.loads(row["targets"])
+        row.pop("gallery_key", None)
+        return row
+
+    def get_pose_draft(self, gallery_url: str, profile: str) -> dict[str, Any]:
+        key = gallery_key(gallery_url)
+        with self._lock, self.connect() as db:
+            row = db.execute(
+                """SELECT * FROM pose_drafts
+                   WHERE gallery_key = ? AND profile = ?""",
+                (key, profile),
+            ).fetchone()
+            if not row:
+                return {
+                    "gallery_url": gallery_url,
+                    "profile": profile,
+                    "revision": 0,
+                    "controls": {role: None for role in POSE_ROLES},
+                    "targets": [],
+                    "updated_at": None,
+                }
+            draft = self._decode_pose_draft(dict(row))
+            tags = {
+                item["id"]: dict(item)
+                for item in db.execute("SELECT * FROM pose_tags").fetchall()
+            }
+        for target in draft["targets"]:
+            tag = tags.get(target["pose_tag_id"])
+            if tag:
+                target.update(
+                    pose_slug=tag["slug"],
+                    pose_label=tag["label"],
+                )
+        return draft
+
+    def save_pose_draft(
+        self,
+        gallery_url: str,
+        profile: str,
+        expected_revision: int,
+        controls: dict[str, str | None],
+        targets: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        key = gallery_key(gallery_url)
+        now = utc_now()
+        with self._lock, self.connect() as db:
+            current_row = db.execute(
+                """SELECT * FROM pose_drafts
+                   WHERE gallery_key = ? AND profile = ?""",
+                (key, profile),
+            ).fetchone()
+            current_revision = int(current_row["revision"]) if current_row else 0
+            if current_revision != expected_revision:
+                current = (
+                    self._decode_pose_draft(dict(current_row))
+                    if current_row
+                    else {
+                        "gallery_url": gallery_url,
+                        "profile": profile,
+                        "revision": 0,
+                        "controls": {role: None for role in POSE_ROLES},
+                        "targets": [],
+                        "updated_at": None,
+                    }
+                )
+                raise PoseRevisionConflict(current)
+            revision = current_revision + 1
+            db.execute(
+                """INSERT INTO pose_drafts(
+                       gallery_key, gallery_url, profile, revision, controls, targets, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(gallery_key, profile) DO UPDATE SET
+                       gallery_url = excluded.gallery_url,
+                       revision = excluded.revision,
+                       controls = excluded.controls,
+                       targets = excluded.targets,
+                       updated_at = excluded.updated_at""",
+                (
+                    key,
+                    gallery_url,
+                    profile,
+                    revision,
+                    json.dumps(controls, separators=(",", ":")),
+                    json.dumps(targets, separators=(",", ":")),
+                    now,
+                ),
+            )
+        return self.get_pose_draft(gallery_url, profile)
+
     def image_statuses(self, profile: str, gallery_url: str) -> set[str]:
         key = gallery_key(gallery_url)
         with self._lock, self.connect() as db:
@@ -400,8 +628,8 @@ class Database:
                 """
                 INSERT INTO jobs(
                     id, gallery_url, title, profile, requested_images, status,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)
+                    kind, payload, pair_count, pose_revision, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job["id"],
@@ -411,6 +639,12 @@ class Database:
                     json.dumps(job.get("image_urls"))
                     if job.get("image_urls") is not None
                     else None,
+                    job.get("kind", "download"),
+                    json.dumps(job.get("payload"), separators=(",", ":"))
+                    if job.get("payload") is not None
+                    else None,
+                    int(job.get("pair_count") or 0),
+                    job.get("pose_revision"),
                     job["created_at"],
                     job["created_at"],
                 ),
@@ -446,6 +680,15 @@ class Database:
     def _decode_job(job: dict[str, Any]) -> dict[str, Any]:
         raw = job.get("requested_images")
         job["image_urls"] = json.loads(raw) if raw else None
+        raw_payload = job.get("payload")
+        job["payload"] = json.loads(raw_payload) if raw_payload else None
+        job["kind"] = job.get("kind") or "download"
+        job["pair_count"] = int(job.get("pair_count") or 0)
+        if job["kind"] == "pose_export" and job["payload"]:
+            if not job["pair_count"]:
+                job["pair_count"] = len(job["payload"].get("targets", []))
+            if job.get("pose_revision") is None:
+                job["pose_revision"] = job["payload"].get("revision")
         job["cancel_requested"] = bool(job.get("cancel_requested"))
         job.pop("requested_images", None)
         total = int(job.get("total") or 0)
@@ -460,17 +703,65 @@ class Database:
             ).fetchall()
         return [self._decode_job(dict(row)) for row in rows]
 
-    def active_job_for_gallery(
-        self, profile: str, gallery_url: str
-    ) -> dict[str, Any] | None:
-        target_key = gallery_key(gallery_url)
+    @staticmethod
+    def _decode_job_summary(job: dict[str, Any]) -> dict[str, Any]:
+        job["cancel_requested"] = bool(job.get("cancel_requested"))
+        job["kind"] = job.get("kind") or "download"
+        job["pair_count"] = int(job.get("pair_count") or 0)
+        total = int(job.get("total") or 0)
+        done = int(job.get("completed") or 0) + int(job.get("failed") or 0)
+        job["progress"] = round(done / total * 100, 1) if total else 0
+        return job
+
+    def get_job_summary(self, job_id: str) -> dict[str, Any] | None:
+        with self._lock, self.connect() as db:
+            row = db.execute(
+                """SELECT id, gallery_url, title, profile, status, total, completed,
+                          failed, destination, error, cancel_requested, kind,
+                          pair_count, pose_revision, created_at, updated_at
+                   FROM jobs WHERE id = ?""",
+                (job_id,),
+            ).fetchone()
+        return self._decode_job_summary(dict(row)) if row else None
+
+    def list_job_summaries(
+        self, limit: int = 100, kind: str | None = None
+    ) -> list[dict[str, Any]]:
+        where = " WHERE kind = ?" if kind is not None else ""
+        params: list[Any] = [kind] if kind is not None else []
+        params.append(limit)
         with self._lock, self.connect() as db:
             rows = db.execute(
-                """SELECT * FROM jobs
-                   WHERE profile = ?
+                f"""SELECT id, gallery_url, title, profile, status, total, completed,
+                           failed, destination, error, cancel_requested, kind,
+                           pair_count, pose_revision, created_at, updated_at
+                    FROM jobs{where} ORDER BY created_at DESC LIMIT ?""",
+                params,
+            ).fetchall()
+        return [self._decode_job_summary(dict(row)) for row in rows]
+
+    def job_cancel_requested(self, job_id: str) -> bool:
+        with self._lock, self.connect() as db:
+            row = db.execute(
+                "SELECT cancel_requested FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return row is None or bool(row[0])
+
+    def active_job_for_gallery(
+        self, profile: str | None, gallery_url: str, kind: str = "download"
+    ) -> dict[str, Any] | None:
+        target_key = gallery_key(gallery_url)
+        profile_clause = " AND profile = ?" if profile is not None else ""
+        params: list[Any] = [kind]
+        if profile is not None:
+            params.append(profile)
+        with self._lock, self.connect() as db:
+            rows = db.execute(
+                f"""SELECT * FROM jobs
+                   WHERE kind = ?{profile_clause}
                      AND status IN ('queued', 'starting', 'downloading', 'canceling')
                    ORDER BY created_at""",
-                (profile,),
+                params,
             ).fetchall()
         for row in rows:
             job = self._decode_job(dict(row))
@@ -501,6 +792,15 @@ class Database:
                    ORDER BY created_at"""
                 )
             ]
+
+    def list_jobs_by_kind(self, kind: str, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock, self.connect() as db:
+            rows = db.execute(
+                """SELECT * FROM jobs WHERE kind = ?
+                   ORDER BY created_at DESC LIMIT ?""",
+                (kind, limit),
+            ).fetchall()
+        return [self._decode_job(dict(row)) for row in rows]
 
     def set_setting(self, key: str, value: Any) -> None:
         with self._lock, self.connect() as db:

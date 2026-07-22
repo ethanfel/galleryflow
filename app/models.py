@@ -33,6 +33,43 @@ class DownloadCreate(BaseModel):
         return value
 
 
+PoseRole = Literal["solo", "couple", "group"]
+
+
+class PoseTagCreate(BaseModel):
+    label: str = Field(min_length=1, max_length=80)
+    default_role: PoseRole = "solo"
+
+
+class PoseTagPatch(BaseModel):
+    label: str | None = Field(default=None, min_length=1, max_length=80)
+    default_role: PoseRole | None = None
+
+
+class PoseControls(BaseModel):
+    solo: str | None = Field(default=None, max_length=2_000)
+    couple: str | None = Field(default=None, max_length=2_000)
+    group: str | None = Field(default=None, max_length=2_000)
+
+
+class PoseTarget(BaseModel):
+    image_url: str = Field(min_length=1, max_length=2_000)
+    pose_tag_id: int = Field(gt=0)
+    role: PoseRole
+
+
+class PoseDraftPut(BaseModel):
+    expected_revision: int = Field(ge=0)
+    controls: PoseControls = Field(default_factory=PoseControls)
+    targets: list[PoseTarget] = Field(default_factory=list, max_length=2_000)
+
+
+class PoseExportCreate(BaseModel):
+    gallery_id: str = Field(min_length=1, max_length=4_000)
+    profile: str = Field(default="Default", min_length=1, max_length=64)
+    expected_revision: int = Field(ge=1)
+
+
 class SettingsPatch(BaseModel):
     request_timeout: float | None = Field(default=None, ge=5, le=120)
     image_workers: int | None = Field(default=None, ge=1, le=24)

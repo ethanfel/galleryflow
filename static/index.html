@@ -43,6 +43,8 @@
     <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
     <symbol id="i-sort" viewBox="0 0 24 24"><path d="M4 6h10M4 12h7M4 18h4M17 4v16m-4-4 4 4 4-4"/></symbol>
     <symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 7 4 12l5 5M5 12h8a6 6 0 0 1 6 6"/></symbol>
+    <symbol id="i-tag" viewBox="0 0 24 24"><path d="M20 13 13 20 4 11V4h7l9 9Z"/><circle cx="8.5" cy="8.5" r="1.5"/></symbol>
+    <symbol id="i-layers" viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5M3 16l9 5 9-5"/></symbol>
   </svg>
 
   <a class="skip-link" href="#main-content">Skip to content</a>
@@ -350,16 +352,49 @@
         <section class="image-picker" aria-labelledby="image-picker-title">
           <div class="image-picker-header">
             <div><h3 id="image-picker-title">Choose images</h3><p id="selection-summary">Loading images…</p></div>
-            <div class="picker-actions"><button class="text-button" id="select-all" type="button">Select all</button><span></span><button class="text-button" id="select-none" type="button">Clear</button></div>
+            <div class="picker-header-actions">
+              <div class="gallery-mode-switch" role="tablist" aria-label="Gallery workflow">
+                <button class="is-active" type="button" role="tab" aria-selected="true" data-gallery-mode="download"><svg><use href="#i-download"></use></svg><span>Download</span></button>
+                <button type="button" role="tab" aria-selected="false" data-gallery-mode="pose"><svg><use href="#i-layers"></use></svg><span>Pose dataset</span></button>
+              </div>
+              <div class="picker-actions"><button class="text-button" id="select-all" type="button">Select all</button><span></span><button class="text-button" id="select-none" type="button">Clear</button></div>
+            </div>
           </div>
+          <section class="pose-toolbar" id="pose-toolbar" aria-labelledby="pose-toolbar-title" hidden>
+            <div class="pose-toolbar-heading">
+              <div><span class="modal-kicker">Dataset preparation</span><h4 id="pose-toolbar-title">Assign checked images</h4></div>
+              <span class="pose-save-status" id="pose-save-status" role="status">Draft not loaded</span>
+            </div>
+            <div class="pose-role-switch" role="group" aria-label="Assignment type">
+              <button class="is-active" type="button" data-pose-assignment="target" aria-pressed="true"><b>T</b><span>Target</span></button>
+              <button type="button" data-pose-assignment="solo" aria-pressed="false"><b>C</b><span>Solo control</span></button>
+              <button type="button" data-pose-assignment="couple" aria-pressed="false"><b>C</b><span>Couple control</span></button>
+              <button type="button" data-pose-assignment="group" aria-pressed="false"><b>C</b><span>Group control</span></button>
+            </div>
+            <div class="pose-target-fields" id="pose-target-fields">
+              <label><span>Pose</span><input id="pose-tag-input" type="text" list="pose-tag-options" maxlength="80" placeholder="Search or create a pose…" autocomplete="off"></label>
+              <label><span>Use control</span><select id="pose-control-role"><option value="solo">Solo</option><option value="couple">Couple</option><option value="group">Group</option></select></label>
+            </div>
+            <p class="pose-control-hint" id="pose-control-hint" hidden>Choose exactly one checked image for this control slot. Reassigning a slot replaces its current image.</p>
+            <div class="pose-toolbar-actions">
+              <button class="text-button pose-clear-assignment" id="pose-clear-checked" type="button">Remove assignment</button>
+              <button class="button button-primary" id="pose-apply-checked" type="button" disabled><svg><use href="#i-check"></use></svg><span>Apply to checked</span></button>
+            </div>
+          </section>
+          <datalist id="pose-tag-options"></datalist>
           <div class="image-grid" id="image-grid" aria-live="polite" aria-busy="true"></div>
           <div class="empty-state compact" id="images-empty" hidden><div class="empty-illustration"><svg><use href="#i-image"></use></svg><span></span></div><h3>No images found</h3><p>The server could not find downloadable images on this page.</p></div>
         </section>
       </div>
       <footer class="modal-footer gallery-footer">
-        <div class="selection-total"><span id="selected-count">0</span><span>images selected</span></div>
-        <label class="modal-profile"><span>Download to</span><select id="modal-profile-select" aria-label="Download profile"></select></label>
+        <div class="selection-total" id="download-selection-total"><span id="selected-count">0</span><span>images selected</span></div>
+        <div class="pose-preflight" id="pose-preflight" hidden>
+          <div><strong id="pose-target-count">0</strong><span>targets</span><i></i><strong id="pose-control-count">0</strong><span>controls</span><i></i><strong id="pose-issue-count">0</strong><span>issues</span></div>
+          <small id="pose-preflight-detail">Add at least one target to prepare a dataset.</small>
+        </div>
+        <label class="modal-profile"><span id="modal-profile-label">Download to</span><select id="modal-profile-select" aria-label="Download profile"></select></label>
         <button class="button button-primary button-download" id="queue-download" type="button" disabled><svg><use href="#i-download"></use></svg><span>Add to queue</span></button>
+        <button class="button button-primary button-pose-export" id="pose-export" type="button" disabled hidden><svg><use href="#i-layers"></use></svg><span>Download &amp; organize</span></button>
       </footer>
     </div>
   </dialog>
@@ -385,7 +420,21 @@
         <button class="lightbox-nav lightbox-previous" id="lightbox-previous" type="button" aria-label="Previous image" title="Previous image (Left arrow)"><svg><use href="#i-chevron"></use></svg></button>
         <button class="lightbox-nav lightbox-next" id="lightbox-next" type="button" aria-label="Next image" title="Next image (Right arrow)"><svg><use href="#i-chevron"></use></svg></button>
       </div>
-      <footer class="lightbox-footer"><span>Click or tap the image to toggle fit and actual size</span><span><kbd>←</kbd><kbd>→</kbd> navigate <i></i> <kbd>Esc</kbd> close</span></footer>
+      <section class="lightbox-pose-dock" id="lightbox-pose-dock" aria-labelledby="lightbox-pose-title" hidden>
+        <div class="lightbox-pose-summary"><span class="modal-kicker">Current image</span><strong id="lightbox-pose-title">Not assigned</strong></div>
+        <div class="lightbox-control-actions" role="group" aria-label="Set current image as a control">
+          <button type="button" data-lightbox-control="solo"><b>C</b> Solo</button>
+          <button type="button" data-lightbox-control="couple"><b>C</b> Couple</button>
+          <button type="button" data-lightbox-control="group"><b>C</b> Group</button>
+        </div>
+        <div class="lightbox-target-action">
+          <label><span>Pose target</span><input id="lightbox-pose-tag-input" type="text" list="pose-tag-options" maxlength="80" placeholder="Pose name…" autocomplete="off"></label>
+          <select id="lightbox-pose-control-role" aria-label="Control used by this target"><option value="solo">Solo control</option><option value="couple">Couple control</option><option value="group">Group control</option></select>
+          <button class="button button-primary" id="lightbox-set-target" type="button"><svg><use href="#i-tag"></use></svg><span>Set target</span></button>
+        </div>
+        <button class="icon-button lightbox-clear-pose" id="lightbox-clear-pose" type="button" title="Remove this image assignment" aria-label="Remove this image assignment"><svg><use href="#i-trash"></use></svg></button>
+      </section>
+      <footer class="lightbox-footer"><span id="lightbox-footer-hint">Click or tap the image to toggle fit and actual size</span><span><kbd>←</kbd><kbd>→</kbd> navigate <i></i> <kbd>Esc</kbd> close</span></footer>
     </div>
   </dialog>
 

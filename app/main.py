@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from contextlib import asynccontextmanager
 from urllib.parse import quote
 
@@ -12,13 +13,17 @@ from fastapi.staticfiles import StaticFiles
 
 from . import __version__
 from .config import AppConfig, config as default_config
-from .db import Database
+from .db import Database, POSE_ROLES, PoseRevisionConflict
 from .downloader import ActiveDownloadError, DownloadManager, EventBroker
 from .models import (
     DownloadCreate,
     GalleryPatch,
     LegacyDownloadRequest,
     LegacyIgnoreRequest,
+    PoseDraftPut,
+    PoseExportCreate,
+    PoseTagCreate,
+    PoseTagPatch,
     ProfileCreate,
     ProfilePatch,
     SettingsPatch,
@@ -29,9 +34,11 @@ from .models import (
 from .scraper import PornPicsScraper, ScrapeError
 from .security import (
     UnsafeUrl,
+    canonicalize_url,
     clean_profile_name,
     confined_path,
     decode_gallery_id,
+    encode_gallery_id,
     safe_folder_name,
     sign_media_url,
     validate_public_media_url,
@@ -83,7 +90,10 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
     app = FastAPI(
         title="GalleryFlow",
         version=__version__,
-        description="A web-only gallery browser, downloader, history tracker, and profile sorter.",
+        description=(
+            "A web-only gallery browser, downloader, pose-pair organizer, "
+            "history tracker, and visual sorter."
+        ),
         lifespan=lifespan,
     )
     app.state.config = app_config
@@ -122,7 +132,7 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
     async def active_download_handler(_: Request, exc: ActiveDownloadError):
         return JSONResponse(
             status_code=409,
-            content={"detail": str(exc), "job": exc.job},
+            content={"detail": str(exc), "job": downloads.public_job(exc.job)},
         )
 
     @app.exception_handler(SortConflict)
@@ -143,9 +153,71 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
         item.update(status)
         return item
 
+    def decorate_pose_draft(draft: dict) -> dict:
+        draft["gallery_id"] = encode_gallery_id(draft["gallery_url"])
+        return draft
+
+    async def pose_gallery_images(gallery_url: str) -> list[dict]:
+        images = database.gallery_images(gallery_url)
+        if images:
+            return images
+        detail = await scraper.gallery(gallery_url)
+        database.register_gallery_images(detail["url"], detail["images"])
+        return database.gallery_images(detail["url"])
+
+    async def normalize_pose_draft(
+        gallery_url: str, payload: PoseDraftPut
+    ) -> tuple[dict[str, str | None], list[dict]]:
+        images = await pose_gallery_images(gallery_url)
+        available = {canonicalize_url(item["url"]): item for item in images}
+        controls: dict[str, str | None] = {role: None for role in POSE_ROLES}
+        used_controls: set[str] = set()
+        for role, value in payload.controls.model_dump().items():
+            if value is None:
+                continue
+            canonical = canonicalize_url(value)
+            if canonical not in available:
+                raise ValueError("A control image is not part of this gallery")
+            if canonical in used_controls:
+                raise ValueError("Each control role must use a different image")
+            controls[role] = available[canonical]["url"]
+            used_controls.add(canonical)
+
+        targets: list[dict] = []
+        used_targets: set[str] = set()
+        used_ordinals: set[int] = set()
+        for requested in payload.targets:
+            canonical = canonicalize_url(requested.image_url)
+            if canonical not in available:
+                raise ValueError("A target image is not part of this gallery")
+            if canonical in used_controls:
+                raise ValueError("An image cannot be both a control and a target")
+            if canonical in used_targets:
+                raise ValueError("A target image can have only one pose")
+            if not controls[requested.role]:
+                raise ValueError(
+                    f"The {requested.role} control must be selected before using that role"
+                )
+            if not database.get_pose_tag(requested.pose_tag_id):
+                raise ValueError("A selected pose tag no longer exists")
+            ordinal = int(available[canonical]["ordinal"])
+            if ordinal in used_ordinals:
+                raise ValueError("Gallery image ordinals must be unique")
+            targets.append(
+                {
+                    "image_url": available[canonical]["url"],
+                    "ordinal": ordinal,
+                    "pose_tag_id": requested.pose_tag_id,
+                    "role": requested.role,
+                }
+            )
+            used_targets.add(canonical)
+            used_ordinals.add(ordinal)
+        return controls, targets
+
     @app.get("/api/health")
     async def health() -> dict:
-        jobs = database.list_jobs(100)
+        jobs = database.list_job_summaries(100)
         active = sum(
             j["status"] in {"queued", "starting", "downloading", "canceling"}
             for j in jobs
@@ -213,6 +285,142 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
             {"type": "gallery", "url": gallery_url, "ignored": payload.ignored}
         )
         return {"url": gallery_url, "ignored": payload.ignored}
+
+    @app.get("/api/pose-tags")
+    async def list_pose_tags() -> dict:
+        return {"items": database.list_pose_tags()}
+
+    @app.post("/api/pose-tags", status_code=201)
+    async def create_pose_tag(payload: PoseTagCreate) -> dict:
+        try:
+            tag = database.create_pose_tag(payload.label, payload.default_role)
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(409, "A pose tag with this label already exists") from exc
+        events.publish({"type": "pose", "action": "tag", "tag": tag})
+        return {"tag": tag}
+
+    @app.patch("/api/pose-tags/{tag_id}")
+    async def patch_pose_tag(tag_id: int, payload: PoseTagPatch) -> dict:
+        try:
+            tag = database.update_pose_tag(
+                tag_id, label=payload.label, default_role=payload.default_role
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(409, "A pose tag with this label already exists") from exc
+        if not tag:
+            raise HTTPException(404, "Pose tag not found")
+        events.publish({"type": "pose", "action": "tag", "tag": tag})
+        return {"tag": tag}
+
+    @app.get("/api/galleries/{gallery_id}/pose-draft")
+    async def get_pose_draft(
+        gallery_id: str,
+        profile: str = Query(default="Default", max_length=64),
+    ) -> dict:
+        gallery_url = validate_source_url(decode_gallery_id(gallery_id))
+        profile = clean_profile_name(profile)
+        if not database.get_profile(profile):
+            raise HTTPException(404, "Profile not found")
+        return {
+            "draft": decorate_pose_draft(
+                database.get_pose_draft(gallery_url, profile)
+            )
+        }
+
+    @app.put("/api/galleries/{gallery_id}/pose-draft")
+    async def put_pose_draft(
+        gallery_id: str,
+        payload: PoseDraftPut,
+        profile: str = Query(default="Default", max_length=64),
+    ) -> Response:
+        gallery_url = validate_source_url(decode_gallery_id(gallery_id))
+        profile = clean_profile_name(profile)
+        if not database.get_profile(profile):
+            raise HTTPException(404, "Profile not found")
+        controls, targets = await normalize_pose_draft(gallery_url, payload)
+        try:
+            draft = database.save_pose_draft(
+                gallery_url,
+                profile,
+                payload.expected_revision,
+                controls,
+                targets,
+            )
+        except PoseRevisionConflict as exc:
+            current = database.get_pose_draft(gallery_url, profile)
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": str(exc),
+                    "draft": decorate_pose_draft(current),
+                },
+            )
+        draft = decorate_pose_draft(draft)
+        events.publish(
+            {
+                "type": "pose",
+                "action": "draft",
+                "gallery_id": draft["gallery_id"],
+                "profile": draft["profile"],
+                "revision": draft["revision"],
+            }
+        )
+        return JSONResponse(content={"draft": draft})
+
+    @app.post("/api/pose-exports", status_code=202)
+    async def create_pose_export(payload: PoseExportCreate) -> dict:
+        gallery_url = validate_source_url(decode_gallery_id(payload.gallery_id))
+        profile = clean_profile_name(payload.profile)
+        if not database.get_profile(profile):
+            raise HTTPException(404, "Profile not found")
+        draft = database.get_pose_draft(gallery_url, profile)
+        if draft["revision"] != payload.expected_revision:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": "The pose draft changed before it was exported",
+                    "draft": decorate_pose_draft(draft),
+                },
+            )
+        if not draft["targets"]:
+            raise HTTPException(422, "Add at least one pose target before exporting")
+        for target in draft["targets"]:
+            if not draft["controls"].get(target["role"]):
+                raise HTTPException(422, f"Missing {target['role']} control")
+            if not target.get("pose_slug"):
+                raise HTTPException(422, "A pose tag used by this draft no longer exists")
+        job = downloads.enqueue_pose_export(
+            gallery_url=gallery_url,
+            profile=profile,
+            draft=draft,
+        )
+        return {"job": downloads.public_job(job)}
+
+    @app.get("/api/pose-exports")
+    async def list_pose_exports(
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict:
+        return {
+            "items": [
+                downloads.public_job(job)
+                for job in database.list_job_summaries(limit, "pose_export")
+            ]
+        }
+
+    @app.get("/api/pose-exports/{job_id}/items")
+    async def pose_export_items(job_id: str) -> dict:
+        job = database.get_job_summary(job_id)
+        if not job or job.get("kind") != "pose_export":
+            raise HTTPException(404, "Pose export job not found")
+        return {"items": database.list_job_items(job_id)}
+
+    @app.delete("/api/pose-exports/{job_id}")
+    async def cancel_pose_export(job_id: str) -> dict:
+        existing = database.get_job_summary(job_id)
+        if not existing or existing.get("kind") != "pose_export":
+            raise HTTPException(404, "Pose export job not found")
+        job = downloads.cancel(job_id)
+        return {"job": job}
 
     @app.get("/api/media")
     async def proxy_media(request: Request, url: str, token: str) -> StreamingResponse:
@@ -301,11 +509,16 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
 
     @app.get("/api/downloads")
     async def list_downloads(limit: int = Query(default=100, ge=1, le=500)) -> dict:
-        return {"items": database.list_jobs(limit)}
+        return {
+            "items": [
+                downloads.public_job(job)
+                for job in database.list_job_summaries(limit)
+            ]
+        }
 
     @app.get("/api/downloads/{job_id}/items")
     async def download_items(job_id: str) -> dict:
-        if not database.get_job(job_id):
+        if not database.get_job_summary(job_id):
             raise HTTPException(404, "Download job not found")
         return {"items": database.list_job_items(job_id)}
 
@@ -472,6 +685,7 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
         return {
             "download_root": str(app_config.download_root),
             "sort_root": str(app_config.sort_root_path),
+            "pose_root": str(app_config.pose_root_path),
             "source_home": app_config.source_home,
             "request_timeout": stored.get(
                 "request_timeout", app_config.request_timeout

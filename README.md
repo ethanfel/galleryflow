@@ -7,6 +7,7 @@ A self-contained, server-side PornPics gallery browser and downloader. The compl
 - Browse the current PornPics catalog, search, paste a category URL, and keep loading additional pages into one portrait gallery grid.
 - Green complete, blue partial, and red ignored states, scoped correctly per profile.
 - Open original-resolution images in a full-screen lightbox with zoom and keyboard navigation, then download a whole gallery or select individual images in their original order.
+- Build training-ready pose pairs while browsing: assign one solo, couple, or group control to each target, add a pose tag, and export matched target/control folders with shared IDs.
 - Automatic profile folders with safe, server-controlled paths.
 - Persistent queue with live progress, cancellation, per-image results, retries for transient failures, and restart recovery.
 - Global ignore/unignore, hide-saved and hide-ignored filters, history, profile management, and responsive mobile/desktop layouts.
@@ -79,6 +80,20 @@ services:
 
 Sorter decisions move target images and create control copies, so the sort-library mount must be writable.
 
+Pose-pair exports default to `<sort-root>/pose_pairs`. To keep datasets on a separate disk, mount a writable output directory and set it explicitly:
+
+```yaml
+services:
+  galleryflow:
+    volumes:
+      - galleryflow-data:/data
+      - /path/to/pose-datasets:/pose-output
+    environment:
+      PORNPIC_WEBUI_POSE_ROOT: /pose-output
+```
+
+Both `/data` and every mounted download, sorter, or pose-output directory must be writable by container UID/GID `10001:10001`. Do not include a space after the host path's colon in a Docker `-v` specification: use `/host/path:/pose-output`, not `/host/path: /pose-output`.
+
 ## Import the old history
 
 Always preview first:
@@ -114,6 +129,25 @@ Optional `id001_` prefixes keep target/control pairs together. Existing filename
 
 Every sorter move is journaled before files change. If the server stops partway through an action or undo, the next startup/session read reconciles the operation automatically when its state is unambiguous. If both the source and destination exist, neither copy is deleted: the session remains marked **Recovering** until an operator resolves the duplicate and reloads or rescans. Starting another session for that target is blocked while recovery is pending.
 
+## Pose-pair workflow
+
+Open a gallery and switch it to **Pose dataset** mode. Mark at most one gallery image as the control for each available role: **solo**, **couple**, or **group**. Then select one or more target images, choose their primary pose tag and the appropriate control role, and apply the annotation. Pose tags are reusable across profiles and can be created directly from the gallery; each gallery draft remains scoped to its selected profile. The revisioned draft is saved on the server as you work, so closing the modal or browser does not discard it.
+
+Each target has exactly one pose tag and uses exactly one of the gallery's three control alternatives. Before export, GalleryFlow reports incomplete targets whose selected role has no control. **Download & organize** snapshots the current draft and sends the work through the persistent job queue, where progress, cancellation, and restart recovery behave like gallery downloads.
+
+Pairs are grouped by safe pose slug and use a shared deterministic ID:
+
+```text
+<pose-root>/
+└── <pose-slug>/
+    ├── selected_target/
+    │   └── g<gallery-id>-<ordinal>_target.jpg
+    └── selected_control/
+        └── g<gallery-id>-<ordinal>_control.jpg
+```
+
+Gallery URLs and output paths are validated, symlinks and path traversal are rejected, and an existing file is never silently replaced. Re-exporting the same unchanged pair is idempotent. Changed content, a different role/control, or moving the same gallery image to another pose reports a conflict instead of overwriting the dataset. A failed or canceled multi-pair export rolls back only the files newly created by that job.
+
 ## Configuration
 
 Environment variables:
@@ -123,6 +157,7 @@ Environment variables:
 | `PORNPIC_WEBUI_DATA_DIR` | `./data` | SQLite and application state |
 | `PORNPIC_WEBUI_DOWNLOAD_ROOT` | `./data/downloads` | Profile libraries |
 | `PORNPIC_WEBUI_SORT_ROOT` | download root | Highest server folder exposed to the visual sorter |
+| `PORNPIC_WEBUI_POSE_ROOT` | `<sort-root>/pose_pairs` | Training-ready pose-pair datasets |
 | `PORNPIC_WEBUI_JOB_WORKERS` | `2` | Concurrent gallery jobs |
 | `PORNPIC_WEBUI_IMAGE_WORKERS` | `6` | Global concurrent image requests |
 | `PORNPIC_WEBUI_REQUEST_TIMEOUT` | `25` | Browse timeout in seconds |
@@ -139,6 +174,10 @@ Concurrency and theme can also be adjusted in the WebUI. A changed gallery-worke
 data/
 ├── pornpic_webui.sqlite3
 └── downloads/
+    ├── pose_pairs/
+    │   └── <pose-slug>/
+    │       ├── selected_target/
+    │       └── selected_control/
     ├── Default/
     └── <profile>/
         └── <safe-title>--<gallery-id>/

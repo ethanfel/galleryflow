@@ -27,6 +27,7 @@ def build_visual_app(
     load_more: bool = False,
     open_gallery: bool = False,
     open_lightbox: bool = False,
+    open_pose: bool = False,
 ):
     config = AppConfig(
         data_dir=temp_root / "data",
@@ -143,6 +144,8 @@ def build_visual_app(
             script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const button=document.querySelector('.gallery-open');if(button){button.click();clearInterval(poll)}},50)});"
         if open_lightbox:
             script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const button=document.querySelector('.image-preview-button');if(button){button.click();clearInterval(poll)}},50)});"
+        if open_pose:
+            script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const modal=document.querySelector('#gallery-modal');const button=document.querySelector('[data-gallery-mode=pose]');const image=document.querySelector('.image-option:not(.skeleton-image)');if(modal?.open&&button&&image){button.click();clearInterval(poll)}},50)});"
         return Response(script, media_type="application/javascript")
 
     async def fake_index() -> Response:
@@ -175,9 +178,14 @@ def main() -> None:
     parser.add_argument("--load-more", action="store_true")
     parser.add_argument("--gallery", action="store_true")
     parser.add_argument("--lightbox", action="store_true")
+    parser.add_argument("--pose", action="store_true")
     args = parser.parse_args()
     suffix = (
-        "lightbox-mobile"
+        "pose-mobile"
+        if args.pose and args.mobile
+        else "pose"
+        if args.pose
+        else "lightbox-mobile"
         if args.lightbox and args.mobile
         else "lightbox"
         if args.lightbox
@@ -198,7 +206,7 @@ def main() -> None:
         "390,844"
         if args.mobile
         else "1920,969"
-        if args.gallery or args.lightbox
+        if args.gallery or args.lightbox or args.pose
         else "1440,1100"
     )
     with tempfile.TemporaryDirectory(prefix="pornpic-webui-") as directory:
@@ -207,8 +215,9 @@ def main() -> None:
                 build_visual_app(
                     Path(directory),
                     load_more=args.load_more,
-                    open_gallery=args.gallery or args.lightbox,
+                    open_gallery=args.gallery or args.lightbox or args.pose,
                     open_lightbox=args.lightbox,
+                    open_pose=args.pose,
                 ),
                 host="127.0.0.1",
                 port=18101,
@@ -241,7 +250,7 @@ def main() -> None:
                 "--disable-sync",
                 "--force-prefers-reduced-motion",
                 "--no-first-run",
-                f"--virtual-time-budget={3000 if args.lightbox else 1000}",
+                f"--virtual-time-budget={3000 if args.lightbox or args.pose else 1000}",
                 f"--user-data-dir={Path(directory) / 'chrome-profile'}",
                 f"--window-size={viewport}",
                 f"--screenshot={output}",

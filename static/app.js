@@ -31,6 +31,18 @@
     jobFilter: 'all',
     gallery: null,
     selectedImages: new Set(),
+    galleryMode: 'download',
+    poseSelectedImages: new Set(),
+    poseTags: [],
+    poseDraft: { revision: 0, controls: { solo: '', couple: '', group: '' }, targets: [] },
+    poseLoadedKey: '',
+    poseLoading: false,
+    poseDirty: false,
+    poseSaving: false,
+    poseSaveTimer: null,
+    poseSavePromise: null,
+    poseMutation: 0,
+    poseAssignment: 'target',
     lightboxIndex: -1,
     lightboxZoomed: false,
     lightboxTrigger: null,
@@ -44,6 +56,7 @@
     eventSource: null,
     eventConnected: false,
     queueTimer: null,
+    jobEventTimer: null,
     healthTimer: null,
     requestController: null,
     galleryObserver: null,
@@ -55,6 +68,9 @@
     sortLoading: false,
     sortBusy: false
   };
+
+  const POSE_ROLES = ['solo', 'couple', 'group'];
+  const poseRoleLabel = role => ({ solo: 'Solo', couple: 'Couple', group: 'Group' }[role] || 'Solo');
 
   class ApiError extends Error {
     constructor(message, status = 0, data = null) {
@@ -227,6 +243,8 @@
       progress,
       bytes: Number(item.bytes_downloaded ?? item.downloaded_bytes ?? 0),
       speed: Number(item.speed ?? item.bytes_per_second ?? 0),
+      kind: item.kind === 'pose_export' ? 'pose_export' : 'download',
+      pairCount: Number(item.pair_count ?? 0),
       error: item.error || item.message || '',
       createdAt: item.created_at || item.started_at || item.date_added || ''
     };
@@ -320,7 +338,13 @@
       state.eventConnected = false;
       scheduleJobPoll(5000);
     });
-    source.addEventListener('job', () => loadJobs({ quiet: true }));
+    source.addEventListener('job', () => {
+      if (state.jobEventTimer !== null) return;
+      state.jobEventTimer = window.setTimeout(() => {
+        state.jobEventTimer = null;
+        loadJobs({ quiet: true });
+      }, 200);
+    });
     source.addEventListener('gallery', event => {
       try {
         const change = JSON.parse(event.data || '{}');
@@ -430,10 +454,27 @@
 
   async function selectProfile(name, reload = true) {
     if (!name || name === state.activeProfile) return;
+    if ($('#gallery-modal').open && state.poseLoadedKey) {
+      await flushPoseDraft();
+      if (state.poseDirty) {
+        renderProfileSelectors();
+        toast('Profile not changed', 'Save the current pose draft before changing its destination.', 'error');
+        return;
+      }
+    }
     state.activeProfile = name;
     storage.set('active-profile', name);
     renderProfileSelectors();
+    $('#active-profile').value = name;
+    $('#modal-profile-select').value = name;
     renderProfiles();
+    if ($('#gallery-modal').open && state.gallery) {
+      state.poseLoadedKey = '';
+      state.poseDraft = { revision: 0, controls: { solo: '', couple: '', group: '' }, targets: [] };
+      state.poseSelectedImages = new Set();
+      renderImages();
+      if (state.galleryMode === 'pose') loadPoseWorkspace();
+    }
     if (reload) {
       await Promise.all([loadHistory(), loadGalleries({ quiet: true })]);
       toast('Profile changed', `New downloads will be saved to “${name}”.`, 'info');
@@ -806,10 +847,29 @@
   }
 
   async function openGallery(id) {
+    if (state.poseLoadedKey && (state.poseDirty || state.poseSaving)) {
+      await flushPoseDraft();
+      if (state.poseDirty) {
+        toast('Pose draft still has unsaved changes', 'Resolve the save error before opening another gallery.', 'error');
+        return;
+      }
+    }
     const summary = state.galleries.find(item => String(item.id) === String(id));
     if (!summary) return;
+    window.clearTimeout(state.poseSaveTimer);
+    state.poseSaving = false;
+    state.poseSavePromise = null;
+    state.poseLoading = false;
     state.gallery = { ...summary, images: [] };
     state.selectedImages = new Set();
+    state.poseSelectedImages = new Set();
+    state.poseTags = [];
+    state.poseDraft = { revision: 0, controls: { solo: '', couple: '', group: '' }, targets: [] };
+    state.poseLoadedKey = '';
+    state.poseDirty = false;
+    state.poseMutation = 0;
+    window.clearTimeout(state.poseSaveTimer);
+    setGalleryMode('download', { load: false, render: false });
     state.loadingDetail = true;
     $('#gallery-modal-title').textContent = summary.title;
     $('#gallery-modal-kicker').textContent = 'Loading gallery';
@@ -880,14 +940,435 @@
     $('use', button).setAttribute('href', gallery.ignored ? '#i-eye' : '#i-eye-off');
   }
 
+  function normalizePoseTag(item) {
+    return {
+      ...item,
+      id: item?.id,
+      label: String(item?.label || item?.name || '').trim(),
+      slug: String(item?.slug || ''),
+      defaultRole: POSE_ROLES.includes(item?.default_role) ? item.default_role : 'solo'
+    };
+  }
+
+  function normalizePoseDraft(item) {
+    const draft = item?.draft || item || {};
+    const controls = draft.controls || {};
+    return {
+      revision: Number(draft.revision || 0),
+      controls: Object.fromEntries(POSE_ROLES.map(role => [role, typeof controls[role] === 'string' ? controls[role] : ''])),
+      targets: (Array.isArray(draft.targets) ? draft.targets : []).map(target => ({
+        imageUrl: String(target.image_url || ''),
+        ordinal: Number(target.ordinal || 0),
+        poseTagId: target.pose_tag_id,
+        poseSlug: String(target.pose_slug || ''),
+        poseLabel: String(target.pose_label || ''),
+        role: POSE_ROLES.includes(target.role) ? target.role : 'solo'
+      })).filter(target => target.imageUrl && target.poseTagId !== undefined && target.poseTagId !== null)
+    };
+  }
+
+  function currentPoseKey(gallery = state.gallery, profile = $('#modal-profile-select')?.value || state.activeProfile) {
+    if (gallery?.id === undefined || gallery?.id === null || !profile) return '';
+    return `${gallery.id}\n${profile}`;
+  }
+
+  function poseTargetFor(url) {
+    return state.poseDraft.targets.find(target => target.imageUrl === url) || null;
+  }
+
+  function poseControlFor(url) {
+    return POSE_ROLES.find(role => state.poseDraft.controls[role] === url) || '';
+  }
+
+  function poseAssignmentFor(url) {
+    const controlRole = poseControlFor(url);
+    if (controlRole) return { type: 'control', role: controlRole };
+    const target = poseTargetFor(url);
+    return target ? { type: 'target', ...target } : null;
+  }
+
+  function poseTagForInput(value) {
+    const query = String(value || '').trim().toLocaleLowerCase();
+    if (!query) return null;
+    return state.poseTags.find(tag => tag.label.toLocaleLowerCase() === query || tag.slug.toLocaleLowerCase() === query) || null;
+  }
+
+  function renderPoseTagOptions() {
+    const list = $('#pose-tag-options');
+    list.replaceChildren();
+    [...state.poseTags].sort((a, b) => a.label.localeCompare(b.label)).forEach(tag => {
+      const option = document.createElement('option');
+      option.value = tag.label;
+      option.label = `${tag.label} · ${poseRoleLabel(tag.defaultRole)} control`;
+      list.append(option);
+    });
+  }
+
+  function renderPoseBadge(option, image) {
+    $('.pose-role-badge', option)?.remove();
+    option.classList.remove('has-pose-target', 'has-pose-control');
+    if (state.galleryMode !== 'pose') return;
+    const assignment = poseAssignmentFor(image.url);
+    if (!assignment) return;
+    const badge = document.createElement('span');
+    badge.className = `pose-role-badge ${assignment.type}`;
+    const marker = document.createElement('b');
+    marker.textContent = assignment.type === 'target' ? 'T' : 'C';
+    const label = document.createElement('span');
+    label.textContent = assignment.type === 'target' ? (assignment.poseLabel || assignment.poseSlug || 'Target') : poseRoleLabel(assignment.role);
+    badge.title = assignment.type === 'target'
+      ? `Target: ${label.textContent} · ${poseRoleLabel(assignment.role)} control`
+      : `${poseRoleLabel(assignment.role)} control`;
+    badge.append(marker, label);
+    option.append(badge);
+    option.classList.add(assignment.type === 'target' ? 'has-pose-target' : 'has-pose-control');
+  }
+
+  function posePreflight() {
+    const targets = state.poseDraft.targets;
+    const assignedControls = POSE_ROLES.filter(role => state.poseDraft.controls[role]);
+    const issues = [];
+    if (!targets.length) issues.push('Add at least one target');
+    targets.forEach(target => {
+      if (!target.poseTagId) issues.push('A target has no pose');
+      if (!state.poseDraft.controls[target.role]) issues.push(`${poseRoleLabel(target.role)} control is missing`);
+    });
+    if (!($('#modal-profile-select')?.value || state.activeProfile)) issues.push('Choose a destination profile');
+    return { targets: targets.length, controls: assignedControls.length, issues: [...new Set(issues)] };
+  }
+
+  function renderPosePreflight() {
+    const result = posePreflight();
+    $('#pose-target-count').textContent = formatNumber(result.targets);
+    $('#pose-control-count').textContent = formatNumber(result.controls);
+    $('#pose-issue-count').textContent = formatNumber(result.issues.length);
+    $('#pose-issue-count').classList.toggle('has-issues', Boolean(result.issues.length));
+    $('#pose-preflight-detail').textContent = result.issues.length
+      ? result.issues.join(' · ')
+      : `Ready to build ${formatNumber(result.targets)} paired image${result.targets === 1 ? '' : 's'}.`;
+    $('#pose-export').disabled = state.poseLoading || state.poseSaving || Boolean(result.issues.length);
+  }
+
+  function renderPoseSaveStatus(message = '') {
+    const status = $('#pose-save-status');
+    if (message) status.textContent = message;
+    else if (state.poseLoading) status.textContent = 'Loading draft…';
+    else if (state.poseSaving) status.textContent = 'Saving…';
+    else if (state.poseDirty) status.textContent = 'Changes pending…';
+    else if (state.poseLoadedKey) status.textContent = 'Draft saved';
+    else status.textContent = 'Draft not loaded';
+    status.classList.toggle('is-saving', state.poseSaving || state.poseDirty);
+  }
+
+  function renderPoseToolbar() {
+    const isTarget = state.poseAssignment === 'target';
+    const checked = state.poseSelectedImages.size;
+    $$('[data-pose-assignment]').forEach(button => {
+      const active = button.dataset.poseAssignment === state.poseAssignment;
+      button.classList.toggle('is-active', active);
+      button.setAttribute('aria-pressed', String(active));
+    });
+    $('#pose-target-fields').hidden = !isTarget;
+    $('#pose-control-hint').hidden = isTarget;
+    const apply = $('#pose-apply-checked');
+    const label = $('span', apply);
+    const targetRole = $('#pose-control-role').value;
+    const missingControl = isTarget && !state.poseDraft.controls[targetRole];
+    label.textContent = missingControl
+      ? `Set ${poseRoleLabel(targetRole).toLowerCase()} control first`
+      : checked ? `Apply to ${formatNumber(checked)} checked` : 'Apply to checked';
+    const missingTag = isTarget && !$('#pose-tag-input').value.trim();
+    apply.disabled = state.poseLoading || !checked || missingTag || missingControl || (!isTarget && checked !== 1);
+    $('#pose-clear-checked').disabled = !checked || ![...state.poseSelectedImages].some(url => poseAssignmentFor(url));
+    renderPoseSaveStatus();
+    renderPosePreflight();
+  }
+
+  function renderLightboxPoseDock() {
+    const dock = $('#lightbox-pose-dock');
+    const image = state.gallery?.images?.[state.lightboxIndex];
+    dock.hidden = state.galleryMode !== 'pose' || !image;
+    $('#lightbox-footer-hint').textContent = state.galleryMode === 'pose'
+      ? 'Tag this image, then use the arrows to continue through the gallery'
+      : 'Click or tap the image to toggle fit and actual size';
+    if (dock.hidden) return;
+    const assignment = poseAssignmentFor(image.url);
+    $('#lightbox-pose-title').textContent = !assignment
+      ? 'Not assigned'
+      : assignment.type === 'control'
+        ? `${poseRoleLabel(assignment.role)} control`
+        : `Target · ${assignment.poseLabel || assignment.poseSlug}`;
+    $$('[data-lightbox-control]').forEach(button => {
+      const active = assignment?.type === 'control' && assignment.role === button.dataset.lightboxControl;
+      button.classList.toggle('is-active', active);
+      button.setAttribute('aria-pressed', String(active));
+    });
+    $('#lightbox-pose-tag-input').value = assignment?.type === 'target' ? assignment.poseLabel : '';
+    $('#lightbox-pose-control-role').value = assignment?.type === 'target' ? assignment.role : 'solo';
+    updateLightboxTargetAvailability();
+    $('#lightbox-clear-pose').disabled = !assignment;
+  }
+
+  function updateLightboxTargetAvailability() {
+    const targetRole = $('#lightbox-pose-control-role').value;
+    $('#lightbox-set-target').disabled = !state.poseDraft.controls[targetRole];
+    $('#lightbox-set-target').title = state.poseDraft.controls[targetRole] ? 'Set this image as a pose target' : `Set a ${targetRole} control first`;
+  }
+
+  function renderPoseWorkspace() {
+    renderPoseTagOptions();
+    renderPoseToolbar();
+    renderLightboxPoseDock();
+  }
+
+  async function loadPoseWorkspace({ force = false } = {}) {
+    const key = currentPoseKey();
+    if (!key || (key === state.poseLoadedKey && !force) || state.poseLoading) return;
+    state.poseLoading = true;
+    renderPoseWorkspace();
+    const [galleryId, profile] = key.split('\n');
+    try {
+      const [tagsData, draftData] = await Promise.all([
+        api('/api/pose-tags'),
+        api(withParams(`/api/galleries/${encodeURIComponent(galleryId)}/pose-draft`, { profile }))
+      ]);
+      if (key !== currentPoseKey()) return;
+      state.poseTags = apiItems(tagsData).map(normalizePoseTag).filter(tag => tag.id !== undefined && tag.label);
+      state.poseDraft = normalizePoseDraft(draftData);
+      state.poseLoadedKey = key;
+      state.poseDirty = false;
+      renderImages();
+      renderPoseWorkspace();
+    } catch (error) {
+      renderPoseSaveStatus('Draft unavailable');
+      toast('Could not load pose draft', errorMessage(error), 'error');
+    } finally {
+      state.poseLoading = false;
+      renderPoseWorkspace();
+    }
+  }
+
+  function setGalleryMode(mode, { load = true, render = true } = {}) {
+    state.galleryMode = mode === 'pose' ? 'pose' : 'download';
+    const poseMode = state.galleryMode === 'pose';
+    $('#gallery-modal').classList.toggle('is-pose-mode', poseMode);
+    $$('[data-gallery-mode]').forEach(button => {
+      const active = button.dataset.galleryMode === state.galleryMode;
+      button.classList.toggle('is-active', active);
+      button.setAttribute('aria-selected', String(active));
+    });
+    $('#pose-toolbar').hidden = !poseMode;
+    $('#download-selection-total').hidden = poseMode;
+    $('#pose-preflight').hidden = !poseMode;
+    $('#queue-download').hidden = poseMode;
+    $('#pose-export').hidden = !poseMode;
+    $('#modal-profile-label').textContent = poseMode ? 'Organize in' : 'Download to';
+    $('#image-picker-title').textContent = poseMode ? 'Prepare pose pairs' : 'Choose images';
+    $('#select-all').textContent = poseMode ? 'Check all' : 'Select all';
+    $('#select-none').textContent = poseMode ? 'Uncheck all' : 'Clear';
+    if (render) renderImages();
+    renderPoseWorkspace();
+    if (poseMode && load) loadPoseWorkspace();
+  }
+
+  function poseDraftBody(expectedRevision = state.poseDraft.revision) {
+    return {
+      expected_revision: Number(expectedRevision || 0),
+      controls: Object.fromEntries(POSE_ROLES.map(role => [role, state.poseDraft.controls[role] || null])),
+      targets: state.poseDraft.targets.map(target => ({ image_url: target.imageUrl, pose_tag_id: target.poseTagId, role: target.role }))
+    };
+  }
+
+  function markPoseDraftDirty() {
+    state.poseDirty = true;
+    state.poseMutation += 1;
+    renderPoseWorkspace();
+    window.clearTimeout(state.poseSaveTimer);
+    state.poseSaveTimer = window.setTimeout(() => savePoseDraft(), 650);
+  }
+
+  async function savePoseDraft() {
+    window.clearTimeout(state.poseSaveTimer);
+    if (state.poseSaving) return state.poseSavePromise;
+    if (!state.poseDirty || !state.poseLoadedKey) return null;
+    const key = state.poseLoadedKey;
+    const [galleryId, profile] = key.split('\n');
+    state.poseSaving = true;
+    renderPoseWorkspace();
+    state.poseSavePromise = (async () => {
+      while (state.poseDirty && state.poseLoadedKey === key) {
+        const mutation = state.poseMutation;
+        state.poseDirty = false;
+        try {
+          const data = await api(withParams(`/api/galleries/${encodeURIComponent(galleryId)}/pose-draft`, { profile }), {
+            method: 'PUT',
+            body: poseDraftBody()
+          });
+          if (state.poseLoadedKey !== key) return;
+          state.poseDraft.revision = Number((data?.draft || data)?.revision ?? state.poseDraft.revision + 1);
+          if (mutation !== state.poseMutation) state.poseDirty = true;
+        } catch (error) {
+          if (error.status === 409 && state.poseLoadedKey === key) {
+            const latestData = error.data?.draft
+              ? { draft: error.data.draft }
+              : await api(withParams(`/api/galleries/${encodeURIComponent(galleryId)}/pose-draft`, { profile }));
+            if (state.poseLoadedKey !== key) return;
+            state.poseDraft = normalizePoseDraft(latestData);
+            state.poseDirty = false;
+            state.poseMutation += 1;
+            renderImages();
+            renderPoseWorkspace();
+            toast('Newer pose draft loaded', 'Your conflicting local edit was not saved. Review the newer draft and apply the change again.', 'info', 7000);
+            return;
+          }
+          state.poseDirty = true;
+          renderPoseSaveStatus('Draft not saved');
+          throw error;
+        }
+      }
+    })();
+    try {
+      await state.poseSavePromise;
+    } catch (error) {
+      toast('Could not save pose draft', errorMessage(error), 'error');
+    } finally {
+      state.poseSaving = false;
+      state.poseSavePromise = null;
+      renderPoseWorkspace();
+    }
+    return null;
+  }
+
+  async function flushPoseDraft() {
+    window.clearTimeout(state.poseSaveTimer);
+    if (state.poseSaving && state.poseSavePromise) await state.poseSavePromise.catch(() => null);
+    if (state.poseDirty) await savePoseDraft();
+  }
+
+  async function ensurePoseTag(label, defaultRole) {
+    const cleanLabel = String(label || '').trim().replace(/\s+/g, ' ');
+    if (!cleanLabel) throw new ApiError('Enter a pose name first.');
+    const existing = poseTagForInput(cleanLabel);
+    if (existing) return existing;
+    const data = await api('/api/pose-tags', { method: 'POST', body: { label: cleanLabel, default_role: defaultRole } });
+    const tag = normalizePoseTag(data?.tag || data);
+    state.poseTags.push(tag);
+    renderPoseTagOptions();
+    toast('Pose created', `${tag.label} defaults to the ${poseRoleLabel(tag.defaultRole).toLowerCase()} control.`, 'success');
+    return tag;
+  }
+
+  function clearPoseAssignment(url) {
+    POSE_ROLES.forEach(role => { if (state.poseDraft.controls[role] === url) state.poseDraft.controls[role] = ''; });
+    state.poseDraft.targets = state.poseDraft.targets.filter(target => target.imageUrl !== url);
+  }
+
+  function setPoseControl(url, role) {
+    const replaced = state.poseDraft.controls[role];
+    clearPoseAssignment(url);
+    state.poseDraft.controls[role] = url;
+    return replaced && replaced !== url;
+  }
+
+  function setPoseTarget(url, tag, role) {
+    clearPoseAssignment(url);
+    state.poseDraft.targets.push({
+      imageUrl: url,
+      ordinal: (state.gallery?.images || []).findIndex(image => image.url === url) + 1,
+      poseTagId: tag.id,
+      poseSlug: tag.slug,
+      poseLabel: tag.label,
+      role
+    });
+  }
+
+  async function applyPoseAssignment(urls, assignment, { button = null, clearChecked = false } = {}) {
+    const selected = [...urls];
+    if (!selected.length || state.poseLoading) return false;
+    if (assignment !== 'target' && selected.length !== 1) {
+      toast('Choose one control image', 'Each Solo, Couple, or Group slot uses exactly one control.', 'info');
+      return false;
+    }
+    if (assignment === 'target') {
+      const dockAction = button?.closest('#lightbox-pose-dock');
+      const roleSelect = dockAction ? $('#lightbox-pose-control-role') : $('#pose-control-role');
+      const role = POSE_ROLES.includes(roleSelect.value) ? roleSelect.value : 'solo';
+      if (!state.poseDraft.controls[role]) {
+        toast(`Set a ${poseRoleLabel(role).toLowerCase()} control first`, 'Every target needs its matching control before the draft can be saved.', 'info');
+        return false;
+      }
+      const occupiedControl = selected.map(poseControlFor).find(Boolean);
+      if (occupiedControl) {
+        toast('This image is a control', `Replace the ${poseRoleLabel(occupiedControl).toLowerCase()} control before tagging it as a target.`, 'info');
+        return false;
+      }
+    } else {
+      const previousRole = poseControlFor(selected[0]);
+      if (previousRole && previousRole !== assignment && state.poseDraft.targets.some(target => target.role === previousRole)) {
+        toast('This control is still in use', `Replace the ${poseRoleLabel(previousRole).toLowerCase()} control before changing its role.`, 'info');
+        return false;
+      }
+    }
+    if (button) setButtonBusy(button, true, assignment === 'target' ? 'Tagging…' : 'Assigning…');
+    try {
+      if (assignment === 'target') {
+        const input = button?.closest('#lightbox-pose-dock') ? $('#lightbox-pose-tag-input') : $('#pose-tag-input');
+        const roleSelect = button?.closest('#lightbox-pose-dock') ? $('#lightbox-pose-control-role') : $('#pose-control-role');
+        const role = POSE_ROLES.includes(roleSelect.value) ? roleSelect.value : 'solo';
+        const tag = await ensurePoseTag(input.value, role);
+        selected.forEach(url => setPoseTarget(url, tag, role));
+        announce(`${selected.length} image${selected.length === 1 ? '' : 's'} assigned as ${tag.label} targets`);
+      } else {
+        const replaced = setPoseControl(selected[0], assignment);
+        toast(`${poseRoleLabel(assignment)} control set`, replaced ? 'The previous image in this control slot was replaced.' : 'Targets can now use this control.', 'success');
+      }
+      if (clearChecked) state.poseSelectedImages.clear();
+      markPoseDraftDirty();
+      renderImages();
+      renderPoseWorkspace();
+      return true;
+    } catch (error) {
+      toast('Could not assign image', errorMessage(error), 'error');
+      return false;
+    } finally {
+      if (button) setButtonBusy(button, false);
+    }
+  }
+
+  function clearCheckedPoseAssignments() {
+    if (!state.poseSelectedImages.size) return;
+    const blockedRole = POSE_ROLES.find(role => (
+      state.poseSelectedImages.has(state.poseDraft.controls[role]) &&
+      state.poseDraft.targets.some(target => target.role === role && !state.poseSelectedImages.has(target.imageUrl))
+    ));
+    if (blockedRole) {
+      toast('Control is still in use', `Also check its ${poseRoleLabel(blockedRole).toLowerCase()} targets, or replace that control first.`, 'info');
+      return;
+    }
+    state.poseSelectedImages.forEach(clearPoseAssignment);
+    const count = state.poseSelectedImages.size;
+    markPoseDraftDirty();
+    renderImages();
+    renderPoseWorkspace();
+    announce(`Assignments removed from ${count} image${count === 1 ? '' : 's'}`);
+  }
+
+  function syncPoseTagDefault(input, select) {
+    const tag = poseTagForInput(input.value);
+    if (tag) select.value = tag.defaultRole;
+    if (input.id === 'lightbox-pose-tag-input') updateLightboxTargetAvailability();
+    else renderPoseToolbar();
+  }
+
   function renderImages() {
     const grid = $('#image-grid');
     grid.replaceChildren();
     const images = state.gallery?.images || [];
+    const activeSelection = state.galleryMode === 'pose' ? state.poseSelectedImages : state.selectedImages;
     $('#images-empty').hidden = Boolean(images.length);
     images.forEach((image, index) => {
       const option = document.createElement('div');
-      option.className = `image-option${state.selectedImages.has(image.url) ? ' is-selected' : ''}`;
+      option.className = `image-option${activeSelection.has(image.url) ? ' is-selected' : ''}`;
       option.classList.toggle('is-downloaded', Boolean(image.downloaded));
       option.dataset.imageUrl = image.url;
       option.dataset.imageIndex = String(index);
@@ -895,8 +1376,8 @@
       const input = document.createElement('input');
       input.id = `gallery-image-${index}`;
       input.type = 'checkbox';
-      input.checked = state.selectedImages.has(image.url);
-      input.setAttribute('aria-label', `Select ${image.filename}`);
+      input.checked = activeSelection.has(image.url);
+      input.setAttribute('aria-label', state.galleryMode === 'pose' ? `Check ${image.filename} for pose tagging` : `Select ${image.filename} for download`);
       const previewButton = document.createElement('button');
       previewButton.className = 'image-preview-button';
       previewButton.type = 'button';
@@ -915,7 +1396,7 @@
       const check = document.createElement('label');
       check.className = 'image-check';
       check.htmlFor = input.id;
-      check.setAttribute('aria-label', `Select ${image.filename}`);
+      check.setAttribute('aria-label', input.getAttribute('aria-label'));
       check.innerHTML = '<svg><use href="#i-check"></use></svg>';
       const number = document.createElement('span');
       number.className = 'image-number';
@@ -927,6 +1408,7 @@
         saved.innerHTML = '<svg><use href="#i-check"></use></svg> Saved';
         option.append(saved);
       }
+      renderPoseBadge(option, image);
       grid.append(option);
     });
     updateSelectionUi();
@@ -992,6 +1474,7 @@
       loadCandidate();
     });
     loadCandidate();
+    renderLightboxPoseDock();
     announce(`Viewing image ${state.lightboxIndex + 1} of ${images.length}: ${image.filename}`);
   }
 
@@ -1025,17 +1508,20 @@
   }
 
   function toggleImage(url, checked) {
-    if (checked) state.selectedImages.add(url);
-    else state.selectedImages.delete(url);
+    const selection = state.galleryMode === 'pose' ? state.poseSelectedImages : state.selectedImages;
+    if (checked) selection.add(url);
+    else selection.delete(url);
     const option = $$('.image-option', $('#image-grid')).find(item => item.dataset.imageUrl === url);
     option?.classList.toggle('is-selected', checked);
     updateSelectionUi();
   }
 
   function selectAllImages(selected) {
-    state.selectedImages = new Set(selected ? (state.gallery?.images || []).map(image => image.url) : []);
+    const selection = new Set(selected ? (state.gallery?.images || []).map(image => image.url) : []);
+    if (state.galleryMode === 'pose') state.poseSelectedImages = selection;
+    else state.selectedImages = selection;
     $$('.image-option', $('#image-grid')).forEach(option => {
-      const checked = state.selectedImages.has(option.dataset.imageUrl);
+      const checked = selection.has(option.dataset.imageUrl);
       option.classList.toggle('is-selected', checked);
       const input = $('input', option);
       if (input) input.checked = checked;
@@ -1044,12 +1530,18 @@
   }
 
   function updateSelectionUi() {
-    const selected = state.selectedImages.size;
+    const selection = state.galleryMode === 'pose' ? state.poseSelectedImages : state.selectedImages;
+    const selected = selection.size;
     const total = state.gallery?.images?.length || 0;
     $('#selected-count').textContent = formatNumber(selected);
     const downloaded = state.gallery?.downloadedImages || 0;
-    $('#selection-summary').textContent = state.loadingDetail ? 'Scanning the source page…' : `${formatNumber(selected)} of ${formatNumber(total)} selected${downloaded ? ` · ${formatNumber(downloaded)} already saved` : ''}`;
+    $('#selection-summary').textContent = state.loadingDetail
+      ? 'Scanning the source page…'
+      : state.galleryMode === 'pose'
+        ? `${formatNumber(selected)} checked for bulk tagging · ${formatNumber(state.poseDraft.targets.length)} targets assigned`
+        : `${formatNumber(selected)} of ${formatNumber(total)} selected${downloaded ? ` · ${formatNumber(downloaded)} already saved` : ''}`;
     $('#queue-download').disabled = state.loadingDetail || !selected || !state.activeProfile;
+    renderPoseToolbar();
   }
 
   async function queueGallery() {
@@ -1078,6 +1570,34 @@
     } catch (error) {
       toast('Could not start download', errorMessage(error), 'error');
     } finally { setButtonBusy(button, false); }
+  }
+
+  async function exportPoseDataset() {
+    const gallery = state.gallery;
+    const profile = $('#modal-profile-select').value || state.activeProfile;
+    if (!gallery || !profile) return;
+    const button = $('#pose-export');
+    setButtonBusy(button, true, 'Preparing…');
+    try {
+      await flushPoseDraft();
+      if (state.poseDirty) throw new ApiError('The pose draft could not be saved. Try again before exporting.');
+      const preflight = posePreflight();
+      if (preflight.issues.length) throw new ApiError(preflight.issues.join(' · '));
+      const data = await api('/api/pose-exports', {
+        method: 'POST',
+        body: { gallery_id: gallery.id, profile, expected_revision: state.poseDraft.revision }
+      });
+      const pairs = Number(data?.job?.pair_count ?? preflight.targets);
+      closeModal($('#lightbox-modal'));
+      $('#gallery-modal').close();
+      toast('Pose dataset queued', `${formatNumber(pairs)} pair${pairs === 1 ? '' : 's'} will download and organize in “${profile}”.`, 'success');
+      await loadJobs({ quiet: true });
+    } catch (error) {
+      toast('Could not export pose dataset', errorMessage(error), 'error');
+    } finally {
+      setButtonBusy(button, false);
+      renderPoseWorkspace();
+    }
   }
 
   async function loadJobs({ quiet = false } = {}) {
@@ -1123,22 +1643,30 @@
       row.classList.toggle('is-completed', job.status === 'completed');
       row.classList.toggle('is-partial', job.status === 'completed_with_errors');
       row.classList.toggle('is-failed', job.status === 'failed');
+      row.classList.toggle('is-pose-export', job.kind === 'pose_export');
+      if (job.kind === 'pose_export') $('use', $('.job-thumb', row)).setAttribute('href', '#i-layers');
       loadImage($('.job-thumb img', row), job.thumbnailUrl, '');
-      $('.job-heading h3', row).textContent = job.title;
-      $('.job-heading p', row).textContent = `${job.profile}${job.createdAt ? ` · ${relativeTime(job.createdAt)}` : ''}`;
+      $('.job-heading h3', row).textContent = job.kind === 'pose_export' ? (job.title || 'Pose dataset') : job.title;
+      $('.job-heading p', row).textContent = job.kind === 'pose_export'
+        ? `Pose dataset · ${formatNumber(job.pairCount)} pair${job.pairCount === 1 ? '' : 's'} · ${job.profile}${job.createdAt ? ` · ${relativeTime(job.createdAt)}` : ''}`
+        : `${job.profile}${job.createdAt ? ` · ${relativeTime(job.createdAt)}` : ''}`;
       const stateLabel = $('.job-state', row);
       const displayStatus = job.status.replaceAll('_', ' ');
       stateLabel.textContent = displayStatus;
       stateLabel.className = `job-state ${job.status === 'completed_with_errors' ? 'partial' : job.status}`;
       $('.job-progress > span', row).style.width = `${job.progress}%`;
-      const counts = job.total ? `${formatNumber(job.complete)} / ${formatNumber(job.total)} images` : `${Math.round(job.progress)}%`;
+      const counts = job.kind === 'pose_export'
+        ? job.total
+          ? `${formatNumber(job.complete)} / ${formatNumber(job.total)} source images · ${formatNumber(job.pairCount)} pairs`
+          : `${formatNumber(job.pairCount)} pairs queued`
+        : job.total ? `${formatNumber(job.complete)} / ${formatNumber(job.total)} images` : `${Math.round(job.progress)}%`;
       $('.job-progress-label', row).textContent = counts;
       $('.job-speed', row).textContent = job.speed ? `${formatBytes(job.speed)}/s` : job.bytes ? formatBytes(job.bytes) : '';
       const error = $('.job-error', row);
       error.hidden = !job.error && !(job.status === 'completed_with_errors' && job.failed);
       error.textContent = job.error || (job.failed ? `${formatNumber(job.failed)} images failed` : '');
       $('.job-toggle', row).hidden = true;
-      $('.job-remove', row).title = isTerminalJob(job) ? 'Remove' : 'Cancel download';
+      $('.job-remove', row).title = isTerminalJob(job) ? 'Remove' : job.kind === 'pose_export' ? 'Cancel pose export' : 'Cancel download';
       $('.job-remove', row).setAttribute('aria-label', $('.job-remove', row).title);
       list.append(fragment);
     });
@@ -1164,8 +1692,12 @@
       await api(`/api/downloads/${encodeURIComponent(job.id)}`, { method: 'DELETE' });
       state.jobs = state.jobs.filter(item => String(item.id) !== String(job.id));
       renderJobs();
-      toast(isTerminalJob(job) ? 'Transfer removed' : 'Download cancelled', job.title, 'info');
-    } catch (error) { toast('Could not remove transfer', errorMessage(error), 'error'); }
+      const title = isTerminalJob(job) ? 'Transfer removed' : job.kind === 'pose_export' ? 'Pose export cancelled' : 'Download cancelled';
+      toast(title, job.title, 'info');
+    } catch (error) {
+      const title = !isTerminalJob(job) && job.kind === 'pose_export' ? 'Could not cancel pose export' : 'Could not remove transfer';
+      toast(title, errorMessage(error), 'error');
+    }
   }
 
   async function clearCompleted() {
@@ -1805,6 +2337,21 @@
     }));
     $('#select-all').addEventListener('click', () => selectAllImages(true));
     $('#select-none').addEventListener('click', () => selectAllImages(false));
+    $$('[data-gallery-mode]').forEach(button => button.addEventListener('click', () => setGalleryMode(button.dataset.galleryMode)));
+    $$('[data-pose-assignment]').forEach(button => button.addEventListener('click', () => {
+      state.poseAssignment = button.dataset.poseAssignment;
+      renderPoseToolbar();
+      if (state.poseAssignment === 'target') $('#pose-tag-input').focus();
+    }));
+    $('#pose-tag-input').addEventListener('input', event => syncPoseTagDefault(event.currentTarget, $('#pose-control-role')));
+    $('#pose-tag-input').addEventListener('change', event => syncPoseTagDefault(event.currentTarget, $('#pose-control-role')));
+    $('#pose-control-role').addEventListener('change', renderPoseToolbar);
+    $('#pose-apply-checked').addEventListener('click', event => applyPoseAssignment(
+      state.poseSelectedImages,
+      state.poseAssignment,
+      { button: event.currentTarget, clearChecked: true }
+    ));
+    $('#pose-clear-checked').addEventListener('click', clearCheckedPoseAssignments);
     $('#image-grid').addEventListener('change', event => {
       if (event.target.matches('input[type="checkbox"]')) toggleImage(event.target.closest('.image-option').dataset.imageUrl, event.target.checked);
     });
@@ -1820,14 +2367,43 @@
     $('#lightbox-stage').addEventListener('click', event => {
       if (event.target.matches('#lightbox-image')) setLightboxZoom(!state.lightboxZoomed);
     });
+    $$('[data-lightbox-control]').forEach(button => button.addEventListener('click', event => {
+      const image = state.gallery?.images?.[state.lightboxIndex];
+      if (image) applyPoseAssignment([image.url], event.currentTarget.dataset.lightboxControl, { button: event.currentTarget });
+    }));
+    $('#lightbox-pose-tag-input').addEventListener('input', event => syncPoseTagDefault(event.currentTarget, $('#lightbox-pose-control-role')));
+    $('#lightbox-pose-tag-input').addEventListener('change', event => syncPoseTagDefault(event.currentTarget, $('#lightbox-pose-control-role')));
+    $('#lightbox-pose-control-role').addEventListener('change', updateLightboxTargetAvailability);
+    $('#lightbox-set-target').addEventListener('click', event => {
+      const image = state.gallery?.images?.[state.lightboxIndex];
+      if (image) applyPoseAssignment([image.url], 'target', { button: event.currentTarget });
+    });
+    $('#lightbox-clear-pose').addEventListener('click', () => {
+      const image = state.gallery?.images?.[state.lightboxIndex];
+      if (!image || !poseAssignmentFor(image.url)) return;
+      const controlRole = poseControlFor(image.url);
+      if (controlRole && state.poseDraft.targets.some(target => target.role === controlRole)) {
+        toast('Control is still in use', `Replace the ${poseRoleLabel(controlRole).toLowerCase()} control before removing it.`, 'info');
+        return;
+      }
+      clearPoseAssignment(image.url);
+      markPoseDraftDirty();
+      renderImages();
+      renderPoseWorkspace();
+      announce(`${image.filename} assignment removed`);
+    });
     $('#lightbox-modal').addEventListener('close', resetLightbox);
-    $('#gallery-modal').addEventListener('close', () => closeModal($('#lightbox-modal')));
+    $('#gallery-modal').addEventListener('close', () => {
+      closeModal($('#lightbox-modal'));
+      flushPoseDraft();
+    });
     $('#modal-ignore').addEventListener('click', () => {
       if (!state.gallery) return;
       const listItem = state.galleries.find(item => String(item.id) === String(state.gallery.id)) || state.gallery;
       toggleIgnore(listItem, $('#modal-ignore'));
     });
     $('#queue-download').addEventListener('click', queueGallery);
+    $('#pose-export').addEventListener('click', exportPoseDataset);
     window.addEventListener('scroll', () => $('.topbar').classList.toggle('is-scrolled', window.scrollY > 4), { passive: true });
     window.addEventListener('hashchange', () => setView(location.hash.slice(1), { updateHash: false }));
     document.addEventListener('visibilitychange', () => {
@@ -1867,7 +2443,10 @@
     } else if (galleryOpen && !lightboxOpen && key === 'a' && !editing) {
       event.preventDefault();
       selectAllImages(true);
-    } else if (galleryOpen && !lightboxOpen && event.key === 'Enter' && !editing && !$('#queue-download').disabled) {
+    } else if (galleryOpen && !lightboxOpen && state.galleryMode === 'pose' && event.key === 'Enter' && !editing && !$('#pose-apply-checked').disabled) {
+      event.preventDefault();
+      $('#pose-apply-checked').click();
+    } else if (galleryOpen && !lightboxOpen && state.galleryMode === 'download' && event.key === 'Enter' && !editing && !$('#queue-download').disabled) {
       event.preventDefault();
       queueGallery();
     }
