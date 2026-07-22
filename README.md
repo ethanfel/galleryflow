@@ -1,4 +1,4 @@
-# PornPic WebUI 2
+# GalleryFlow
 
 A self-contained, server-side PornPics gallery browser and downloader. The complete interface runs in a normal web browser; PyQt and a desktop client are not required.
 
@@ -21,7 +21,7 @@ Only download material you are legally permitted to access and retain. Site avai
 Python 3.11 or newer is recommended.
 
 ```bash
-cd /media/unraid/davinci/Qwen_edit_lora/pornpic_webui
+cd /media/unraid/davinci/Qwen_edit_lora/galleryflow
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
@@ -35,7 +35,7 @@ If the legacy gallery server is still using port `8099`, keep it running side by
 The current environment already has the required packages, so during development this is enough:
 
 ```bash
-cd /media/unraid/davinci/Qwen_edit_lora/pornpic_webui
+cd /media/unraid/davinci/Qwen_edit_lora/galleryflow
 python run.py
 ```
 
@@ -58,21 +58,21 @@ Or use the published GitHub Container Registry image (authenticate first because
 
 ```bash
 gh auth token | docker login ghcr.io -u ethanfel --password-stdin
-docker pull ghcr.io/ethanfel/pornpic-webui:latest
-docker run -d --name pornpic-webui --restart unless-stopped \
-  -p 8100:8099 -v pornpic-data:/data \
-  ghcr.io/ethanfel/pornpic-webui:latest
+docker pull ghcr.io/ethanfel/galleryflow:latest
+docker run -d --name galleryflow --restart unless-stopped \
+  -p 8100:8099 -v galleryflow-data:/data \
+  ghcr.io/ethanfel/galleryflow:latest
 ```
 
-State and downloads are stored in the Docker-managed `pornpic-data` volume. To place the library directly on another disk, replace that volume with a bind mount such as `/path/to/library:/data` and make the host directory writable by container UID/GID `10001:10001`.
+State and downloads are stored in the Docker-managed `galleryflow-data` volume. To place the library directly on another disk, replace that volume with a bind mount such as `/path/to/library:/data` and make the host directory writable by container UID/GID `10001:10001`.
 
 An existing sort library can instead be mounted separately:
 
 ```yaml
 services:
-  pornpic-webui:
+  galleryflow:
     volumes:
-      - pornpic-data:/data
+      - galleryflow-data:/data
       - /path/to/existing/library:/sort-library
     environment:
       PORNPIC_WEBUI_SORT_ROOT: /sort-library

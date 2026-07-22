@@ -81,7 +81,7 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
             await media_client.aclose()
 
     app = FastAPI(
-        title="PornPic WebUI",
+        title="GalleryFlow",
         version=__version__,
         description="A web-only gallery browser, downloader, history tracker, and profile sorter.",
         lifespan=lifespan,

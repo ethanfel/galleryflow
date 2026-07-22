@@ -1,17 +1,17 @@
 services:
-  pornpic-webui:
-    image: ghcr.io/ethanfel/pornpic-webui:latest
+  galleryflow:
+    image: ghcr.io/ethanfel/galleryflow:latest
     build: .
-    container_name: pornpic-webui
+    container_name: galleryflow
     restart: unless-stopped
     ports:
       - "8099:8099"
     volumes:
-      - pornpic-data:/data
+      - galleryflow-data:/data
     environment:
       PORNPIC_WEBUI_JOB_WORKERS: "2"
       PORNPIC_WEBUI_IMAGE_WORKERS: "6"
       PORNPIC_WEBUI_SORT_ROOT: /data/downloads
 
 volumes:
-  pornpic-data:
+  galleryflow-data:

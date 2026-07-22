@@ -7,7 +7,7 @@ import uvicorn
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run PornPic WebUI")
+    parser = argparse.ArgumentParser(description="Run GalleryFlow")
     parser.add_argument(
         "--host", default="0.0.0.0", help="Listen address (default: 0.0.0.0)"
     )
