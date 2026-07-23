@@ -32,9 +32,10 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"}
 ACTIVE_STATUSES = {"queued", "preparing", "scanning", "pausing", "canceling"}
 TERMINAL_STATUSES = {"completed", "completed_with_errors", "failed", "canceled"}
 REVIEW_STATES = {"pending", "accepted", "rejected"}
-ANALYZER_VERSION = (
-    "hybrid-spatial-pyramid-v1+rtmo-l-geometry-v1+phash64-gate-v1"
-)
+ANALYZER_VERSION = "hybrid-spatial-pyramid-v1+rtmo-l-geometry-v1+phash64-gate-v1"
+LEGACY_RANKING_VERSION = "appearance-v1"
+CURRENT_RANKING_VERSION = "pose-first-v1"
+POSE_MATCH_FLOOR = 0.55
 EXACT_HASH_MAX_DISTANCE = 8
 MAX_SCAN_PAGES = 500
 MAX_EXTEND_PAGES = 50
@@ -140,6 +141,7 @@ class FinderService:
                     page_limit INTEGER NOT NULL,
                     pages_completed INTEGER NOT NULL DEFAULT 0,
                     minimum_score REAL NOT NULL,
+                    ranking_version TEXT NOT NULL DEFAULT 'pose-first-v1',
                     status TEXT NOT NULL,
                     total_galleries INTEGER NOT NULL DEFAULT 0,
                     processed_galleries INTEGER NOT NULL DEFAULT 0,
@@ -185,6 +187,7 @@ class FinderService:
                     best_preview_remote_url TEXT NOT NULL DEFAULT '',
                     best_ordinal INTEGER,
                     score REAL NOT NULL DEFAULT 0,
+                    ranking_tier INTEGER NOT NULL DEFAULT 1,
                     matches_json TEXT NOT NULL DEFAULT '[]',
                     images_scored INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL,
@@ -207,6 +210,7 @@ class FinderService:
             migrations = {
                 "finder_scans": {
                     "reference_model_key": "TEXT NOT NULL DEFAULT ''",
+                    "ranking_version": ("TEXT NOT NULL DEFAULT 'appearance-v1'"),
                 },
                 "finder_scan_references": {
                     "metadata_json": "TEXT NOT NULL DEFAULT '{}'",
@@ -216,6 +220,7 @@ class FinderService:
                 },
                 "finder_results": {
                     "matches_json": "TEXT NOT NULL DEFAULT '[]'",
+                    "ranking_tier": "INTEGER NOT NULL DEFAULT 1",
                 },
             }
             for table, additions in migrations.items():
@@ -228,6 +233,18 @@ class FinderService:
                         db.execute(
                             f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
                         )
+            db.execute(
+                """CREATE INDEX IF NOT EXISTS idx_finder_results_rank
+                   ON finder_results(
+                       scan_id, ranking_tier DESC, score DESC, discovered_order
+                   )"""
+            )
+            db.execute(
+                """CREATE INDEX IF NOT EXISTS idx_finder_results_review_rank
+                   ON finder_results(
+                       scan_id, review, ranking_tier DESC, score DESC
+                   )"""
+            )
             db.execute(
                 """UPDATE finder_scans
                    SET status = 'canceled', finished_at = ?, updated_at = ?
@@ -248,6 +265,24 @@ class FinderService:
                    WHERE pause_requested = 0 AND cancel_requested = 0
                      AND status IN ('preparing','scanning','pausing','canceling')""",
                 (utc_now(),),
+            )
+            now = utc_now()
+            db.execute(
+                """UPDATE finder_scans
+                   SET status = 'failed', finished_at = COALESCE(finished_at, ?),
+                       updated_at = ?, error = ?
+                   WHERE ranking_version != ?
+                     AND status IN (
+                         'queued','preparing','scanning','pausing','paused',
+                         'canceling'
+                     )""",
+                (
+                    now,
+                    now,
+                    "This Finder scan uses legacy appearance ranking and cannot "
+                    "continue after the pose-first ranking upgrade. Start a new scan.",
+                    CURRENT_RANKING_VERSION,
+                ),
             )
 
     async def start(self) -> None:
@@ -345,16 +380,18 @@ class FinderService:
         else:
             try:
                 details = self.model_path.stat()
-                identity = (
-                    f"{self.model_path}:{details.st_size}:{details.st_mtime_ns}"
-                )
+                identity = f"{self.model_path}:{details.st_size}:{details.st_mtime_ns}"
             except OSError:
-                identity = f"{type(self.encoder).__module__}.{type(self.encoder).__name__}"
+                identity = (
+                    f"{type(self.encoder).__module__}.{type(self.encoder).__name__}"
+                )
         if self.pose_estimator is None:
             pose_identity = "disabled"
         else:
             pose_key = getattr(self.pose_estimator, "model_key", "rtmo")
-            pose_identity = str(pose_key) if self._pose_ready else f"{pose_key}:unavailable"
+            pose_identity = (
+                str(pose_key) if self._pose_ready else f"{pose_key}:unavailable"
+            )
         return f"{identity}:{ANALYZER_VERSION}:pose={pose_identity}"
 
     def status(self) -> dict[str, Any]:
@@ -365,7 +402,9 @@ class FinderService:
         counts = {row["status"]: int(row["count"]) for row in rows}
         encoder_provider = getattr(self.encoder, "provider_status", None)
         pose_provider = getattr(self.pose_estimator, "provider_status", None)
-        encoder_provider_status = encoder_provider() if callable(encoder_provider) else {}
+        encoder_provider_status = (
+            encoder_provider() if callable(encoder_provider) else {}
+        )
         pose_provider_status = pose_provider() if callable(pose_provider) else {}
         active_devices = [
             str(value)
@@ -390,8 +429,11 @@ class FinderService:
                 "pose": pose_provider_status,
             },
             "device": ", ".join(dict.fromkeys(active_devices)),
-            "backend": "spatial DINOv2 + RTMO-L" if self.pose_estimator else "spatial DINOv2",
+            "backend": "spatial DINOv2 + RTMO-L"
+            if self.pose_estimator
+            else "spatial DINOv2",
             "analyzer_version": ANALYZER_VERSION,
+            "ranking_version": CURRENT_RANKING_VERSION,
             "folder_root": str(self.examples_root),
             # Kept for clients written against the 2.2 API.
             "examples_root": str(self.examples_root),
@@ -619,6 +661,23 @@ class FinderService:
         scan["pause_requested"] = bool(scan["pause_requested"])
         scan["reference_ready"] = bool(scan["reference_ready"])
         scan["has_next_page"] = bool(scan.get("next_url"))
+        scan["ranking_current"] = scan.get("ranking_version") == CURRENT_RANKING_VERSION
+        scan["extendable"] = bool(
+            scan["ranking_current"]
+            and scan["has_next_page"]
+            and int(scan["page_limit"]) < MAX_SCAN_PAGES
+            and not scan["cancel_requested"]
+            and scan["status"]
+            in {
+                "queued",
+                "preparing",
+                "scanning",
+                "pausing",
+                "paused",
+                "completed",
+                "completed_with_errors",
+            }
+        )
         if scan["status"] in {"completed", "completed_with_errors"}:
             scan["progress"] = 100.0
         else:
@@ -670,7 +729,9 @@ class FinderService:
                 for row in db.execute(
                     """SELECT id FROM finder_scans
                        WHERE status = 'queued' AND cancel_requested = 0
-                         AND pause_requested = 0 ORDER BY created_at"""
+                         AND pause_requested = 0 AND ranking_version = ?
+                       ORDER BY created_at""",
+                    (CURRENT_RANKING_VERSION,),
                 ).fetchall()
             ]
 
@@ -699,8 +760,9 @@ class FinderService:
                 """INSERT INTO finder_scans(
                        id, example_directory, pose_tag_id, pose_tag_label,
                        pose_tag_slug, pose_default_role, source_url, next_url,
-                       page_limit, minimum_score, status, created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
+                       page_limit, minimum_score, ranking_version, status,
+                       created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
                 (
                     scan_id,
                     normalized_directory,
@@ -712,6 +774,7 @@ class FinderService:
                     source_url,
                     page_limit,
                     minimum_score,
+                    CURRENT_RANKING_VERSION,
                     now,
                     now,
                 ),
@@ -727,6 +790,7 @@ class FinderService:
             "reference_model_key",
             "reference_ready",
             "reference_count",
+            "ranking_version",
             "next_url",
             "pages_completed",
             "status",
@@ -777,6 +841,10 @@ class FinderService:
             raise FinderNotFound("Finder scan not found")
         if scan["status"] != "paused":
             raise FinderConflict("Only a paused Finder scan can be resumed")
+        if scan.get("ranking_version") != CURRENT_RANKING_VERSION:
+            raise FinderConflict(
+                "A legacy-ranked Finder scan cannot be resumed; start a new scan"
+            )
         if not self._available:
             raise FinderUnavailable(
                 self._prepare_error or "Finder vision support is unavailable"
@@ -819,12 +887,16 @@ class FinderService:
         with self._lock, self.database.connect() as db:
             row = db.execute(
                 """SELECT status, page_limit, pages_completed, next_url,
-                          cancel_requested, pause_requested
+                          cancel_requested, pause_requested, ranking_version
                    FROM finder_scans WHERE id = ?""",
                 (scan_id,),
             ).fetchone()
             if not row:
                 raise FinderNotFound("Finder scan not found")
+            if row["ranking_version"] != CURRENT_RANKING_VERSION:
+                raise FinderConflict(
+                    "A legacy-ranked Finder scan cannot be extended; start a new scan"
+                )
 
             status = str(row["status"])
             if bool(row["cancel_requested"]) or status in {"canceling", "canceled"}:
@@ -905,9 +977,12 @@ class FinderService:
         self._publish(scan, force=True)
         return scan
 
-    @staticmethod
+    @classmethod
     def _normalized_top_matches(
+        cls,
         matches: list[dict[str, Any]] | None,
+        *,
+        ranking_version: str = LEGACY_RANKING_VERSION,
     ) -> list[dict[str, Any]]:
         normalized: list[dict[str, Any]] = []
         for item in matches or []:
@@ -953,6 +1028,10 @@ class FinderService:
                 common_joints = max(0, int(item.get("pose_common_joints", 0)))
             except (TypeError, ValueError):
                 common_joints = 0
+            try:
+                ranking_tier = max(0, min(3, int(item.get("ranking_tier", 1))))
+            except (TypeError, ValueError):
+                ranking_tier = 1
             overlay = str(item.get("skeleton_overlay_url") or "")
             pose_reliable = bool(item.get("pose_reliable"))
             if (
@@ -961,54 +1040,77 @@ class FinderService:
                 or len(overlay) > 200_000
             ):
                 overlay = ""
-            normalized.append(
-                {
-                    "rank": 0,
-                    "image_url": image_url,
-                    "preview_remote_url": preview,
-                    "ordinal": ordinal,
-                    "score": max(0.0, min(1.0, score)),
-                    "appearance_score": max(0.0, min(1.0, appearance)),
-                    "exact_score": max(0.0, min(1.0, exact)),
-                    "pose_score": None if pose is None else max(0.0, min(1.0, pose)),
-                    "person_count": (
-                        None if person_count is None else max(0, person_count)
-                    ),
-                    "pose_reliable": pose_reliable,
-                    "pose_coverage": optional_scores.get("pose_coverage"),
-                    "pose_body_confidence": optional_scores.get(
-                        "pose_body_confidence"
-                    ),
-                    "pose_common_joints": common_joints,
-                    "pose_mirrored": bool(item.get("pose_mirrored")),
-                    "skeleton_overlay_url": overlay,
-                    "is_exact": exact > 0,
-                    "match_type": (
-                        "exact"
-                        if exact > 0
-                        else "pose"
-                        if pose_reliable
+            normalized_item = {
+                "rank": 0,
+                "image_url": image_url,
+                "preview_remote_url": preview,
+                "ordinal": ordinal,
+                "score": max(0.0, min(1.0, score)),
+                "ranking_tier": ranking_tier,
+                "appearance_score": max(0.0, min(1.0, appearance)),
+                "exact_score": max(0.0, min(1.0, exact)),
+                "pose_score": None if pose is None else max(0.0, min(1.0, pose)),
+                "person_count": (
+                    None if person_count is None else max(0, person_count)
+                ),
+                "pose_reliable": pose_reliable,
+                "pose_coverage": optional_scores.get("pose_coverage"),
+                "pose_body_confidence": optional_scores.get("pose_body_confidence"),
+                "pose_common_joints": common_joints,
+                "pose_mirrored": bool(item.get("pose_mirrored")),
+                "skeleton_overlay_url": overlay,
+                "is_exact": exact > 0,
+                "match_type": (
+                    "exact"
+                    if ranking_tier == 3 or exact > 0
+                    else "pose"
+                    if ranking_tier == 2
+                    or (
+                        ranking_version == LEGACY_RANKING_VERSION
+                        and pose_reliable
                         and pose is not None
                         and pose > 0.5
-                        else "appearance"
-                    ),
-                }
+                    )
+                    else "pose_mismatch"
+                    if ranking_tier == 0 and pose_reliable
+                    else "appearance"
+                ),
+            }
+            normalized_item["pose_evidence"] = cls._pose_evidence(normalized_item)
+            normalized.append(normalized_item)
+        if ranking_version == CURRENT_RANKING_VERSION:
+            normalized.sort(
+                key=lambda item: (
+                    -item["ranking_tier"],
+                    -item["score"],
+                    -item["pose_evidence"],
+                    -(item["pose_coverage"] or 0.0),
+                    -item["appearance_score"],
+                    item["ordinal"],
+                    item["image_url"],
+                )
             )
-        normalized.sort(
-            key=lambda item: (
-                -item["score"],
-                -item["appearance_score"],
-                item["ordinal"],
-                item["image_url"],
+        else:
+            normalized.sort(
+                key=lambda item: (
+                    -item["score"],
+                    -item["appearance_score"],
+                    item["ordinal"],
+                    item["image_url"],
+                )
             )
-        )
         top = normalized[:3]
         for rank, item in enumerate(top, start=1):
             item["rank"] = rank
         return top
 
     @classmethod
-    def _decode_result(cls, row: Any) -> dict[str, Any]:
+    def _decode_result(
+        cls,
+        row: Any,
+        *,
+        ranking_version: str = LEGACY_RANKING_VERSION,
+    ) -> dict[str, Any]:
         item = dict(row)
         raw_matches = item.pop("matches_json", "[]")
         try:
@@ -1016,10 +1118,13 @@ class FinderService:
         except (TypeError, ValueError, json.JSONDecodeError):
             decoded = []
         matches = cls._normalized_top_matches(
-            decoded if isinstance(decoded, list) else []
+            decoded if isinstance(decoded, list) else [],
+            ranking_version=ranking_version,
         )
-        if not matches and item.get("best_image_url") and item.get(
-            "best_preview_remote_url"
+        if (
+            not matches
+            and item.get("best_image_url")
+            and item.get("best_preview_remote_url")
         ):
             matches = cls._normalized_top_matches(
                 [
@@ -1028,12 +1133,14 @@ class FinderService:
                         "preview_remote_url": item["best_preview_remote_url"],
                         "ordinal": item.get("best_ordinal") or 0,
                         "score": item.get("score") or 0,
+                        "ranking_tier": item.get("ranking_tier", 1),
                         "appearance_score": item.get("score") or 0,
                         "exact_score": 0,
                         "pose_score": None,
                         "person_count": None,
                     }
-                ]
+                ],
+                ranking_version=ranking_version,
             )
         item["top_matches"] = matches
         return item
@@ -1057,6 +1164,11 @@ class FinderService:
             clauses.append("review = ?")
             params.append(review)
         where = " AND ".join(clauses)
+        order_by = (
+            "ranking_tier DESC, score DESC, discovered_order, id"
+            if scan.get("ranking_version") == CURRENT_RANKING_VERSION
+            else "score DESC, discovered_order, id"
+        )
         with self._lock, self.database.connect() as db:
             total = int(
                 db.execute(
@@ -1065,10 +1177,18 @@ class FinderService:
             )
             rows = db.execute(
                 f"""SELECT * FROM finder_results WHERE {where}
-                    ORDER BY score DESC, discovered_order, id LIMIT ? OFFSET ?""",
+                    ORDER BY {order_by} LIMIT ? OFFSET ?""",
                 [*params, limit, offset],
             ).fetchall()
-        items = [self._decode_result(row) for row in rows]
+        items = [
+            self._decode_result(
+                row,
+                ranking_version=str(
+                    scan.get("ranking_version") or LEGACY_RANKING_VERSION
+                ),
+            )
+            for row in rows
+        ]
         for item in items:
             item["above_threshold"] = item["score"] >= scan["minimum_score"]
         return items, total
@@ -1089,8 +1209,11 @@ class FinderService:
             row = db.execute(
                 "SELECT * FROM finder_results WHERE id = ?", (result_id,)
             ).fetchone()
-        item = self._decode_result(row)
         scan = self.get_scan(scan_id) or {}
+        item = self._decode_result(
+            row,
+            ranking_version=str(scan.get("ranking_version") or LEGACY_RANKING_VERSION),
+        )
         item["above_threshold"] = item["score"] >= scan.get("minimum_score", 0)
         return item
 
@@ -1113,6 +1236,9 @@ class FinderService:
             "processed_images",
             "failed_galleries",
             "candidate_count",
+            "ranking_version",
+            "ranking_current",
+            "extendable",
             "progress",
             "error",
             "updated_at",
@@ -1139,9 +1265,7 @@ class FinderService:
             wait = self._next_request_at - now
             if wait > 0:
                 await asyncio.sleep(wait)
-            self._next_request_at = (
-                time.monotonic() + self.config.finder_request_delay
-            )
+            self._next_request_at = time.monotonic() + self.config.finder_request_delay
 
     @staticmethod
     def _normalized_embeddings(value: Any) -> np.ndarray:
@@ -1485,10 +1609,9 @@ class FinderService:
         )
 
     async def _prepare_references(self, scan: dict[str, Any]) -> np.ndarray:
-        references_current = (
-            scan.get("reference_model_key") == self._model_key
-            and self._references_are_current(scan["id"])
-        )
+        references_current = scan.get(
+            "reference_model_key"
+        ) == self._model_key and self._references_are_current(scan["id"])
         if scan["reference_ready"] and references_current:
             return self._load_scan_references(scan["id"])
         if scan["reference_ready"]:
@@ -1541,7 +1664,10 @@ class FinderService:
             fingerprint.update(b"\0")
             manifest.append((path, relative, digest))
         fingerprint_value = fingerprint.hexdigest()
-        if scan["reference_fingerprint"] and scan["reference_fingerprint"] != fingerprint_value:
+        if (
+            scan["reference_fingerprint"]
+            and scan["reference_fingerprint"] != fingerprint_value
+        ):
             raise FinderConflict(
                 "Example images changed before the Finder reference was ready"
             )
@@ -1584,9 +1710,7 @@ class FinderService:
                             mirror_index,
                             vector.astype("<f4", copy=False).tobytes(),
                             int(vector.shape[0]),
-                            json.dumps(
-                                metadata, separators=(",", ":"), sort_keys=True
-                            ),
+                            json.dumps(metadata, separators=(",", ":"), sort_keys=True),
                         ),
                     )
         references = self._load_scan_references(scan["id"])
@@ -1775,6 +1899,17 @@ class FinderService:
         return max(0.0, 1.0 - distance / 64.0)
 
     @staticmethod
+    def _pose_evidence(pose: dict[str, Any]) -> float:
+        try:
+            coverage = float(pose.get("pose_coverage") or 0)
+            body_confidence = float(pose.get("pose_body_confidence") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        if not np.isfinite(coverage) or not np.isfinite(body_confidence):
+            return 0.0
+        return max(0.0, min(1.0, coverage)) * max(0.0, min(1.0, body_confidence / 0.45))
+
+    @staticmethod
     def _combined_score(
         appearance_score: float,
         exact_score: float,
@@ -1783,13 +1918,9 @@ class FinderService:
         if exact_score > 0:
             return max(appearance_score, exact_score)
         pose_score = pose.get("pose_score")
-        if not pose.get("pose_reliable") or not isinstance(
-            pose_score, (int, float)
-        ):
+        if not pose.get("pose_reliable") or not isinstance(pose_score, (int, float)):
             return appearance_score
-        coverage = float(pose.get("pose_coverage") or 0)
-        body_confidence = float(pose.get("pose_body_confidence") or 0)
-        evidence = min(1.0, coverage) * min(1.0, body_confidence / 0.45)
+        evidence = FinderService._pose_evidence(pose)
         # Reliable geometry is a bounded positive tie-breaker. It cannot erase
         # a strong crop/appearance match, which is important for extreme poses
         # where even RTMO can see only part of a body.
@@ -1801,14 +1932,41 @@ class FinderService:
         )
         return max(0.0, min(1.0, appearance_score + bonus))
 
+    @classmethod
+    def _ranked_score(
+        cls,
+        appearance_score: float,
+        exact_score: float,
+        pose: dict[str, Any],
+        *,
+        ranking_version: str,
+    ) -> tuple[int, float]:
+        appearance = max(0.0, min(1.0, float(appearance_score)))
+        exact = max(0.0, min(1.0, float(exact_score)))
+        if ranking_version != CURRENT_RANKING_VERSION:
+            return 1, cls._combined_score(appearance, exact, pose)
+        if exact > 0:
+            return 3, exact
+        pose_score = pose.get("pose_score")
+        try:
+            normalized_pose = float(pose_score)
+        except (TypeError, ValueError):
+            normalized_pose = float("nan")
+        if pose.get("pose_reliable") and np.isfinite(normalized_pose):
+            normalized_pose = max(0.0, min(1.0, normalized_pose))
+            tier = 2 if normalized_pose >= POSE_MATCH_FLOOR else 0
+            return tier, normalized_pose
+        return 1, appearance
+
     def _claim_scan(self, scan_id: str) -> bool:
         with self._lock, self.database.connect() as db:
             result = db.execute(
                 """UPDATE finder_scans
                    SET status = 'preparing', updated_at = ?, error = ''
                    WHERE id = ? AND status = 'queued'
+                     AND ranking_version = ?
                      AND cancel_requested = 0 AND pause_requested = 0""",
-                (utc_now(), scan_id),
+                (utc_now(), scan_id, CURRENT_RANKING_VERSION),
             )
         return bool(result.rowcount)
 
@@ -1883,6 +2041,7 @@ class FinderService:
         images_scored: int,
         best: dict | None,
         status: str,
+        ranking_version: str = LEGACY_RANKING_VERSION,
         error: str = "",
         top_matches: list[dict[str, Any]] | None = None,
     ) -> None:
@@ -1901,7 +2060,10 @@ class FinderService:
                     "person_count": None,
                 }
             ]
-        matches = self._normalized_top_matches(top_matches)
+        matches = self._normalized_top_matches(
+            top_matches, ranking_version=ranking_version
+        )
+        ranking_tier = 1 if ranking_version == LEGACY_RANKING_VERSION else 0
         if matches:
             leading = matches[0]
             best = {
@@ -1910,6 +2072,7 @@ class FinderService:
                 "ordinal": leading["ordinal"],
             }
             score = leading["score"]
+            ranking_tier = leading["ranking_tier"]
         matches_json = json.dumps(matches, separators=(",", ":"), sort_keys=True)
         with self._lock, self.database.connect() as db:
             db.execute(
@@ -1917,9 +2080,10 @@ class FinderService:
                        id, scan_id, gallery_key, gallery_url, title,
                        thumbnail_remote_url, best_image_url,
                        best_preview_remote_url, best_ordinal, score,
-                       matches_json, images_scored, status, error, discovered_order,
+                       ranking_tier, matches_json, images_scored, status, error,
+                       discovered_order,
                        created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(scan_id, gallery_key) DO UPDATE SET
                        gallery_url = excluded.gallery_url,
                        title = excluded.title,
@@ -1928,6 +2092,7 @@ class FinderService:
                        best_preview_remote_url = excluded.best_preview_remote_url,
                        best_ordinal = excluded.best_ordinal,
                        score = excluded.score,
+                       ranking_tier = excluded.ranking_tier,
                        matches_json = excluded.matches_json,
                        images_scored = excluded.images_scored,
                        status = excluded.status,
@@ -1945,6 +2110,7 @@ class FinderService:
                     str(best.get("preview_remote_url") if best else ""),
                     int(best.get("ordinal")) if best else None,
                     float(score),
+                    ranking_tier,
                     matches_json,
                     images_scored,
                     status,
@@ -2057,6 +2223,7 @@ class FinderService:
         reference_hashes: tuple[int, ...],
         reference_poses: tuple[Any, ...],
     ) -> None:
+        ranking_version = str(scan.get("ranking_version") or LEGACY_RANKING_VERSION)
         gallery_url = validate_source_url(card["url"])
         if self._result_complete(scan["id"], gallery_url):
             return
@@ -2088,9 +2255,7 @@ class FinderService:
                 vector = candidate.appearance[0]
                 raw_score = float(np.max(references @ vector))
                 spatial = candidate.metadata.get("descriptor_kind") == "spatial"
-                appearance_score = self._appearance_score(
-                    raw_score, spatial=spatial
-                )
+                appearance_score = self._appearance_score(raw_score, spatial=spatial)
                 exact_score = (
                     self._exact_score(
                         self._metadata_phash(candidate.metadata), reference_hashes
@@ -2099,13 +2264,18 @@ class FinderService:
                     else 0.0
                 )
                 pose = self._pose_diagnostics(candidate.metadata, reference_poses)
+                ranking_tier, score = self._ranked_score(
+                    appearance_score,
+                    exact_score,
+                    pose,
+                    ranking_version=ranking_version,
+                )
                 return {
                     "image_url": original,
                     "preview_remote_url": preview,
                     "ordinal": int(image["ordinal"]),
-                    "score": self._combined_score(
-                        appearance_score, exact_score, pose
-                    ),
+                    "score": score,
+                    "ranking_tier": ranking_tier,
                     "appearance_score": appearance_score,
                     "exact_score": exact_score,
                     **pose,
@@ -2116,7 +2286,10 @@ class FinderService:
             for start in range(0, len(images), batch_size):
                 self._check_control(scan["id"])
                 outcomes = await asyncio.gather(
-                    *(score_image(image) for image in images[start : start + batch_size]),
+                    *(
+                        score_image(image)
+                        for image in images[start : start + batch_size]
+                    ),
                     return_exceptions=True,
                 )
                 for outcome in outcomes:
@@ -2126,7 +2299,9 @@ class FinderService:
                         scored.append(outcome)
             if not scored:
                 raise ValueError("No gallery preview image could be scored")
-            top_matches = self._normalized_top_matches(scored)
+            top_matches = self._normalized_top_matches(
+                scored, ranking_version=ranking_version
+            )
             self._save_result(
                 scan["id"],
                 {**card, "url": detail.get("url") or gallery_url},
@@ -2135,6 +2310,7 @@ class FinderService:
                 images_scored=len(scored),
                 best=None,
                 status="completed",
+                ranking_version=ranking_version,
                 top_matches=top_matches,
             )
         except (_FinderPaused, _FinderCanceled):
@@ -2148,10 +2324,15 @@ class FinderService:
                 images_scored=0,
                 best=None,
                 status="failed",
+                ranking_version=ranking_version,
                 error=str(exc),
             )
 
     async def _run_scan(self, scan: dict[str, Any]) -> None:
+        if scan.get("ranking_version") != CURRENT_RANKING_VERSION:
+            raise FinderConflict(
+                "A legacy-ranked Finder scan cannot continue; start a new scan"
+            )
         references = await self._prepare_references(scan)
         reference_hashes = self._load_reference_hashes(scan["id"])
         reference_poses = self._load_reference_poses(scan["id"])

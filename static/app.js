@@ -87,6 +87,7 @@
   const POSE_ROLES = ['solo', 'couple', 'group'];
   const FINDER_TERMINAL_STATES = ['completed', 'completed_with_errors', 'complete', 'done', 'failed', 'cancelled', 'canceled'];
   const FINDER_MAX_PAGES = 500;
+  const FINDER_RANKING_VERSION = 'pose-first-v1';
   const poseRoleLabel = role => ({ solo: 'Solo', couple: 'Couple', group: 'Group' }[role] || 'Solo');
 
   class ApiError extends Error {
@@ -1867,6 +1868,10 @@
     const reportedContinuation = scan.has_next_page ?? scan.has_more ?? scan.continuation_available ?? scan.can_extend;
     const hasNextPage = !Boolean(scan.source_exhausted ?? scan.exhausted)
       && (reportedContinuation === undefined ? Boolean(nextUrl) : Boolean(reportedContinuation));
+    const rankingVersion = String(scan.ranking_version || config.ranking_version || 'appearance-first-v1');
+    const rankingCurrent = scan.ranking_current === undefined
+      ? rankingVersion === FINDER_RANKING_VERSION
+      : Boolean(scan.ranking_current);
     if (!Number.isFinite(percentage)) percentage = pagesTotal ? (pagesScanned / pagesTotal) * 100 : 0;
     if (percentage > 0 && percentage <= 1) percentage *= 100;
     const poseTag = scan.pose_tag && typeof scan.pose_tag === 'object' ? scan.pose_tag : {};
@@ -1882,6 +1887,8 @@
       sourceUrl: String(scan.source_url || config.source_url || scan.url || ''),
       nextUrl,
       hasNextPage,
+      rankingVersion,
+      rankingCurrent,
       pages: Number(scan.page_limit ?? config.page_limit ?? pagesTotal),
       pagesScanned,
       galleriesScanned: Number(scan.processed_galleries ?? scan.galleries_scanned ?? progress.processed_galleries ?? progress.galleries_scanned ?? progress.galleries ?? 0),
@@ -1925,6 +1932,15 @@
     return null;
   }
 
+  function normalizeFinderTier(value, fallback = 1) {
+    const tier = Number.parseInt(value, 10);
+    return Number.isFinite(tier) ? Math.max(0, Math.min(3, tier)) : fallback;
+  }
+
+  function finderTierType(tier) {
+    return ['pose_mismatch', 'visual_fallback', 'pose', 'exact'][normalizeFinderTier(tier)] || 'visual_fallback';
+  }
+
   function normalizeFinderMatch(rawMatch, index, fallback = {}) {
     const match = typeof rawMatch === 'string' ? { image_url: rawMatch } : (rawMatch || {});
     const breakdown = match.score_breakdown && typeof match.score_breakdown === 'object'
@@ -1943,6 +1959,10 @@
       personCount: Math.max(0, Number(match.person_count ?? match.people_count ?? match.persons_detected ?? (index === 0 ? fallback.personCount : 0) ?? 0) || 0),
       overlayUrl: String(match.skeleton_overlay_url || match.pose_overlay_url || match.overlay_url || (index === 0 ? fallback.overlayUrl : '') || ''),
       poseReliable: Boolean(match.pose_reliable ?? match.poseReliable ?? (index === 0 ? fallback.poseReliable : false)),
+      rankingTier: normalizeFinderTier(
+        match.ranking_tier ?? match.rank_tier,
+        index === 0 ? normalizeFinderTier(fallback.rankingTier, isExact ? 3 : 1) : 1
+      ),
       matchType: String(match.match_type || match.method || (index === 0 ? fallback.matchType : '') || '').toLowerCase(),
       isExact
     };
@@ -1968,13 +1988,17 @@
       personCount: Math.max(0, Number(item?.person_count ?? item?.people_count ?? item?.persons_detected ?? best.person_count ?? best.people_count ?? 0) || 0),
       overlayUrl: item?.skeleton_overlay_url || item?.pose_overlay_url || item?.overlay_url || best.skeleton_overlay_url || best.pose_overlay_url || best.overlay_url || '',
       poseReliable: Boolean(item?.pose_reliable ?? item?.poseReliable ?? best.pose_reliable ?? best.poseReliable),
+      rankingTier: normalizeFinderTier(item?.ranking_tier ?? item?.rank_tier ?? best.ranking_tier ?? best.rank_tier, isExact ? 3 : 1),
       matchType: String(item?.match_type || item?.method || best.match_type || best.method || '').toLowerCase(),
       isExact
     };
     const matchCollections = [item?.matches, item?.top_matches, item?.best_matches, item?.candidate_matches, item?.candidates, item?.candidate_images];
     const rawMatches = matchCollections.find(value => Array.isArray(value) && value.length) || [];
     let matches = (rawMatches.length ? rawMatches : [best]).map((match, matchIndex) => normalizeFinderMatch(match, matchIndex, fallback));
-    matches = matches.filter(match => match.imageUrl || match.previewUrl || match.overlayUrl).sort((a, b) => a.rank - b.rank || (b.score ?? -1) - (a.score ?? -1)).slice(0, 3);
+    matches = matches
+      .filter(match => match.imageUrl || match.previewUrl || match.overlayUrl)
+      .sort((a, b) => b.rankingTier - a.rankingTier || (b.score ?? -1) - (a.score ?? -1) || a.rank - b.rank)
+      .slice(0, 3);
     if (!matches.length && (fallback.imageUrl || fallback.previewUrl || fallback.overlayUrl)) matches = [normalizeFinderMatch({}, 0, fallback)];
     const primaryMatch = matches[0] || normalizeFinderMatch({}, 0, fallback);
     const gallery = normalizeGallery({
@@ -1987,7 +2011,8 @@
       image_count: item?.image_count ?? source.image_count ?? source.total_images ?? 0
     });
     const score = firstFinderScore(item?.score, item?.similarity, item?.combined_score, primaryMatch.score, fallback.score) ?? 0;
-    const matchType = String(item?.match_type || item?.method || best.match_type || best.method || primaryMatch.matchType || (isExact ? 'exact' : '')).toLowerCase();
+    const rankingTier = normalizeFinderTier(item?.ranking_tier ?? item?.rank_tier, primaryMatch.rankingTier);
+    const matchType = String(item?.match_type || item?.method || best.match_type || best.method || primaryMatch.matchType || finderTierType(rankingTier)).toLowerCase();
     return {
       ...gallery,
       key: item?.result_id ?? item?.id ?? galleryId,
@@ -1999,6 +2024,7 @@
       bestPreviewUrl: primaryMatch.previewUrl || gallery.thumbnailUrl,
       bestOrdinal: primaryMatch.ordinal,
       matches,
+      rankingTier,
       matchType,
       isExact: isExact || primaryMatch.isExact || ['exact', 'duplicate', 'near_duplicate'].includes(matchType),
       exactScore: firstFinderScore(fallback.exactScore, primaryMatch.exactScore),
@@ -2020,12 +2046,12 @@
   }
 
   function finderScanCanExtend(scan = state.finderScan) {
-    if (!scan?.id || !scan.hasNextPage || Number(scan.pages || 0) >= FINDER_MAX_PAGES) return false;
+    if (!scan?.id || !scan.rankingCurrent || !scan.hasNextPage || Number(scan.pages || 0) >= FINDER_MAX_PAGES) return false;
     return ['completed', 'completed_with_errors', 'complete', 'done', 'paused', 'running', 'scanning', 'active'].includes(scan.status);
   }
 
   function finderScanAtPageCap(scan = state.finderScan) {
-    if (!scan?.id || !scan.hasNextPage || Number(scan.pages || 0) < FINDER_MAX_PAGES) return false;
+    if (!scan?.id || !scan.rankingCurrent || !scan.hasNextPage || Number(scan.pages || 0) < FINDER_MAX_PAGES) return false;
     return ['completed', 'completed_with_errors', 'complete', 'done', 'paused', 'running', 'scanning', 'active'].includes(scan.status);
   }
 
@@ -2123,6 +2149,23 @@
     return `${Math.round((normalizeFinderScore(score, 0) || 0) * 100)}%`;
   }
 
+  function finderEvidenceLabel(item, { short = false } = {}) {
+    const tier = normalizeFinderTier(item?.rankingTier);
+    const score = finderScoreLabel(item?.score);
+    if (tier === 3) return `${short ? 'Exact' : 'Exact image'} ${score}`;
+    if (tier === 2) return `Pose ${score}`;
+    if (tier === 1) return `${short ? 'Visual' : 'Visual fallback'} ${score}`;
+    return `${short ? 'Pose' : 'Pose mismatch'} ${score}`;
+  }
+
+  function finderEvidenceKind(item) {
+    const tier = normalizeFinderTier(item?.rankingTier);
+    if (tier === 3) return 'Exact image';
+    if (tier === 2) return 'Pose match';
+    if (tier === 1) return 'Visual fallback';
+    return 'Pose mismatch';
+  }
+
   function appendFinderMatchMedia(container, result) {
     const matches = result.matches?.length ? result.matches : [{
       rank: 1,
@@ -2148,7 +2191,12 @@
       const matchScore = firstFinderScore(match.score, matchIndex === 0 ? result.score : null);
       const scoreBadge = $('.finder-match-score', button);
       scoreBadge.hidden = matchScore === null;
-      if (matchScore !== null) scoreBadge.textContent = finderScoreLabel(matchScore);
+      if (matchScore !== null) {
+        scoreBadge.textContent = finderEvidenceLabel(
+          { ...match, score: matchScore },
+          { short: true }
+        );
+      }
       $('.finder-match-ordinal', button).textContent = match.ordinal ? `Image ${String(match.ordinal).padStart(2, '0')}` : 'Candidate';
       const peopleBadge = $('.finder-match-people', button);
       peopleBadge.hidden = !match.personCount;
@@ -2172,12 +2220,14 @@
     const scores = [
       ['exact', 'Exact', result.exactScore],
       ['pose', 'Pose', result.poseScore],
-      ['appearance', 'Appearance', result.appearanceScore]
+      ['appearance', 'Visual layout', result.appearanceScore]
     ];
     scores.forEach(([kind, label, score]) => {
       if (score === null || score === undefined) return;
       const badge = document.createElement('span');
-      const displayLabel = kind === 'pose' && !result.poseReliable ? 'Pose (low)' : label;
+      const displayLabel = kind === 'pose' && result.rankingTier === 0
+        ? 'Pose mismatch'
+        : kind === 'pose' && !result.poseReliable ? 'Pose uncertain' : label;
       badge.className = `finder-score-chip is-${kind}`;
       badge.title = `${displayLabel} score ${finderScoreLabel(score)}`;
       badge.innerHTML = '<i></i><span></span><b></b>';
@@ -2194,7 +2244,9 @@
   }
 
   function renderFinderResults() {
-    const ranked = [...state.finderResults].sort((a, b) => b.score - a.score || a.rank - b.rank);
+    const ranked = [...state.finderResults].sort(
+      (a, b) => b.rankingTier - a.rankingTier || b.score - a.score || (b.appearanceScore ?? -1) - (a.appearanceScore ?? -1) || a.rank - b.rank
+    );
     const counts = {
       pending: ranked.filter(result => result.review === 'pending').length,
       accepted: ranked.filter(result => result.review === 'accepted').length,
@@ -2217,6 +2269,7 @@
       const fragment = $('#finder-card-template').content.cloneNode(true);
       const card = $('.finder-card', fragment);
       card.dataset.finderResult = String(result.key);
+      card.dataset.finderRankingTier = String(result.rankingTier);
       card.classList.toggle('is-high', result.score >= 0.85);
       card.classList.toggle('is-likely', result.score >= 0.70 && result.score < 0.85);
       card.classList.toggle('is-explore', result.score < 0.70);
@@ -2224,17 +2277,16 @@
       card.classList.toggle('is-rejected', result.review === 'rejected');
       appendFinderMatchMedia($('.finder-match-gallery', card), result);
       $('.finder-rank', card).textContent = `#${String(ranked.indexOf(result) + 1).padStart(2, '0')}`;
-      $('.finder-similarity', card).textContent = `${finderScoreLabel(result.score)} match`;
+      $('.finder-similarity', card).textContent = finderEvidenceLabel(result);
       const matchKind = $('.finder-match-kind', card);
-      const kindCopy = result.isExact
-        ? 'Exact image'
-        : result.matchType === 'pose'
-          ? 'Pose-assisted'
-          : result.poseScore !== null && result.poseScore !== undefined && !result.poseReliable
-            ? 'Appearance · pose uncertain'
-            : result.appearanceScore !== null && result.appearanceScore !== undefined ? 'Appearance' : '';
+      const kindCopy = finderEvidenceKind(result);
       matchKind.hidden = !kindCopy;
       matchKind.textContent = kindCopy;
+      matchKind.title = result.rankingTier === 1
+        ? 'RTMO could not confirm enough joints, so this candidate is ranked by visual layout below reliable pose matches.'
+        : result.rankingTier === 0
+          ? 'RTMO found reliable joints, but their geometry did not reach the pose-match floor.'
+          : '';
       $('.finder-card-title', card).textContent = result.title;
       const matchCopy = `${formatNumber(result.matchCount)} ${result.matchCount === 1 ? 'image' : 'images'} compared`;
       $('.finder-card-copy p', card).textContent = `${matchCopy}${result.imageCount ? ` · ${formatNumber(result.imageCount)} total` : ''}`;
@@ -2260,7 +2312,7 @@
         ? 'Lower the display threshold or choose another review tab.'
         : finderScanIsRunning()
           ? 'Results will appear here as galleries are compared.'
-          : 'Try more examples, a lower minimum similarity, or a wider source.';
+          : 'Try more examples, a lower minimum match score, or a wider source.';
     }
   }
 
@@ -2286,12 +2338,14 @@
     renderFinderScans();
     const scan = state.finderScan;
     const hasScan = Boolean(scan?.id);
+    const legacyRanking = hasScan && !scan.rankingCurrent;
     $('#finder-welcome').hidden = hasScan;
     $('#finder-results').hidden = !hasScan;
     $('#finder-progress-wrap').hidden = !hasScan;
     $('#finder-pause').hidden = !finderScanIsRunning(scan);
-    $('#finder-resume').hidden = scan?.status !== 'paused';
+    $('#finder-resume').hidden = scan?.status !== 'paused' || legacyRanking;
     $('#finder-cancel').hidden = !hasScan || finderScanIsTerminal(scan) || scan?.status === 'canceling';
+    $('#finder-ranking-note').hidden = !legacyRanking;
     ['finder-pause', 'finder-resume', 'finder-cancel'].forEach(id => { $(`#${id}`).disabled = state.finderBusy; });
     const canExtend = finderScanCanExtend(scan);
     const atPageCap = finderScanAtPageCap(scan);

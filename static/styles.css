@@ -543,11 +543,13 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .finder-extend-button { min-height: 35px; padding-inline: 11px; font-size: 9px; white-space: nowrap; }
 .finder-extend-button svg { width: 13px; height: 13px; }
 .finder-continuation.is-unavailable .finder-extend-copy span { color: var(--amber); }
-.finder-limit-note { display: flex; min-height: 46px; margin-top: 12px; padding: 8px 10px; gap: 9px; align-items: center; border: 1px solid var(--border); border-radius: 10px; background: rgba(255,255,255,.018); color: var(--muted); }
-.finder-limit-note > svg { width: 15px; height: 15px; flex: none; color: var(--amber); }
-.finder-limit-note > span { display: flex; min-width: 0; flex-direction: column; }
-.finder-limit-note strong { color: var(--text-soft); font-size: 9px; }
-.finder-limit-note span span { margin-top: 1px; font-size: 8px; }
+.finder-limit-note, .finder-ranking-note { display: flex; min-height: 46px; margin-top: 12px; padding: 8px 10px; gap: 9px; align-items: center; border: 1px solid var(--border); border-radius: 10px; background: rgba(255,255,255,.018); color: var(--muted); }
+.finder-limit-note > svg, .finder-ranking-note > svg { width: 15px; height: 15px; flex: none; color: var(--amber); }
+.finder-limit-note > span, .finder-ranking-note > span { display: flex; min-width: 0; flex-direction: column; }
+.finder-limit-note strong, .finder-ranking-note strong { color: var(--text-soft); font-size: 9px; }
+.finder-limit-note span span, .finder-ranking-note span span { margin-top: 1px; font-size: 8px; }
+.finder-ranking-note { border-color: rgba(155,123,250,.2); background: rgba(155,123,250,.065); }
+.finder-ranking-note > svg { color: #c8baff; }
 .finder-welcome { display: flex; min-height: 585px; padding: 48px 22px; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
 .finder-welcome h3 { margin: 0 0 6px; font-size: 18px; }
 .finder-welcome > p { max-width: 430px; margin: 0; color: var(--muted); font-size: 11px; }
@@ -570,6 +572,11 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .finder-card:has(.finder-match-kind:not([hidden])) .finder-rank { color: var(--muted); }
 .finder-card.is-high .finder-similarity { color: var(--green); }
 .finder-card.is-likely .finder-similarity { color: #c9bcff; }
+.finder-card[data-finder-ranking-tier="3"] .finder-similarity { color: var(--green); }
+.finder-card[data-finder-ranking-tier="2"] .finder-similarity { color: #c9bcff; }
+.finder-card[data-finder-ranking-tier="1"] .finder-similarity { color: var(--amber); }
+.finder-card[data-finder-ranking-tier="0"] .finder-similarity { color: #ff9298; }
+.finder-card[data-finder-ranking-tier="0"] .finder-match-kind { border-color: rgba(255,107,114,.22); background: var(--red-soft); color: #ff9298; }
 .finder-match-gallery { display: grid; gap: 1px; overflow: hidden; border-bottom: 1px solid var(--border); background: var(--border); }
 .finder-match-gallery.has-1 { aspect-ratio: 4 / 3; grid-template-columns: 1fr; }
 .finder-match-gallery.has-2 { aspect-ratio: 4 / 3; grid-template-columns: repeat(2, minmax(0, 1fr)); }

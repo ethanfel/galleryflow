@@ -259,6 +259,40 @@ def configured(tmp_path: Path) -> tuple[AppConfig, Database, int]:
     return config, database, int(tag["id"])
 
 
+def pose_first_match(
+    ordinal: int,
+    *,
+    appearance: float,
+    exact: float = 0,
+    pose: float | None = None,
+    reliable: bool = False,
+    coverage: float = 0.9,
+    body_confidence: float = 0.9,
+) -> dict[str, object]:
+    diagnostics = {
+        "pose_score": pose,
+        "pose_reliable": reliable,
+        "pose_coverage": coverage,
+        "pose_body_confidence": body_confidence,
+    }
+    tier, score = FinderService._ranked_score(
+        appearance,
+        exact,
+        diagnostics,
+        ranking_version=finder_module.CURRENT_RANKING_VERSION,
+    )
+    return {
+        "image_url": f"https://cdni.pornpics.com/full/rank-{ordinal}.jpg",
+        "preview_remote_url": f"https://cdni.pornpics.com/p/rank-{ordinal}.jpg",
+        "ordinal": ordinal,
+        "score": score,
+        "ranking_tier": tier,
+        "appearance_score": appearance,
+        "exact_score": exact,
+        **diagnostics,
+    }
+
+
 @pytest.mark.asyncio
 async def test_finder_max_score_ranking_review_and_persistent_cache(
     tmp_path: Path, monkeypatch
@@ -466,9 +500,7 @@ async def test_finder_caches_pose_diagnostics_and_skeleton_overlays(
         assert match["pose_score"] == pytest.approx(1.0)
         assert match["person_count"] == 1
         assert match["pose_common_joints"] == 17
-        assert match["skeleton_overlay_url"].startswith(
-            "data:image/svg+xml;base64,"
-        )
+        assert match["skeleton_overlay_url"].startswith("data:image/svg+xml;base64,")
         assert service.status()["pose_ready"] is True
         assert pose.prepare_calls == 1
 
@@ -502,9 +534,7 @@ def test_finder_labels_and_overlays_only_reliable_pose_assistance() -> None:
         model_key="fake-rtmo-pose-v1",
         provider="CPUExecutionProvider",
     )
-    diagnostics = FinderService._pose_diagnostics(
-        {"pose": sparse.as_dict()}, (sparse,)
-    )
+    diagnostics = FinderService._pose_diagnostics({"pose": sparse.as_dict()}, (sparse,))
     assert diagnostics["pose_reliable"] is False
     assert diagnostics["skeleton_overlay_url"] == ""
 
@@ -538,6 +568,140 @@ def test_finder_labels_and_overlays_only_reliable_pose_assistance() -> None:
     pose_assisted = normalized(0.95, True)
     assert pose_assisted["match_type"] == "pose"
     assert pose_assisted["skeleton_overlay_url"] == overlay
+
+
+def test_pose_first_ranking_orders_exact_pose_fallback_then_mismatch() -> None:
+    exact = pose_first_match(1, appearance=0.05, exact=0.875)
+    correct_pose = pose_first_match(2, appearance=0.10, pose=0.72, reliable=True)
+    visual_fallback = pose_first_match(3, appearance=0.98, pose=0.99, reliable=False)
+    wrong_pose = pose_first_match(4, appearance=1.0, pose=0.54, reliable=True)
+
+    matches = FinderService._normalized_top_matches(
+        [wrong_pose, visual_fallback, correct_pose, exact],
+        ranking_version=finder_module.CURRENT_RANKING_VERSION,
+    )
+
+    assert [match["ordinal"] for match in matches] == [1, 2, 3]
+    assert [match["ranking_tier"] for match in matches] == [3, 2, 1]
+    assert matches[1]["score"] == pytest.approx(0.72)
+    assert matches[1]["appearance_score"] == pytest.approx(0.10)
+    assert matches[2]["score"] == pytest.approx(0.98)
+    assert wrong_pose["ranking_tier"] == 0
+    assert wrong_pose["score"] == pytest.approx(0.54)
+
+
+def test_pose_first_uses_evidence_then_appearance_only_as_tiebreakers() -> None:
+    low_evidence = pose_first_match(
+        1,
+        appearance=0.99,
+        pose=0.8,
+        reliable=True,
+        coverage=0.5,
+        body_confidence=0.2,
+    )
+    high_evidence_low_appearance = pose_first_match(
+        2,
+        appearance=0.1,
+        pose=0.8,
+        reliable=True,
+        coverage=0.9,
+        body_confidence=0.9,
+    )
+    same_evidence_higher_appearance = pose_first_match(
+        3,
+        appearance=0.2,
+        pose=0.8,
+        reliable=True,
+        coverage=0.9,
+        body_confidence=0.9,
+    )
+
+    matches = FinderService._normalized_top_matches(
+        [
+            low_evidence,
+            high_evidence_low_appearance,
+            same_evidence_higher_appearance,
+        ],
+        ranking_version=finder_module.CURRENT_RANKING_VERSION,
+    )
+
+    assert [match["ordinal"] for match in matches] == [3, 2, 1]
+
+
+def test_pose_first_persists_gallery_tier_and_uses_leading_lane_threshold(
+    tmp_path: Path,
+) -> None:
+    config, database, tag_id = configured(tmp_path)
+    service = FinderService(
+        config,
+        database,
+        FakeScraper(),
+        EventBroker(),
+        encoder=FakeEncoder(),
+        media_fetcher=fake_media,
+    )
+    service.ensure_schema()
+    scan = service.create_scan(
+        example_directory="pose",
+        pose_tag_id=tag_id,
+        source_url=ROOT,
+        page_limit=1,
+        minimum_score=0.65,
+    )
+    assert scan["ranking_version"] == finder_module.CURRENT_RANKING_VERSION
+    assert scan["ranking_current"] is True
+
+    pose_hit = pose_first_match(1, appearance=0.1, pose=0.6, reliable=True)
+    same_gallery_fallback = pose_first_match(2, appearance=0.99)
+    service._save_result(
+        scan["id"],
+        {"url": GALLERY_A, "title": "Pose hit"},
+        order=1,
+        score=0,
+        images_scored=2,
+        best=None,
+        status="completed",
+        ranking_version=finder_module.CURRENT_RANKING_VERSION,
+        top_matches=[same_gallery_fallback, pose_hit],
+    )
+    service._save_result(
+        scan["id"],
+        {"url": GALLERY_B, "title": "Visual fallback"},
+        order=2,
+        score=0,
+        images_scored=1,
+        best=None,
+        status="completed",
+        ranking_version=finder_module.CURRENT_RANKING_VERSION,
+        top_matches=[pose_first_match(1, appearance=0.99)],
+    )
+    service._save_result(
+        scan["id"],
+        {"url": GALLERY_C, "title": "Exact"},
+        order=3,
+        score=0,
+        images_scored=1,
+        best=None,
+        status="completed",
+        ranking_version=finder_module.CURRENT_RANKING_VERSION,
+        top_matches=[pose_first_match(1, appearance=0.1, exact=0.875)],
+    )
+
+    results, total = service.results(
+        scan["id"], review="all", min_score=0, limit=10, offset=0
+    )
+    assert total == 3
+    assert [item["title"] for item in results] == [
+        "Exact",
+        "Pose hit",
+        "Visual fallback",
+    ]
+    pose_gallery = results[1]
+    assert pose_gallery["ranking_tier"] == 2
+    assert pose_gallery["score"] == pytest.approx(0.6)
+    assert pose_gallery["best_ordinal"] == 1
+    assert pose_gallery["above_threshold"] is False
+    assert service.get_scan(scan["id"])["candidate_count"] == 2
 
 
 @pytest.mark.asyncio
@@ -859,9 +1023,10 @@ async def test_finder_model_upgrade_restarts_partial_scan_without_mixed_results(
     completed = original.get_scan(scan["id"])
     assert completed is not None
     assert completed["pages_completed"] == 1
-    assert original.results(
-        scan["id"], review="all", min_score=0, limit=20, offset=0
-    )[1] == 2
+    assert (
+        original.results(scan["id"], review="all", min_score=0, limit=20, offset=0)[1]
+        == 2
+    )
     await original.stop()
 
     upgraded_encoder = FakeEncoder()
@@ -884,9 +1049,10 @@ async def test_finder_model_upgrade_restarts_partial_scan_without_mixed_results(
     assert reset["next_url"] == ROOT
     assert reset["processed_galleries"] == 0
     assert reset["processed_images"] == 0
-    assert upgraded.results(
-        scan["id"], review="all", min_score=0, limit=20, offset=0
-    )[1] == 0
+    assert (
+        upgraded.results(scan["id"], review="all", min_score=0, limit=20, offset=0)[1]
+        == 0
+    )
     assert reset["reference_model_key"] == upgraded._model_key
 
 
@@ -1015,9 +1181,12 @@ def test_finder_cache_prunes_stale_models_lru_and_transient_pose_errors(
     service._store_embedding("current-extra", False, embedding, metadata)
     assert service._prune_embedding_cache() == 2
     with database.connect() as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM finder_embedding_cache"
-        ).fetchone()[0] == 2
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM finder_embedding_cache"
+            ).fetchone()[0]
+            == 2
+        )
 
     service._pose_ready = True
     service._store_embedding(
@@ -1028,10 +1197,13 @@ def test_finder_cache_prunes_stale_models_lru_and_transient_pose_errors(
     )
     assert service._cached_descriptor("transient-pose-failure", False) is None
     with database.connect() as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM finder_embedding_cache WHERE source_key = ?",
-            ("transient-pose-failure",),
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM finder_embedding_cache WHERE source_key = ?",
+                ("transient-pose-failure",),
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_finder_schema_migrates_legacy_metadata_and_matches_safely(
@@ -1105,6 +1277,16 @@ def test_finder_schema_migrates_legacy_metadata_and_matches_safely(
             (tag_id, ROOT, now, now, now),
         )
         connection.execute(
+            """INSERT INTO finder_scans(
+                   id, example_directory, reference_ready, reference_count,
+                   pose_tag_id, pose_tag_label, pose_tag_slug, pose_default_role,
+                   source_url, next_url, page_limit, pages_completed,
+                   minimum_score, status, created_at, updated_at
+               ) VALUES ('legacy-active', 'pose', 1, 1, ?, 'Standing',
+                         'standing', 'solo', ?, ?, 2, 1, 0, 'scanning', ?, ?)""",
+            (tag_id, ROOT, PAGE_2, now, now),
+        )
+        connection.execute(
             """INSERT INTO finder_scan_references(
                    scan_id, example_key, mirror_index, embedding, dimensions
                ) VALUES ('legacy', 'example', 0, ?, 2)""",
@@ -1139,19 +1321,14 @@ def test_finder_schema_migrates_legacy_metadata_and_matches_safely(
         }
         reference_columns = {
             row[1]
-            for row in connection.execute(
-                "PRAGMA table_info(finder_scan_references)"
-            )
+            for row in connection.execute("PRAGMA table_info(finder_scan_references)")
         }
         cache_columns = {
             row[1]
-            for row in connection.execute(
-                "PRAGMA table_info(finder_embedding_cache)"
-            )
+            for row in connection.execute("PRAGMA table_info(finder_embedding_cache)")
         }
         result_columns = {
-            row[1]
-            for row in connection.execute("PRAGMA table_info(finder_results)")
+            row[1] for row in connection.execute("PRAGMA table_info(finder_results)")
         }
         reference_metadata = connection.execute(
             "SELECT metadata_json FROM finder_scan_references"
@@ -1159,12 +1336,39 @@ def test_finder_schema_migrates_legacy_metadata_and_matches_safely(
         cache_metadata = connection.execute(
             "SELECT metadata_json FROM finder_embedding_cache"
         ).fetchone()[0]
+        legacy_scan = connection.execute(
+            """SELECT ranking_version FROM finder_scans
+               WHERE id = 'legacy'"""
+        ).fetchone()
+        frozen_scan = connection.execute(
+            """SELECT status, ranking_version, error FROM finder_scans
+               WHERE id = 'legacy-active'"""
+        ).fetchone()
+        migrated_result = connection.execute(
+            """SELECT ranking_tier FROM finder_results
+               WHERE id = 'legacy-result'"""
+        ).fetchone()
+        indexes = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA index_list(finder_results)"
+            ).fetchall()
+        }
     assert "reference_model_key" in scan_columns
+    assert "ranking_version" in scan_columns
     assert "metadata_json" in reference_columns
     assert "metadata_json" in cache_columns
     assert "matches_json" in result_columns
+    assert "ranking_tier" in result_columns
     assert json.loads(reference_metadata) == {}
     assert json.loads(cache_metadata) == {}
+    assert legacy_scan["ranking_version"] == finder_module.LEGACY_RANKING_VERSION
+    assert frozen_scan["ranking_version"] == finder_module.LEGACY_RANKING_VERSION
+    assert frozen_scan["status"] == "failed"
+    assert "legacy appearance ranking" in frozen_scan["error"]
+    assert migrated_result["ranking_tier"] == 1
+    assert "idx_finder_results_rank" in indexes
+    assert "idx_finder_results_review_rank" in indexes
 
     results, total = service.results(
         "legacy", review="all", min_score=0, limit=10, offset=0
@@ -1173,6 +1377,21 @@ def test_finder_schema_migrates_legacy_metadata_and_matches_safely(
     assert results[0]["id"] == "legacy-result"
     assert results[0]["top_matches"][0]["rank"] == 1
     assert results[0]["top_matches"][0]["image_url"].endswith("full.jpg")
+    legacy = service.get_scan("legacy")
+    assert legacy["ranking_current"] is False
+    assert legacy["extendable"] is False
+    with pytest.raises(finder_module.FinderConflict, match="legacy-ranked"):
+        service.extend("legacy", additional_pages=1)
+
+    with database.connect() as connection:
+        connection.execute(
+            """UPDATE finder_scans
+               SET status = 'paused', pause_requested = 1
+               WHERE id = 'legacy-active'"""
+        )
+    with pytest.raises(finder_module.FinderConflict, match="legacy-ranked"):
+        service.resume("legacy-active")
+    assert "legacy-active" not in service._queued_scan_ids()
 
 
 @pytest.mark.asyncio

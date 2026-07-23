@@ -154,6 +154,8 @@ def build_visual_app(
         "processed_images": 1280,
         "candidate_count": 2,
         "minimum_score": 0.65,
+        "ranking_version": "pose-first-v1",
+        "ranking_current": True,
         "progress_percent": 100,
     }
 
@@ -184,16 +186,17 @@ def build_visual_app(
                     "gallery_url": galleries[2]["url"],
                     "title": "High-confidence multi-person pose candidate",
                     "rank": 1,
-                    "score": 0.94,
+                    "score": 0.96,
+                    "ranking_tier": 2,
                     "review": "pending",
                     "images_scored": 24,
                     "image_count": 24,
                     "person_count": 2,
                     "score_breakdown": {"exact": 0.31, "pose": 0.96, "appearance": 0.72},
                     "top_matches": [
-                        {"rank": 1, "image_url": "https://example.test/candidate-1.jpg", "preview_url": media("candidate-1"), "ordinal": 12, "score": 0.94, "pose_score": 0.96, "pose_reliable": True, "match_type": "pose", "person_count": 2, "skeleton_overlay_url": media("overlay-1")},
-                        {"rank": 2, "image_url": "https://example.test/candidate-2.jpg", "preview_url": media("candidate-2"), "ordinal": 8, "score": 0.89, "pose_score": 0.88, "pose_reliable": True, "match_type": "pose", "person_count": 2, "skeleton_overlay_url": media("overlay-2")},
-                        {"rank": 3, "image_url": "https://example.test/candidate-3.jpg", "preview_url": media("candidate-3"), "ordinal": 19, "score": 0.84, "person_count": 2},
+                        {"rank": 1, "image_url": "https://example.test/candidate-1.jpg", "preview_url": media("candidate-1"), "ordinal": 12, "score": 0.96, "ranking_tier": 2, "pose_score": 0.96, "pose_reliable": True, "match_type": "pose", "person_count": 2, "skeleton_overlay_url": media("overlay-1")},
+                        {"rank": 2, "image_url": "https://example.test/candidate-2.jpg", "preview_url": media("candidate-2"), "ordinal": 8, "score": 0.88, "ranking_tier": 2, "pose_score": 0.88, "pose_reliable": True, "match_type": "pose", "person_count": 2, "skeleton_overlay_url": media("overlay-2")},
+                        {"rank": 3, "image_url": "https://example.test/candidate-3.jpg", "preview_url": media("candidate-3"), "ordinal": 19, "score": 0.84, "ranking_tier": 1, "appearance_score": 0.84, "match_type": "visual_fallback", "person_count": 2},
                     ],
                 },
                 {
@@ -203,6 +206,7 @@ def build_visual_app(
                     "title": "Exact source image found in gallery",
                     "rank": 2,
                     "score": 1.0,
+                    "ranking_tier": 3,
                     "review": "pending",
                     "images_scored": 21,
                     "image_count": 21,
