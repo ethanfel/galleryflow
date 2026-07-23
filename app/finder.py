@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import json
 import os
 import stat
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import urljoin
@@ -30,6 +32,15 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"}
 ACTIVE_STATUSES = {"queued", "preparing", "scanning", "pausing", "canceling"}
 TERMINAL_STATUSES = {"completed", "completed_with_errors", "failed", "canceled"}
 REVIEW_STATES = {"pending", "accepted", "rejected"}
+ANALYZER_VERSION = (
+    "hybrid-spatial-pyramid-v1+rtmo-l-geometry-v1+phash64-gate-v1"
+)
+EXACT_HASH_MAX_DISTANCE = 8
+
+try:
+    from .vision import perceptual_hash_bytes as _perceptual_hash_bytes
+except ImportError:  # pragma: no cover - vision is an optional Finder dependency
+    _perceptual_hash_bytes = None
 
 
 class FinderNotFound(LookupError):
@@ -55,6 +66,12 @@ class _FinderCanceled(RuntimeError):
 MediaFetcher = Callable[[str, str], Awaitable[bytes]]
 
 
+@dataclass(frozen=True, slots=True)
+class _ImageDescriptor:
+    appearance: np.ndarray
+    metadata: dict[str, Any]
+
+
 class FinderService:
     """Persistent visual gallery scanner, isolated from download jobs and history."""
 
@@ -66,6 +83,7 @@ class FinderService:
         events: Any,
         *,
         encoder: Any | None = None,
+        pose_estimator: Any | None = None,
         media_fetcher: MediaFetcher | None = None,
     ) -> None:
         self.config = config
@@ -73,11 +91,14 @@ class FinderService:
         self.scraper = scraper
         self.events = events
         self.encoder = encoder
+        self.pose_estimator = pose_estimator
         self.media_fetcher = media_fetcher
         assert config.finder_examples_root is not None
         assert config.finder_model_path is not None
+        assert config.finder_pose_model_path is not None
         self.examples_root = config.finder_examples_root.resolve()
         self.model_path = config.finder_model_path.resolve()
+        self.pose_model_path = config.finder_pose_model_path.resolve()
         self.queue: asyncio.Queue[str] = asyncio.Queue()
         self._workers: list[asyncio.Task] = []
         self._client: httpx.AsyncClient | None = None
@@ -90,9 +111,12 @@ class FinderService:
         self._stopping = False
         self._available = True
         self._ready = False
+        self._pose_ready = False
         self._prepare_error = ""
+        self._pose_error = ""
         self._model_key = ""
         self._last_event_at: dict[str, float] = {}
+        self._cache_writes_since_prune = 0
 
     def ensure_schema(self) -> None:
         with self._lock, self.database.connect() as db:
@@ -102,6 +126,7 @@ class FinderService:
                     id TEXT PRIMARY KEY,
                     example_directory TEXT NOT NULL,
                     reference_fingerprint TEXT NOT NULL DEFAULT '',
+                    reference_model_key TEXT NOT NULL DEFAULT '',
                     reference_ready INTEGER NOT NULL DEFAULT 0,
                     reference_count INTEGER NOT NULL DEFAULT 0,
                     pose_tag_id INTEGER NOT NULL,
@@ -131,6 +156,7 @@ class FinderService:
                     mirror_index INTEGER NOT NULL,
                     embedding BLOB NOT NULL,
                     dimensions INTEGER NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
                     PRIMARY KEY (scan_id, example_key, mirror_index),
                     FOREIGN KEY (scan_id) REFERENCES finder_scans(id) ON DELETE CASCADE
                 );
@@ -142,6 +168,7 @@ class FinderService:
                     rows INTEGER NOT NULL,
                     dimensions INTEGER NOT NULL,
                     embedding BLOB NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
                     last_used_at TEXT NOT NULL
                 );
@@ -156,6 +183,7 @@ class FinderService:
                     best_preview_remote_url TEXT NOT NULL DEFAULT '',
                     best_ordinal INTEGER,
                     score REAL NOT NULL DEFAULT 0,
+                    matches_json TEXT NOT NULL DEFAULT '[]',
                     images_scored INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL,
                     review TEXT NOT NULL DEFAULT 'pending',
@@ -174,6 +202,30 @@ class FinderService:
                     ON finder_results(scan_id, review, score DESC);
                 """
             )
+            migrations = {
+                "finder_scans": {
+                    "reference_model_key": "TEXT NOT NULL DEFAULT ''",
+                },
+                "finder_scan_references": {
+                    "metadata_json": "TEXT NOT NULL DEFAULT '{}'",
+                },
+                "finder_embedding_cache": {
+                    "metadata_json": "TEXT NOT NULL DEFAULT '{}'",
+                },
+                "finder_results": {
+                    "matches_json": "TEXT NOT NULL DEFAULT '[]'",
+                },
+            }
+            for table, additions in migrations.items():
+                columns = {
+                    str(row[1])
+                    for row in db.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                for column, definition in additions.items():
+                    if column not in columns:
+                        db.execute(
+                            f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                        )
             db.execute(
                 """UPDATE finder_scans
                    SET status = 'canceled', finished_at = ?, updated_at = ?
@@ -200,14 +252,40 @@ class FinderService:
         self._stopping = False
         self.ensure_schema()
         self._client = httpx.AsyncClient(timeout=self.config.image_timeout)
+        created_default_encoder = False
         if self.encoder is None:
             try:
                 from .vision import DinoV2Encoder
 
-                self.encoder = DinoV2Encoder(self.model_path)
+                self.encoder = DinoV2Encoder(
+                    self.model_path,
+                    execution_provider=self.config.finder_execution_provider,
+                )
+                created_default_encoder = True
             except Exception as exc:
                 self._available = False
                 self._prepare_error = str(exc)[:1000]
+        # Injected encoders are commonly tests or custom integrations. Only pair
+        # the built-in DINO encoder with the built-in RTMO estimator implicitly;
+        # callers can still inject both explicitly.
+        if (
+            self.pose_estimator is None
+            and self.config.finder_pose_enabled
+            and created_default_encoder
+        ):
+            try:
+                from .pose_vision import RTMOPoseEstimator
+
+                self.pose_estimator = RTMOPoseEstimator(
+                    self.pose_model_path,
+                    execution_provider=self.config.finder_execution_provider,
+                    max_image_bytes=self.config.finder_max_image_bytes,
+                    max_image_pixels=self.config.finder_max_image_pixels,
+                )
+            except Exception as exc:
+                # Pose is an enhancement. Spatial matching remains usable when
+                # RTMO cannot be initialized or downloaded.
+                self._pose_error = str(exc)[:1000]
         if self._available:
             for scan_id in self._queued_scan_ids():
                 self.queue.put_nowait(scan_id)
@@ -217,26 +295,36 @@ class FinderService:
             ]
 
     async def _ensure_encoder_ready(self) -> None:
-        if self._ready:
-            return
         if not self._available or self.encoder is None:
             raise FinderUnavailable(
                 self._prepare_error or "Finder vision support is unavailable"
             )
         async with self._prepare_lock:
-            if self._ready:
-                return
-            try:
-                await self.encoder.prepare()
-                self._model_key = self._encoder_key()
-                self._ready = True
-                self._prepare_error = ""
-            except Exception as exc:
-                self._ready = False
-                self._prepare_error = str(exc)[:1000]
-                raise FinderUnavailable(
-                    self._prepare_error or "Finder model preparation failed"
-                ) from exc
+            if not self._ready:
+                try:
+                    await self.encoder.prepare()
+                    self._ready = True
+                    self._prepare_error = ""
+                except Exception as exc:
+                    self._ready = False
+                    self._prepare_error = str(exc)[:1000]
+                    raise FinderUnavailable(
+                        self._prepare_error or "Finder model preparation failed"
+                    ) from exc
+            if self.pose_estimator is not None and not self._pose_ready:
+                try:
+                    await self.pose_estimator.prepare()
+                    self._pose_ready = True
+                    self._pose_error = ""
+                except Exception as exc:
+                    self._pose_ready = False
+                    self._pose_error = str(exc)[:1000]
+            model_key = self._encoder_key()
+            if model_key != self._model_key:
+                self._model_key = model_key
+                await asyncio.to_thread(
+                    self._prune_embedding_cache, purge_stale_models=True
+                )
 
     async def stop(self) -> None:
         self._stopping = True
@@ -251,13 +339,21 @@ class FinderService:
     def _encoder_key(self) -> str:
         supplied = getattr(self.encoder, "model_key", None)
         if isinstance(supplied, str) and supplied:
-            return supplied
-        try:
-            stat = self.model_path.stat()
-            identity = f"{self.model_path}:{stat.st_size}:{stat.st_mtime_ns}"
-        except OSError:
-            identity = f"{type(self.encoder).__module__}.{type(self.encoder).__name__}"
-        return hashlib.sha256(identity.encode()).hexdigest()
+            identity = supplied
+        else:
+            try:
+                details = self.model_path.stat()
+                identity = (
+                    f"{self.model_path}:{details.st_size}:{details.st_mtime_ns}"
+                )
+            except OSError:
+                identity = f"{type(self.encoder).__module__}.{type(self.encoder).__name__}"
+        if self.pose_estimator is None:
+            pose_identity = "disabled"
+        else:
+            pose_key = getattr(self.pose_estimator, "model_key", "rtmo")
+            pose_identity = str(pose_key) if self._pose_ready else f"{pose_key}:unavailable"
+        return f"{identity}:{ANALYZER_VERSION}:pose={pose_identity}"
 
     def status(self) -> dict[str, Any]:
         with self._lock, self.database.connect() as db:
@@ -265,11 +361,35 @@ class FinderService:
                 "SELECT status, COUNT(*) AS count FROM finder_scans GROUP BY status"
             ).fetchall()
         counts = {row["status"]: int(row["count"]) for row in rows}
+        encoder_provider = getattr(self.encoder, "provider_status", None)
+        pose_provider = getattr(self.pose_estimator, "provider_status", None)
+        encoder_provider_status = encoder_provider() if callable(encoder_provider) else {}
+        pose_provider_status = pose_provider() if callable(pose_provider) else {}
+        active_devices = [
+            str(value)
+            for value in (
+                encoder_provider_status.get("active"),
+                pose_provider_status.get("active"),
+            )
+            if value
+        ]
         return {
             "available": self._available,
             "model_ready": self._ready,
             "error": self._prepare_error,
             "model_path": str(self.model_path),
+            "pose_model_path": str(self.pose_model_path),
+            "pose_enabled": self.pose_estimator is not None,
+            "pose_ready": self._pose_ready,
+            "pose_error": self._pose_error,
+            "execution_provider": self.config.finder_execution_provider,
+            "providers": {
+                "appearance": encoder_provider_status,
+                "pose": pose_provider_status,
+            },
+            "device": ", ".join(dict.fromkeys(active_devices)),
+            "backend": "spatial DINOv2 + RTMO-L" if self.pose_estimator else "spatial DINOv2",
+            "analyzer_version": ANALYZER_VERSION,
             "folder_root": str(self.examples_root),
             # Kept for clients written against the 2.2 API.
             "examples_root": str(self.examples_root),
@@ -601,6 +721,7 @@ class FinderService:
     def _update_scan(self, scan_id: str, **values: Any) -> None:
         allowed = {
             "reference_fingerprint",
+            "reference_model_key",
             "reference_ready",
             "reference_count",
             "next_url",
@@ -692,6 +813,139 @@ class FinderService:
         self._publish(scan, force=True)
         return scan
 
+    @staticmethod
+    def _normalized_top_matches(
+        matches: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        for item in matches or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                score = float(item.get("score", 0))
+                appearance = float(item.get("appearance_score", score))
+                exact = float(item.get("exact_score", 0))
+                ordinal = int(item.get("ordinal"))
+                pose = (
+                    None
+                    if item.get("pose_score") is None
+                    else float(item["pose_score"])
+                )
+                person_count = (
+                    None
+                    if item.get("person_count") is None
+                    else int(item["person_count"])
+                )
+            except (TypeError, ValueError):
+                continue
+            numeric_scores = (score, appearance, exact)
+            if pose is not None:
+                numeric_scores = (*numeric_scores, pose)
+            if not all(np.isfinite(value) for value in numeric_scores):
+                continue
+            image_url = str(item.get("image_url") or item.get("url") or "")
+            preview = str(
+                item.get("preview_remote_url") or item.get("preview_url") or ""
+            )
+            if not image_url or not preview:
+                continue
+            optional_scores: dict[str, float] = {}
+            for name in ("pose_coverage", "pose_body_confidence"):
+                try:
+                    value = float(item[name])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if np.isfinite(value):
+                    optional_scores[name] = max(0.0, min(1.0, value))
+            try:
+                common_joints = max(0, int(item.get("pose_common_joints", 0)))
+            except (TypeError, ValueError):
+                common_joints = 0
+            overlay = str(item.get("skeleton_overlay_url") or "")
+            pose_reliable = bool(item.get("pose_reliable"))
+            if (
+                not pose_reliable
+                or not overlay.startswith("data:image/svg+xml;base64,")
+                or len(overlay) > 200_000
+            ):
+                overlay = ""
+            normalized.append(
+                {
+                    "rank": 0,
+                    "image_url": image_url,
+                    "preview_remote_url": preview,
+                    "ordinal": ordinal,
+                    "score": max(0.0, min(1.0, score)),
+                    "appearance_score": max(0.0, min(1.0, appearance)),
+                    "exact_score": max(0.0, min(1.0, exact)),
+                    "pose_score": None if pose is None else max(0.0, min(1.0, pose)),
+                    "person_count": (
+                        None if person_count is None else max(0, person_count)
+                    ),
+                    "pose_reliable": pose_reliable,
+                    "pose_coverage": optional_scores.get("pose_coverage"),
+                    "pose_body_confidence": optional_scores.get(
+                        "pose_body_confidence"
+                    ),
+                    "pose_common_joints": common_joints,
+                    "pose_mirrored": bool(item.get("pose_mirrored")),
+                    "skeleton_overlay_url": overlay,
+                    "is_exact": exact > 0,
+                    "match_type": (
+                        "exact"
+                        if exact > 0
+                        else "pose"
+                        if pose_reliable
+                        and pose is not None
+                        and pose > 0.5
+                        else "appearance"
+                    ),
+                }
+            )
+        normalized.sort(
+            key=lambda item: (
+                -item["score"],
+                -item["appearance_score"],
+                item["ordinal"],
+                item["image_url"],
+            )
+        )
+        top = normalized[:3]
+        for rank, item in enumerate(top, start=1):
+            item["rank"] = rank
+        return top
+
+    @classmethod
+    def _decode_result(cls, row: Any) -> dict[str, Any]:
+        item = dict(row)
+        raw_matches = item.pop("matches_json", "[]")
+        try:
+            decoded = json.loads(str(raw_matches or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decoded = []
+        matches = cls._normalized_top_matches(
+            decoded if isinstance(decoded, list) else []
+        )
+        if not matches and item.get("best_image_url") and item.get(
+            "best_preview_remote_url"
+        ):
+            matches = cls._normalized_top_matches(
+                [
+                    {
+                        "image_url": item["best_image_url"],
+                        "preview_remote_url": item["best_preview_remote_url"],
+                        "ordinal": item.get("best_ordinal") or 0,
+                        "score": item.get("score") or 0,
+                        "appearance_score": item.get("score") or 0,
+                        "exact_score": 0,
+                        "pose_score": None,
+                        "person_count": None,
+                    }
+                ]
+            )
+        item["top_matches"] = matches
+        return item
+
     def results(
         self,
         scan_id: str,
@@ -722,7 +976,7 @@ class FinderService:
                     ORDER BY score DESC, discovered_order, id LIMIT ? OFFSET ?""",
                 [*params, limit, offset],
             ).fetchall()
-        items = [dict(row) for row in rows]
+        items = [self._decode_result(row) for row in rows]
         for item in items:
             item["above_threshold"] = item["score"] >= scan["minimum_score"]
         return items, total
@@ -743,7 +997,7 @@ class FinderService:
             row = db.execute(
                 "SELECT * FROM finder_results WHERE id = ?", (result_id,)
             ).fetchone()
-        item = dict(row)
+        item = self._decode_result(row)
         scan = self.get_scan(scan_id) or {}
         item["above_threshold"] = item["score"] >= scan.get("minimum_score", 0)
         return item
@@ -808,17 +1062,73 @@ class FinderService:
             raise ValueError("Vision encoder returned an unusable embedding")
         return np.ascontiguousarray(array / norms, dtype=np.float32)
 
+    @staticmethod
+    def _decode_metadata(value: Any) -> dict[str, Any]:
+        try:
+            decoded = json.loads(str(value or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+
+    @staticmethod
+    def _spatial_appearance(description: Any) -> np.ndarray:
+        if isinstance(description, dict):
+            for name in ("spatial", "spatial_embeddings"):
+                if name in description and description[name] is not None:
+                    return FinderService._normalized_embeddings(description[name])
+        else:
+            for name in ("spatial", "spatial_embeddings"):
+                value = getattr(description, name, None)
+                if value is not None:
+                    return FinderService._normalized_embeddings(value)
+        raise ValueError("Vision encoder description has no spatial appearance")
+
+    def _descriptor_metadata(self, data: bytes, descriptor_kind: str) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            "analyzer_version": ANALYZER_VERSION,
+            "descriptor_kind": descriptor_kind,
+            "phash64": None,
+            "pose": None,
+            "person_count": None,
+        }
+        if _perceptual_hash_bytes is not None:
+            try:
+                value = _perceptual_hash_bytes(
+                    data,
+                    mirror_invariant=True,
+                    max_image_bytes=self.config.finder_max_image_bytes,
+                    max_image_pixels=self.config.finder_max_image_pixels,
+                )
+            except Exception:
+                value = None
+            if (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and 0 <= value < 1 << 64
+            ):
+                metadata["phash64"] = f"{value:016x}"
+        if self._pose_ready and self.pose_estimator is not None:
+            try:
+                frame = self.pose_estimator.infer_bytes(data)
+                metadata["pose"] = frame.as_dict()
+                metadata["person_count"] = frame.person_count
+            except Exception as exc:
+                # One difficult image must not make its entire gallery fail.
+                metadata["pose_error"] = str(exc)[:300]
+        return metadata
+
     def _cache_key(self, source_key: str, include_mirror: bool) -> str:
         raw = f"{self._model_key}\0{int(include_mirror)}\0{source_key}"
         return hashlib.sha256(raw.encode()).hexdigest()
 
-    def _cached_embedding(
+    def _cached_descriptor(
         self, source_key: str, include_mirror: bool
-    ) -> np.ndarray | None:
+    ) -> _ImageDescriptor | None:
         key = self._cache_key(source_key, include_mirror)
         with self._lock, self.database.connect() as db:
             row = db.execute(
-                """SELECT rows, dimensions, embedding FROM finder_embedding_cache
+                """SELECT rows, dimensions, embedding, metadata_json
+                   FROM finder_embedding_cache
                    WHERE cache_key = ? AND model_key = ?""",
                 (key, self._model_key),
             ).fetchone()
@@ -837,23 +1147,51 @@ class FinderService:
                     "DELETE FROM finder_embedding_cache WHERE cache_key = ?", (key,)
                 )
             return None
-        return np.frombuffer(raw, dtype="<f4").reshape(rows, dimensions).copy()
+        metadata = self._decode_metadata(row["metadata_json"])
+        if metadata.get("analyzer_version") != ANALYZER_VERSION:
+            with self._lock, self.database.connect() as db:
+                db.execute(
+                    "DELETE FROM finder_embedding_cache WHERE cache_key = ?", (key,)
+                )
+            return None
+        if metadata.get("pose_error") and self._pose_ready:
+            # Inference failures can be transient (for example a temporary CUDA
+            # OOM). Do not turn one failure into a permanent pose-less cache hit.
+            with self._lock, self.database.connect() as db:
+                db.execute(
+                    "DELETE FROM finder_embedding_cache WHERE cache_key = ?", (key,)
+                )
+            return None
+        appearance = np.frombuffer(raw, dtype="<f4").reshape(rows, dimensions).copy()
+        return _ImageDescriptor(appearance, metadata)
+
+    def _cached_embedding(
+        self, source_key: str, include_mirror: bool
+    ) -> np.ndarray | None:
+        descriptor = self._cached_descriptor(source_key, include_mirror)
+        return descriptor.appearance if descriptor is not None else None
 
     def _store_embedding(
-        self, source_key: str, include_mirror: bool, embedding: np.ndarray
-    ) -> None:
+        self,
+        source_key: str,
+        include_mirror: bool,
+        embedding: np.ndarray,
+        metadata: dict[str, Any] | None = None,
+    ) -> bool:
         key = self._cache_key(source_key, include_mirror)
         now = utc_now()
         with self._lock, self.database.connect() as db:
             db.execute(
                 """INSERT INTO finder_embedding_cache(
                        cache_key, model_key, source_key, include_mirror,
-                       rows, dimensions, embedding, created_at, last_used_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       rows, dimensions, embedding, metadata_json,
+                       created_at, last_used_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(cache_key) DO UPDATE SET
                        rows = excluded.rows,
                        dimensions = excluded.dimensions,
                        embedding = excluded.embedding,
+                       metadata_json = excluded.metadata_json,
                        last_used_at = excluded.last_used_at""",
                 (
                     key,
@@ -863,28 +1201,105 @@ class FinderService:
                     int(embedding.shape[0]),
                     int(embedding.shape[1]),
                     embedding.astype("<f4", copy=False).tobytes(),
+                    json.dumps(metadata or {}, separators=(",", ":"), sort_keys=True),
                     now,
                     now,
                 ),
             )
+            self._cache_writes_since_prune += 1
+            prune_due = self._cache_writes_since_prune >= 500
+            if prune_due:
+                self._cache_writes_since_prune = 0
+        return prune_due
 
-    async def _embed_bytes(
+    def _prune_embedding_cache(self, *, purge_stale_models: bool = False) -> int:
+        """Bound persistent descriptor storage and discard obsolete namespaces."""
+
+        removed = 0
+        with self._lock, self.database.connect() as db:
+            if purge_stale_models and self._model_key:
+                cursor = db.execute(
+                    "DELETE FROM finder_embedding_cache WHERE model_key != ?",
+                    (self._model_key,),
+                )
+                removed += max(0, int(cursor.rowcount))
+            summary = db.execute(
+                """SELECT COUNT(*) AS entries,
+                          COALESCE(SUM(length(embedding) + length(metadata_json)), 0)
+                              AS stored_bytes
+                   FROM finder_embedding_cache"""
+            ).fetchone()
+            total_entries = int(summary["entries"])
+            total_bytes = max(0, int(summary["stored_bytes"] or 0))
+            max_entries = self.config.finder_cache_max_entries
+            max_bytes = self.config.finder_cache_max_bytes
+            if total_entries <= max_entries and total_bytes <= max_bytes:
+                return removed
+
+            # Leave 10% headroom so a large scan does not prune on every batch.
+            target_entries = max(0, int(max_entries * 0.9))
+            target_bytes = max(0, int(max_bytes * 0.9))
+            rows = db.execute(
+                """SELECT cache_key,
+                          length(embedding) + length(metadata_json) AS stored_bytes
+                   FROM finder_embedding_cache
+                   ORDER BY last_used_at ASC, created_at ASC, cache_key ASC"""
+            ).fetchall()
+            keys: list[tuple[str]] = []
+            for row in rows:
+                if total_entries <= target_entries and total_bytes <= target_bytes:
+                    break
+                keys.append((str(row["cache_key"]),))
+                total_entries -= 1
+                total_bytes -= max(0, int(row["stored_bytes"] or 0))
+            if keys:
+                db.executemany(
+                    "DELETE FROM finder_embedding_cache WHERE cache_key = ?", keys
+                )
+                removed += len(keys)
+        return removed
+
+    async def _describe_bytes(
         self, data: bytes, source_key: str, *, include_mirror: bool
-    ) -> np.ndarray:
-        cached = self._cached_embedding(source_key, include_mirror)
+    ) -> _ImageDescriptor:
+        cached = self._cached_descriptor(source_key, include_mirror)
         if cached is not None:
             return cached
         self._validate_image_bytes(data)
         async with self._embedding_semaphore:
-            cached = self._cached_embedding(source_key, include_mirror)
+            cached = self._cached_descriptor(source_key, include_mirror)
             if cached is not None:
                 return cached
-            value = await asyncio.to_thread(
-                self.encoder.embed_bytes, data, include_mirror=include_mirror
+            describe = getattr(self.encoder, "describe_bytes", None)
+            if callable(describe):
+                value = await asyncio.to_thread(
+                    describe, data, include_mirror=include_mirror
+                )
+                appearance = self._spatial_appearance(value)
+                descriptor_kind = "spatial"
+            else:
+                value = await asyncio.to_thread(
+                    self.encoder.embed_bytes, data, include_mirror=include_mirror
+                )
+                appearance = self._normalized_embeddings(value)
+                descriptor_kind = "legacy-global"
+            metadata = await asyncio.to_thread(
+                self._descriptor_metadata, data, descriptor_kind
             )
-        embedding = self._normalized_embeddings(value)
-        self._store_embedding(source_key, include_mirror, embedding)
-        return embedding
+        prune_due = self._store_embedding(
+            source_key, include_mirror, appearance, metadata=metadata
+        )
+        if prune_due:
+            await asyncio.to_thread(self._prune_embedding_cache)
+        return _ImageDescriptor(appearance, metadata)
+
+    async def _embed_bytes(
+        self, data: bytes, source_key: str, *, include_mirror: bool
+    ) -> np.ndarray:
+        descriptor = await self._describe_bytes(
+            data, source_key, include_mirror=include_mirror
+        )
+        return descriptor.appearance
 
     def _validate_image_bytes(self, data: bytes) -> None:
         if not data:
@@ -950,18 +1365,73 @@ class FinderService:
                     return data
         raise RuntimeError("Too many image redirects")
 
-    async def _remote_embedding(self, url: str, referer: str) -> np.ndarray:
+    async def _remote_descriptor(self, url: str, referer: str) -> _ImageDescriptor:
         canonical = canonicalize_url(url)
         source_key = f"url:{canonical}"
-        cached = self._cached_embedding(source_key, False)
+        cached = self._cached_descriptor(source_key, False)
         if cached is not None:
             return cached
         data = await self._fetch_media(canonical, referer)
-        return await self._embed_bytes(data, source_key, include_mirror=False)
+        return await self._describe_bytes(data, source_key, include_mirror=False)
+
+    async def _remote_embedding(self, url: str, referer: str) -> np.ndarray:
+        descriptor = await self._remote_descriptor(url, referer)
+        return descriptor.appearance
+
+    def _references_are_current(self, scan_id: str) -> bool:
+        with self._lock, self.database.connect() as db:
+            rows = db.execute(
+                """SELECT metadata_json FROM finder_scan_references
+                   WHERE scan_id = ?""",
+                (scan_id,),
+            ).fetchall()
+        return bool(rows) and all(
+            self._decode_metadata(row["metadata_json"]).get("analyzer_version")
+            == ANALYZER_VERSION
+            for row in rows
+        )
 
     async def _prepare_references(self, scan: dict[str, Any]) -> np.ndarray:
-        if scan["reference_ready"]:
+        references_current = (
+            scan.get("reference_model_key") == self._model_key
+            and self._references_are_current(scan["id"])
+        )
+        if scan["reference_ready"] and references_current:
             return self._load_scan_references(scan["id"])
+        if scan["reference_ready"]:
+            with self._lock, self.database.connect() as db:
+                db.execute(
+                    "DELETE FROM finder_scan_references WHERE scan_id = ?",
+                    (scan["id"],),
+                )
+                db.execute(
+                    "DELETE FROM finder_results WHERE scan_id = ?", (scan["id"],)
+                )
+                db.execute(
+                    """UPDATE finder_scans
+                       SET reference_fingerprint = '', reference_model_key = '',
+                           reference_ready = 0, reference_count = 0,
+                           next_url = source_url, pages_completed = 0,
+                           total_galleries = 0, processed_galleries = 0,
+                           processed_images = 0, failed_galleries = 0,
+                           status = 'preparing', error = '', finished_at = NULL,
+                           updated_at = ?
+                       WHERE id = ?""",
+                    (utc_now(), scan["id"]),
+                )
+            scan = {
+                **scan,
+                "reference_fingerprint": "",
+                "reference_model_key": "",
+                "reference_ready": False,
+                "reference_count": 0,
+                "next_url": scan["source_url"],
+                "pages_completed": 0,
+                "total_galleries": 0,
+                "processed_galleries": 0,
+                "processed_images": 0,
+                "failed_galleries": 0,
+            }
         directory, _ = self._resolve_example_directory(scan["example_directory"])
         files = self._example_files(directory)
         manifest: list[tuple[Path, str, str]] = []
@@ -996,24 +1466,34 @@ class FinderService:
             data = await asyncio.to_thread(self._read_example_file, path)
             if hashlib.sha256(data).hexdigest() != digest:
                 raise FinderConflict("Example images changed while preparing the scan")
-            embedding = await self._embed_bytes(
+            descriptor = await self._describe_bytes(
                 data, f"sha256:{digest}", include_mirror=True
             )
             with self._lock, self.database.connect() as db:
-                for mirror_index, vector in enumerate(embedding):
+                for mirror_index, vector in enumerate(descriptor.appearance):
+                    metadata = {
+                        **descriptor.metadata,
+                        "view_index": mirror_index,
+                        "mirrored": bool(mirror_index),
+                    }
                     db.execute(
                         """INSERT INTO finder_scan_references(
-                               scan_id, example_key, mirror_index, embedding, dimensions
-                           ) VALUES (?, ?, ?, ?, ?)
+                               scan_id, example_key, mirror_index, embedding,
+                               dimensions, metadata_json
+                           ) VALUES (?, ?, ?, ?, ?, ?)
                            ON CONFLICT(scan_id, example_key, mirror_index) DO UPDATE SET
                                embedding = excluded.embedding,
-                               dimensions = excluded.dimensions""",
+                               dimensions = excluded.dimensions,
+                               metadata_json = excluded.metadata_json""",
                         (
                             scan["id"],
                             f"{relative}:{digest}",
                             mirror_index,
                             vector.astype("<f4", copy=False).tobytes(),
                             int(vector.shape[0]),
+                            json.dumps(
+                                metadata, separators=(",", ":"), sort_keys=True
+                            ),
                         ),
                     )
         references = self._load_scan_references(scan["id"])
@@ -1021,6 +1501,7 @@ class FinderService:
             scan["id"],
             reference_ready=1,
             reference_count=int(references.shape[0]),
+            reference_model_key=self._model_key,
             status="scanning",
         )
         return references
@@ -1046,6 +1527,186 @@ class FinderService:
         if not vectors:
             raise ValueError("Finder scan has no reference embeddings")
         return self._normalized_embeddings(np.stack(vectors))
+
+    @staticmethod
+    def _metadata_phash(metadata: dict[str, Any]) -> int | None:
+        raw = metadata.get("phash64")
+        if not isinstance(raw, str) or len(raw) != 16:
+            return None
+        try:
+            value = int(raw, 16)
+        except ValueError:
+            return None
+        return value if 0 <= value < 1 << 64 else None
+
+    def _load_reference_hashes(self, scan_id: str) -> tuple[int, ...]:
+        with self._lock, self.database.connect() as db:
+            rows = db.execute(
+                """SELECT metadata_json FROM finder_scan_references
+                   WHERE scan_id = ? ORDER BY example_key, mirror_index""",
+                (scan_id,),
+            ).fetchall()
+        hashes = {
+            value
+            for row in rows
+            if (
+                value := self._metadata_phash(
+                    self._decode_metadata(row["metadata_json"])
+                )
+            )
+            is not None
+        }
+        return tuple(sorted(hashes))
+
+    @staticmethod
+    def _metadata_pose(metadata: dict[str, Any]) -> Any | None:
+        value = metadata.get("pose")
+        if not isinstance(value, dict):
+            return None
+        try:
+            from .pose_vision import PoseFrame
+
+            return PoseFrame.from_dict(value)
+        except (ImportError, ValueError, TypeError):
+            return None
+
+    def _load_reference_poses(self, scan_id: str) -> tuple[Any, ...]:
+        with self._lock, self.database.connect() as db:
+            rows = db.execute(
+                """SELECT metadata_json FROM finder_scan_references
+                   WHERE scan_id = ? AND mirror_index = 0
+                   ORDER BY example_key""",
+                (scan_id,),
+            ).fetchall()
+        frames = [
+            self._metadata_pose(self._decode_metadata(row["metadata_json"]))
+            for row in rows
+        ]
+        return tuple(frame for frame in frames if frame is not None)
+
+    @staticmethod
+    def _pose_diagnostics(
+        candidate_metadata: dict[str, Any], references: tuple[Any, ...]
+    ) -> dict[str, Any]:
+        candidate = FinderService._metadata_pose(candidate_metadata)
+        if candidate is None:
+            return {
+                "pose_score": None,
+                "pose_reliable": False,
+                "person_count": None,
+                "skeleton_overlay_url": "",
+            }
+        if not references:
+            return {
+                "pose_score": None,
+                "pose_reliable": False,
+                "person_count": candidate.person_count,
+                "skeleton_overlay_url": "",
+            }
+        try:
+            from .pose_vision import pose_geometry_match
+
+            matches = [
+                pose_geometry_match(reference, candidate, allow_mirror=True)
+                for reference in references
+            ]
+        except (ImportError, ValueError, TypeError):
+            matches = []
+        if not matches:
+            return {
+                "pose_score": None,
+                "pose_reliable": False,
+                "person_count": candidate.person_count,
+                "skeleton_overlay_url": "",
+            }
+        best = max(
+            matches,
+            key=lambda match: (
+                bool(match.reliable),
+                float(match.score),
+                float(match.coverage),
+            ),
+        )
+        overlay = ""
+        if best.reliable and candidate.person_count:
+            try:
+                from .pose_vision import skeleton_data_uri
+
+                overlay = skeleton_data_uri(
+                    candidate,
+                    width=candidate.image_size[0],
+                    height=candidate.image_size[1],
+                )
+            except (ImportError, ValueError, TypeError):
+                overlay = ""
+        return {
+            "pose_score": max(0.0, min(1.0, float(best.score))),
+            "pose_reliable": bool(best.reliable),
+            "pose_coverage": max(0.0, min(1.0, float(best.coverage))),
+            "pose_common_joints": max(0, int(best.common_joints)),
+            "pose_body_confidence": max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        getattr(
+                            best,
+                            "minimum_body_confidence",
+                            best.mean_joint_confidence,
+                        )
+                    ),
+                ),
+            ),
+            "pose_mirrored": bool(best.mirrored),
+            "person_count": candidate.person_count,
+            "skeleton_overlay_url": overlay,
+        }
+
+    @staticmethod
+    def _appearance_score(raw_score: float, *, spatial: bool) -> float:
+        if spatial:
+            return float(np.clip((raw_score - 0.20) / 0.65, 0.0, 1.0))
+        # Compatibility for injected/legacy encoders that only implement
+        # embed_bytes. Their scores were historically raw cosine similarity.
+        return max(0.0, min(1.0, raw_score))
+
+    @staticmethod
+    def _exact_score(candidate: int | None, references: tuple[int, ...]) -> float:
+        if candidate is None or not references:
+            return 0.0
+        distance = min((candidate ^ reference).bit_count() for reference in references)
+        if distance > EXACT_HASH_MAX_DISTANCE:
+            return 0.0
+        # Once inside the strict duplicate gate, retain a strong score so a
+        # resized/recompressed source copy is not hidden by appearance ranking.
+        return max(0.0, 1.0 - distance / 64.0)
+
+    @staticmethod
+    def _combined_score(
+        appearance_score: float,
+        exact_score: float,
+        pose: dict[str, Any],
+    ) -> float:
+        if exact_score > 0:
+            return max(appearance_score, exact_score)
+        pose_score = pose.get("pose_score")
+        if not pose.get("pose_reliable") or not isinstance(
+            pose_score, (int, float)
+        ):
+            return appearance_score
+        coverage = float(pose.get("pose_coverage") or 0)
+        body_confidence = float(pose.get("pose_body_confidence") or 0)
+        evidence = min(1.0, coverage) * min(1.0, body_confidence / 0.45)
+        # Reliable geometry is a bounded positive tie-breaker. It cannot erase
+        # a strong crop/appearance match, which is important for extreme poses
+        # where even RTMO can see only part of a body.
+        bonus = (
+            0.12
+            * evidence
+            * max(0.0, float(pose_score) - 0.5)
+            * (1.0 - appearance_score)
+        )
+        return max(0.0, min(1.0, appearance_score + bonus))
 
     def _claim_scan(self, scan_id: str) -> bool:
         with self._lock, self.database.connect() as db:
@@ -1101,10 +1762,13 @@ class FinderService:
                         finished_at=utc_now(),
                     )
             finally:
+                # The scan's durable status is already written. Release queue
+                # joiners before the final read/event publication, which can be
+                # comparatively slow on Unraid/FUSE-backed SQLite volumes.
+                self.queue.task_done()
                 final = self.get_scan(scan_id)
                 if final:
                     self._publish(final, force=True)
-                self.queue.task_done()
 
     def _result_complete(self, scan_id: str, gallery_url: str) -> bool:
         key = gallery_key(gallery_url)
@@ -1127,18 +1791,42 @@ class FinderService:
         best: dict | None,
         status: str,
         error: str = "",
+        top_matches: list[dict[str, Any]] | None = None,
     ) -> None:
         now = utc_now()
         key = gallery_key(card["url"])
+        if top_matches is None and best is not None:
+            top_matches = [
+                {
+                    "image_url": best.get("url"),
+                    "preview_remote_url": best.get("preview_remote_url"),
+                    "ordinal": best.get("ordinal"),
+                    "score": score,
+                    "appearance_score": score,
+                    "exact_score": 0,
+                    "pose_score": None,
+                    "person_count": None,
+                }
+            ]
+        matches = self._normalized_top_matches(top_matches)
+        if matches:
+            leading = matches[0]
+            best = {
+                "url": leading["image_url"],
+                "preview_remote_url": leading["preview_remote_url"],
+                "ordinal": leading["ordinal"],
+            }
+            score = leading["score"]
+        matches_json = json.dumps(matches, separators=(",", ":"), sort_keys=True)
         with self._lock, self.database.connect() as db:
             db.execute(
                 """INSERT INTO finder_results(
                        id, scan_id, gallery_key, gallery_url, title,
                        thumbnail_remote_url, best_image_url,
                        best_preview_remote_url, best_ordinal, score,
-                       images_scored, status, error, discovered_order,
+                       matches_json, images_scored, status, error, discovered_order,
                        created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(scan_id, gallery_key) DO UPDATE SET
                        gallery_url = excluded.gallery_url,
                        title = excluded.title,
@@ -1147,6 +1835,7 @@ class FinderService:
                        best_preview_remote_url = excluded.best_preview_remote_url,
                        best_ordinal = excluded.best_ordinal,
                        score = excluded.score,
+                       matches_json = excluded.matches_json,
                        images_scored = excluded.images_scored,
                        status = excluded.status,
                        error = excluded.error,
@@ -1163,6 +1852,7 @@ class FinderService:
                     str(best.get("preview_remote_url") if best else ""),
                     int(best.get("ordinal")) if best else None,
                     float(score),
+                    matches_json,
                     images_scored,
                     status,
                     error[:1000],
@@ -1209,6 +1899,8 @@ class FinderService:
         card: dict,
         order: int,
         references: np.ndarray,
+        reference_hashes: tuple[int, ...],
+        reference_poses: tuple[Any, ...],
     ) -> None:
         gallery_url = validate_source_url(card["url"])
         if self._result_complete(scan["id"], gallery_url):
@@ -1226,23 +1918,45 @@ class FinderService:
             for index, image in enumerate(images, start=1):
                 image.setdefault("ordinal", index)
 
-            async def score_image(image: dict) -> tuple[float, dict] | None:
+            async def score_image(image: dict) -> dict[str, Any] | None:
                 self._check_control(scan["id"])
                 preview = str(image.get("preview_remote_url") or "")
                 original = str(image.get("url") or "")
                 await asyncio.to_thread(validate_public_media_url, preview)
                 await asyncio.to_thread(validate_public_media_url, original)
                 try:
-                    candidate = await self._remote_embedding(preview, gallery_url)
+                    candidate = await self._remote_descriptor(preview, gallery_url)
                 except (_FinderPaused, _FinderCanceled):
                     raise
                 except Exception:
                     return None
-                vector = candidate[0]
+                vector = candidate.appearance[0]
                 raw_score = float(np.max(references @ vector))
-                return max(0.0, min(1.0, raw_score)), image
+                spatial = candidate.metadata.get("descriptor_kind") == "spatial"
+                appearance_score = self._appearance_score(
+                    raw_score, spatial=spatial
+                )
+                exact_score = (
+                    self._exact_score(
+                        self._metadata_phash(candidate.metadata), reference_hashes
+                    )
+                    if spatial
+                    else 0.0
+                )
+                pose = self._pose_diagnostics(candidate.metadata, reference_poses)
+                return {
+                    "image_url": original,
+                    "preview_remote_url": preview,
+                    "ordinal": int(image["ordinal"]),
+                    "score": self._combined_score(
+                        appearance_score, exact_score, pose
+                    ),
+                    "appearance_score": appearance_score,
+                    "exact_score": exact_score,
+                    **pose,
+                }
 
-            scored: list[tuple[float, dict]] = []
+            scored: list[dict[str, Any]] = []
             batch_size = self.config.finder_network_workers
             for start in range(0, len(images), batch_size):
                 self._check_control(scan["id"])
@@ -1253,19 +1967,20 @@ class FinderService:
                 for outcome in outcomes:
                     if isinstance(outcome, (_FinderPaused, _FinderCanceled)):
                         raise outcome
-                    if isinstance(outcome, tuple):
+                    if isinstance(outcome, dict):
                         scored.append(outcome)
             if not scored:
                 raise ValueError("No gallery preview image could be scored")
-            best_score, best_image = max(scored, key=lambda item: item[0])
+            top_matches = self._normalized_top_matches(scored)
             self._save_result(
                 scan["id"],
                 {**card, "url": detail.get("url") or gallery_url},
                 order=order,
-                score=best_score,
+                score=top_matches[0]["score"],
                 images_scored=len(scored),
-                best=best_image,
+                best=None,
                 status="completed",
+                top_matches=top_matches,
             )
         except (_FinderPaused, _FinderCanceled):
             raise
@@ -1283,6 +1998,8 @@ class FinderService:
 
     async def _run_scan(self, scan: dict[str, Any]) -> None:
         references = await self._prepare_references(scan)
+        reference_hashes = self._load_reference_hashes(scan["id"])
+        reference_poses = self._load_reference_poses(scan["id"])
         self._check_control(scan["id"])
         self._update_scan(scan["id"], status="scanning", error="")
         while True:
@@ -1331,6 +2048,8 @@ class FinderService:
                             card,
                             order_base + start + index,
                             references,
+                            reference_hashes,
+                            reference_poses,
                         )
                         for index, card in enumerate(batch)
                     ),

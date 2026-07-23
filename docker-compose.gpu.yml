@@ -1,0 +1,9 @@
+services:
+  galleryflow:
+    image: ghcr.io/ethanfel/galleryflow:gpu
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    gpus: all
+    environment:
+      PORNPIC_WEBUI_FINDER_EXECUTION_PROVIDER: auto

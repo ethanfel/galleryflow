@@ -536,21 +536,56 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .finder-review-tabs button.is-active b { color: var(--text-soft); }
 .finder-threshold { display: flex; min-width: 155px; gap: 9px; align-items: center; color: var(--muted); font-size: 9px; white-space: nowrap; }
 .finder-threshold input { min-width: 80px; flex: 1; }
-.finder-result-grid { display: grid; padding: 16px; grid-template-columns: repeat(auto-fill, minmax(205px, 1fr)); gap: 13px; }
-.finder-card { display: flex; flex-direction: column; }
+.finder-result-grid { display: grid; padding: 16px; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 14px; align-items: start; }
+.finder-card { display: flex; min-width: 0; flex-direction: column; }
 .finder-card.is-accepted { border-color: rgba(79,210,160,.32); }
 .finder-card.is-rejected { opacity: .72; }
-.finder-card-media { display: block; width: 100%; padding: 0; border: 0; background: transparent; text-align: left; }
-.finder-rank, .finder-similarity, .finder-ordinal { position: absolute; z-index: 3; display: inline-flex; min-height: 23px; padding: 0 7px; align-items: center; border: 1px solid rgba(255,255,255,.13); border-radius: 999px; background: rgba(10,10,14,.78); font-size: 8px; font-weight: 720; backdrop-filter: blur(8px); }
-.finder-rank { top: 9px; left: 9px; color: var(--text-soft); }
-.finder-similarity { top: 9px; right: 9px; color: var(--amber); }
+.finder-card-head { display: flex; min-height: 42px; padding: 8px 10px; gap: 7px; align-items: center; border-bottom: 1px solid var(--border); background: rgba(255,255,255,.012); }
+.finder-rank, .finder-similarity, .finder-match-kind { display: inline-flex; min-height: 23px; padding: 0 7px; align-items: center; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2); font-size: 8px; font-weight: 720; white-space: nowrap; }
+.finder-rank { color: var(--text-soft); }
+.finder-similarity { margin-left: auto; color: var(--amber); font-variant-numeric: tabular-nums; }
+.finder-match-kind { border-color: rgba(155,123,250,.22); background: rgba(155,123,250,.1); color: #cbbfff; }
+.finder-card:has(.finder-match-kind:not([hidden])) .finder-rank { color: var(--muted); }
 .finder-card.is-high .finder-similarity { color: var(--green); }
 .finder-card.is-likely .finder-similarity { color: #c9bcff; }
-.finder-ordinal { right: 9px; bottom: 9px; color: var(--muted); }
-.finder-card-copy { min-height: 67px; padding: 11px 12px 9px; }
+.finder-match-gallery { display: grid; gap: 1px; overflow: hidden; border-bottom: 1px solid var(--border); background: var(--border); }
+.finder-match-gallery.has-1 { aspect-ratio: 4 / 3; grid-template-columns: 1fr; }
+.finder-match-gallery.has-2 { aspect-ratio: 4 / 3; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.finder-match-gallery.has-3 { aspect-ratio: 4 / 3; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); grid-template-rows: repeat(2, minmax(0, 1fr)); }
+.finder-match-gallery.has-3 .finder-match:first-child { grid-row: 1 / 3; }
+.finder-match { position: relative; min-width: 0; min-height: 0; padding: 0; overflow: hidden; border: 0; background: #0d0d12; color: var(--text); }
+.finder-match-image, .finder-skeleton-overlay { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; object-position: center; transition: transform .35s var(--ease), opacity .2s ease; }
+.finder-match-image { z-index: 1; }
+.finder-match:hover .finder-match-image { transform: scale(1.025); }
+.finder-skeleton-overlay { z-index: 2; opacity: 0; }
+.finder-card.is-overlay-visible .finder-skeleton-overlay { opacity: 1; }
+.finder-match .image-placeholder { z-index: 1; }
+.finder-match-position, .finder-match-score, .finder-match-ordinal, .finder-match-people { position: absolute; z-index: 3; display: inline-flex; min-height: 20px; padding: 0 6px; align-items: center; border: 1px solid rgba(255,255,255,.12); border-radius: 999px; background: rgba(9,9,13,.8); font-size: 7px; font-weight: 720; white-space: nowrap; backdrop-filter: blur(8px); }
+.finder-match-position { top: 7px; left: 7px; color: var(--text-soft); }
+.finder-match-score { top: 7px; right: 7px; color: #cabdff; font-variant-numeric: tabular-nums; }
+.finder-match-ordinal { right: 7px; bottom: 7px; color: var(--text-soft); }
+.finder-match-people { bottom: 7px; left: 7px; color: #9bc6f7; }
+.finder-match-open { position: absolute; z-index: 4; inset: 50% auto auto 50%; display: grid; width: 34px; height: 34px; place-items: center; border: 1px solid rgba(255,255,255,.14); border-radius: 10px; background: rgba(9,9,13,.8); color: white; opacity: 0; transform: translate(-50%, -42%); transition: opacity .18s, transform .18s; backdrop-filter: blur(9px); }
+.finder-match-open svg { width: 15px; height: 15px; }
+.finder-match:hover .finder-match-open, .finder-match:focus-visible .finder-match-open { opacity: 1; transform: translate(-50%, -50%); }
+.finder-card-copy { min-height: 93px; padding: 11px 12px 10px; }
 .finder-card-title { display: block; width: 100%; padding: 0; overflow: hidden; border: 0; background: transparent; color: var(--text); font-size: 12px; font-weight: 650; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
 .finder-card-title:hover { color: #ff9fb4; }
 .finder-card-copy p { margin: 4px 0 0; overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.finder-diagnostic-toolbar { display: flex; min-width: 0; margin-top: 9px; padding-top: 9px; gap: 6px; align-items: center; flex-wrap: wrap; border-top: 1px solid var(--border); }
+.finder-score-breakdown { display: flex; min-width: 0; gap: 5px; align-items: center; flex-wrap: wrap; }
+.finder-score-chip, .finder-person-count, .finder-overlay-toggle { display: inline-flex; min-height: 24px; padding: 0 7px; gap: 5px; align-items: center; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2); color: var(--muted); font-size: 7px; white-space: nowrap; }
+.finder-score-chip i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+.finder-score-chip b { color: var(--text-soft); font-variant-numeric: tabular-nums; }
+.finder-score-chip.is-exact { border-color: rgba(79,210,160,.2); background: rgba(79,210,160,.07); color: var(--green); }
+.finder-score-chip.is-pose { border-color: rgba(155,123,250,.23); background: rgba(155,123,250,.08); color: #bbaafb; }
+.finder-score-chip.is-appearance { border-color: rgba(98,168,250,.2); background: rgba(98,168,250,.07); color: var(--blue); }
+.finder-person-count { color: #9bc6f7; }
+.finder-person-count svg { width: 11px; height: 11px; }
+.finder-person-count b { font-weight: 650; }
+.finder-overlay-toggle { margin-left: auto; cursor: pointer; }
+.finder-overlay-toggle:hover, .finder-overlay-toggle[aria-pressed="true"] { border-color: rgba(155,123,250,.3); background: rgba(155,123,250,.11); color: #cbbfff; }
+.finder-overlay-toggle svg { width: 11px; height: 11px; }
 .finder-card-actions { display: grid; margin-top: auto; padding: 0 9px 9px; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px; }
 .finder-card-actions .button { min-width: 0; min-height: 33px; padding: 0 5px; gap: 4px; font-size: 8px; }
 .finder-card-actions .button svg { width: 12px; height: 12px; }
@@ -930,11 +965,12 @@ kbd { min-width: 30px; padding: 4px 8px; border: 1px solid var(--border-strong);
   .finder-review-tabs { width: 100%; }
   .finder-review-tabs button { min-width: 0; flex: 1; padding-inline: 6px; justify-content: center; font-size: 9px; }
   .finder-threshold { width: 100%; }
-  .finder-result-grid { padding: 10px; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-  .finder-card-actions .button span { display: none; }
+  .finder-result-grid { padding: 10px; grid-template-columns: 1fr; gap: 10px; }
   .finder-card-actions .button { min-height: 37px; }
-  .finder-card-copy { min-height: 61px; padding: 9px; }
-  .finder-rank, .finder-similarity, .finder-ordinal { min-height: 20px; padding-inline: 6px; font-size: 7px; }
+  .finder-card-copy { min-height: 0; padding: 10px; }
+  .finder-rank, .finder-similarity, .finder-match-kind { min-height: 22px; padding-inline: 6px; font-size: 7px; }
+  .finder-match-open { display: none; }
+  .finder-overlay-toggle { margin-left: 0; }
   .finder-welcome { min-height: 390px; }
 }
 

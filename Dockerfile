@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="GalleryFlow" \
       org.opencontainers.image.description="Browser-only gallery downloader, visual pose finder, pose-pair organizer, and sorter" \
-      org.opencontainers.image.version="2.2.1" \
+      org.opencontainers.image.version="2.3.0" \
       org.opencontainers.image.source="https://github.com/ethanfel/galleryflow"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

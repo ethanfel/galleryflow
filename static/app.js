@@ -147,6 +147,9 @@
 
   function safeUrl(value) {
     if (!value) return '';
+    if (/^data:image\/svg\+xml;base64,[a-z0-9+/=]+$/i.test(value) && value.length <= 200000) {
+      return value;
+    }
     try {
       const parsed = new URL(value, window.location.origin);
       return ['http:', 'https:'].includes(parsed.protocol) ? parsed.href : '';
@@ -1809,20 +1812,34 @@
     const serviceAvailable = data.available ?? model.available;
     const reportedModelReady = data.model_ready ?? model.model_ready ?? data.ready ?? model.ready;
     const modelReady = reportedModelReady === undefined ? Boolean(serviceAvailable) : Boolean(reportedModelReady);
+    const error = String(data.error || model.error || '');
+    const poseError = String(data.pose_error || model.pose_error || '');
     const ready = serviceAvailable !== undefined
       ? Boolean(serviceAvailable)
       : reportedModelReady === undefined ? ['ready', 'available', 'loaded', 'ok'].includes(status) : modelReady;
+    const providers = data.providers && typeof data.providers === 'object' ? data.providers : {};
+    const appearanceProvider = providers.appearance && typeof providers.appearance === 'object' ? providers.appearance : {};
+    const poseProvider = providers.pose && typeof providers.pose === 'object' ? providers.pose : {};
+    const providerDetails = [];
+    if (appearanceProvider.cpu_fallback) providerDetails.push('Appearance using CPU fallback');
+    if (poseProvider.fallback) providerDetails.push('Pose using CPU fallback');
+    if (poseProvider.message) providerDetails.push(String(poseProvider.message));
     const details = [
+      error ? `Model error: ${error}` : '',
+      poseError ? `Pose unavailable: ${poseError}` : '',
       data.detail || data.message || model.detail || model.description || '',
       data.device || model.device || '',
-      data.backend || model.backend || ''
+      data.backend || model.backend || '',
+      ...providerDetails
     ].filter(Boolean);
     return {
       ready,
       modelReady,
+      error,
+      poseError,
       status,
       name: String(data.model_name || model.name || model.label || data.name || String(data.model_path || '').split('/').pop() || 'Similarity model'),
-      detail: details.join(' · ') || (modelReady ? 'Ready to compare images' : ready ? 'Model downloads automatically on the first scan' : data.error || model.error || 'Model unavailable'),
+      detail: details.join(' · ') || (modelReady ? 'Ready to compare images' : ready ? 'Model downloads automatically on the first scan' : 'Model unavailable'),
       defaultSourceUrl: String(data.default_source_url || data.source_url || ''),
       folderRoot: String(data.folder_root || model.folder_root || '')
     };
@@ -1884,32 +1901,105 @@
     } catch (_) { return ''; }
   }
 
+  function normalizeFinderScore(value, fallback = null) {
+    if (value === null || value === undefined || value === '') return fallback;
+    let score = Number(value);
+    if (!Number.isFinite(score)) return fallback;
+    if (score > 1 && score <= 100) score /= 100;
+    return Math.max(0, Math.min(1, score));
+  }
+
+  function firstFinderScore(...values) {
+    for (const value of values) {
+      const score = normalizeFinderScore(value);
+      if (score !== null) return score;
+    }
+    return null;
+  }
+
+  function normalizeFinderMatch(rawMatch, index, fallback = {}) {
+    const match = typeof rawMatch === 'string' ? { image_url: rawMatch } : (rawMatch || {});
+    const breakdown = match.score_breakdown && typeof match.score_breakdown === 'object'
+      ? match.score_breakdown
+      : match.scores && typeof match.scores === 'object' ? match.scores : {};
+    const isExact = Boolean(match.is_exact ?? match.exact_match ?? (index === 0 ? fallback.isExact : false));
+    return {
+      rank: Math.max(1, Number(match.rank ?? match.match_rank ?? index + 1) || index + 1),
+      imageUrl: String(match.image_url || match.full_url || match.url || (index === 0 ? fallback.imageUrl : '') || ''),
+      previewUrl: String(match.preview_url || match.thumbnail_url || match.preview || (index === 0 ? fallback.previewUrl : '') || ''),
+      ordinal: Number(match.ordinal ?? match.image_ordinal ?? match.index ?? (index === 0 ? fallback.ordinal : 0) ?? 0),
+      score: firstFinderScore(match.score, match.similarity, match.combined_score, index === 0 ? fallback.score : null),
+      exactScore: firstFinderScore(match.exact_score, match.duplicate_score, match.phash_score, breakdown.exact, breakdown.exact_score, index === 0 ? fallback.exactScore : null, isExact ? 1 : null),
+      poseScore: firstFinderScore(match.pose_score, match.keypoint_score, match.geometry_score, breakdown.pose, breakdown.pose_score, index === 0 ? fallback.poseScore : null),
+      appearanceScore: firstFinderScore(match.appearance_score, match.visual_score, match.dino_score, breakdown.appearance, breakdown.appearance_score, index === 0 ? fallback.appearanceScore : null),
+      personCount: Math.max(0, Number(match.person_count ?? match.people_count ?? match.persons_detected ?? (index === 0 ? fallback.personCount : 0) ?? 0) || 0),
+      overlayUrl: String(match.skeleton_overlay_url || match.pose_overlay_url || match.overlay_url || (index === 0 ? fallback.overlayUrl : '') || ''),
+      poseReliable: Boolean(match.pose_reliable ?? match.poseReliable ?? (index === 0 ? fallback.poseReliable : false)),
+      matchType: String(match.match_type || match.method || (index === 0 ? fallback.matchType : '') || '').toLowerCase(),
+      isExact
+    };
+  }
+
   function normalizeFinderResult(item, index = 0) {
     const source = item?.gallery && typeof item.gallery === 'object' ? item.gallery : {};
     const best = item?.best_match && typeof item.best_match === 'object' ? item.best_match : {};
+    const breakdown = item?.score_breakdown && typeof item.score_breakdown === 'object'
+      ? item.score_breakdown
+      : item?.scores && typeof item.scores === 'object' ? item.scores : {};
     const galleryUrl = item?.gallery_url || source.url || source.gallery_url || '';
     const galleryId = item?.gallery_id ?? source.gallery_id ?? source.id ?? encodeFinderGalleryId(galleryUrl);
+    const isExact = Boolean(item?.is_exact ?? item?.exact_match ?? best.is_exact ?? best.exact_match);
+    const fallback = {
+      imageUrl: item?.best_image_url || best.image_url || best.full_url || best.url || '',
+      previewUrl: item?.best_preview_url || best.preview_url || best.thumbnail_url || source.thumbnail_url || source.thumbnail || '',
+      ordinal: Number(item?.best_ordinal ?? best.ordinal ?? best.image_ordinal ?? 0),
+      score: firstFinderScore(item?.score, item?.similarity, item?.combined_score, best.score, best.similarity, best.combined_score),
+      exactScore: firstFinderScore(item?.exact_score, item?.duplicate_score, item?.phash_score, breakdown.exact, breakdown.exact_score, best.exact_score, isExact ? 1 : null),
+      poseScore: firstFinderScore(item?.pose_score, item?.keypoint_score, item?.geometry_score, breakdown.pose, breakdown.pose_score, best.pose_score, best.keypoint_score),
+      appearanceScore: firstFinderScore(item?.appearance_score, item?.visual_score, item?.dino_score, breakdown.appearance, breakdown.appearance_score, best.appearance_score, best.visual_score),
+      personCount: Math.max(0, Number(item?.person_count ?? item?.people_count ?? item?.persons_detected ?? best.person_count ?? best.people_count ?? 0) || 0),
+      overlayUrl: item?.skeleton_overlay_url || item?.pose_overlay_url || item?.overlay_url || best.skeleton_overlay_url || best.pose_overlay_url || best.overlay_url || '',
+      poseReliable: Boolean(item?.pose_reliable ?? item?.poseReliable ?? best.pose_reliable ?? best.poseReliable),
+      matchType: String(item?.match_type || item?.method || best.match_type || best.method || '').toLowerCase(),
+      isExact
+    };
+    const matchCollections = [item?.matches, item?.top_matches, item?.best_matches, item?.candidate_matches, item?.candidates, item?.candidate_images];
+    const rawMatches = matchCollections.find(value => Array.isArray(value) && value.length) || [];
+    let matches = (rawMatches.length ? rawMatches : [best]).map((match, matchIndex) => normalizeFinderMatch(match, matchIndex, fallback));
+    matches = matches.filter(match => match.imageUrl || match.previewUrl || match.overlayUrl).sort((a, b) => a.rank - b.rank || (b.score ?? -1) - (a.score ?? -1)).slice(0, 3);
+    if (!matches.length && (fallback.imageUrl || fallback.previewUrl || fallback.overlayUrl)) matches = [normalizeFinderMatch({}, 0, fallback)];
+    const primaryMatch = matches[0] || normalizeFinderMatch({}, 0, fallback);
     const gallery = normalizeGallery({
       ...source,
       id: galleryId,
       gallery_id: galleryId,
       url: galleryUrl,
       title: item?.title || source.title || source.name || 'Untitled gallery',
-      thumbnail_url: item?.best_preview_url || best.preview_url || source.thumbnail_url || source.thumbnail || '',
+      thumbnail_url: primaryMatch.previewUrl || primaryMatch.imageUrl || source.thumbnail_url || source.thumbnail || '',
       image_count: item?.image_count ?? source.image_count ?? source.total_images ?? 0
     });
-    const score = Number(item?.score ?? item?.similarity ?? best.score ?? best.similarity ?? 0);
+    const score = firstFinderScore(item?.score, item?.similarity, item?.combined_score, primaryMatch.score, fallback.score) ?? 0;
+    const matchType = String(item?.match_type || item?.method || best.match_type || best.method || primaryMatch.matchType || (isExact ? 'exact' : '')).toLowerCase();
     return {
       ...gallery,
       key: item?.result_id ?? item?.id ?? galleryId,
       galleryId,
       rank: Number(item?.rank ?? index + 1),
-      score: Number.isFinite(score) ? Math.max(0, Math.min(1, score)) : 0,
+      score,
       review: normalizeFinderReview(item?.review ?? item?.review_status),
-      bestImageUrl: String(item?.best_image_url || best.image_url || best.url || ''),
-      bestPreviewUrl: String(item?.best_preview_url || best.preview_url || gallery.thumbnailUrl || ''),
-      bestOrdinal: Number(item?.best_ordinal ?? best.ordinal ?? best.image_ordinal ?? 0),
-      matchCount: Number(item?.images_scored ?? item?.match_count ?? item?.matching_images ?? item?.candidate_images ?? 1)
+      bestImageUrl: primaryMatch.imageUrl,
+      bestPreviewUrl: primaryMatch.previewUrl || gallery.thumbnailUrl,
+      bestOrdinal: primaryMatch.ordinal,
+      matches,
+      matchType,
+      isExact: isExact || primaryMatch.isExact || ['exact', 'duplicate', 'near_duplicate'].includes(matchType),
+      exactScore: firstFinderScore(fallback.exactScore, primaryMatch.exactScore),
+      poseScore: firstFinderScore(fallback.poseScore, primaryMatch.poseScore),
+      poseReliable: fallback.poseReliable || primaryMatch.poseReliable,
+      appearanceScore: firstFinderScore(fallback.appearanceScore, primaryMatch.appearanceScore),
+      personCount: fallback.personCount || primaryMatch.personCount,
+      hasOverlay: matches.some(match => Boolean(match.overlayUrl)),
+      matchCount: Number(item?.images_scored ?? item?.match_count ?? item?.matching_images ?? (Array.isArray(item?.candidate_images) ? item.candidate_images.length : item?.candidate_images) ?? 1)
     };
   }
 
@@ -1957,11 +2047,11 @@
   function renderFinderStatus() {
     const model = state.finderStatus;
     const card = $('#finder-model-card');
-    card.classList.toggle('is-ready', Boolean(model?.ready));
-    card.classList.toggle('is-error', Boolean(model && !model.ready));
+    card.classList.toggle('is-ready', Boolean(model?.ready && !model.error));
+    card.classList.toggle('is-error', Boolean(model && (!model.ready || model.error)));
     $('#finder-model-name').textContent = model?.name || 'Model unavailable';
     $('#finder-model-detail').textContent = model?.detail || 'Could not read model status';
-    $('#finder-model-state').textContent = model?.modelReady ? 'Ready' : model?.ready ? 'Available' : model ? model.status.replaceAll('_', ' ') : 'Offline';
+    $('#finder-model-state').textContent = model?.error ? 'Retry available' : model?.modelReady ? 'Ready' : model?.ready ? 'Available' : model ? model.status.replaceAll('_', ' ') : 'Offline';
     const root = model?.folderRoot;
     const normalizedRoot = root ? root.replace(/\/+$/, '') || '/' : '';
     const fullExample = normalizedRoot === '/' ? '/poses/matting-press' : `${normalizedRoot}/poses/matting-press`;
@@ -2005,6 +2095,80 @@
     $('#finder-filter-output').textContent = scan.minSimilarity.toFixed(2);
   }
 
+  function finderScoreLabel(score) {
+    return `${Math.round((normalizeFinderScore(score, 0) || 0) * 100)}%`;
+  }
+
+  function appendFinderMatchMedia(container, result) {
+    const matches = result.matches?.length ? result.matches : [{
+      rank: 1,
+      imageUrl: result.bestImageUrl,
+      previewUrl: result.bestPreviewUrl,
+      ordinal: result.bestOrdinal,
+      score: result.score,
+      personCount: result.personCount,
+      overlayUrl: ''
+    }];
+    container.classList.add(`has-${Math.min(3, Math.max(1, matches.length))}`);
+    matches.slice(0, 3).forEach((match, matchIndex) => {
+      const button = document.createElement('button');
+      button.className = 'finder-match finder-card-open';
+      button.type = 'button';
+      button.dataset.finderAction = 'open';
+      button.dataset.finderResult = String(result.key);
+      const ordinalCopy = match.ordinal ? `image ${match.ordinal}` : `candidate ${matchIndex + 1}`;
+      button.setAttribute('aria-label', `Open ${result.title}, ${ordinalCopy}`);
+      button.innerHTML = '<span class="image-placeholder"><svg><use href="#i-image"></use></svg></span><img class="finder-match-image" alt="" loading="lazy" decoding="async"><img class="finder-skeleton-overlay" alt="" loading="lazy" decoding="async" hidden><span class="finder-match-position"></span><span class="finder-match-score" hidden></span><span class="finder-match-ordinal"></span><span class="finder-match-people" hidden></span><span class="finder-match-open"><svg><use href="#i-maximize"></use></svg></span>';
+      loadImage($('.finder-match-image', button), match.previewUrl || match.imageUrl, `${result.title}, ${ordinalCopy}`);
+      $('.finder-match-position', button).textContent = `#${matchIndex + 1}`;
+      const matchScore = firstFinderScore(match.score, matchIndex === 0 ? result.score : null);
+      const scoreBadge = $('.finder-match-score', button);
+      scoreBadge.hidden = matchScore === null;
+      if (matchScore !== null) scoreBadge.textContent = finderScoreLabel(matchScore);
+      $('.finder-match-ordinal', button).textContent = match.ordinal ? `Image ${String(match.ordinal).padStart(2, '0')}` : 'Candidate';
+      const peopleBadge = $('.finder-match-people', button);
+      peopleBadge.hidden = !match.personCount;
+      if (match.personCount) peopleBadge.textContent = `${match.personCount} ${match.personCount === 1 ? 'person' : 'people'}`;
+      const overlayUrl = safeUrl(match.overlayUrl);
+      if (overlayUrl) {
+        const overlay = $('.finder-skeleton-overlay', button);
+        overlay.hidden = false;
+        overlay.src = overlayUrl;
+        overlay.addEventListener('error', () => {
+          overlay.hidden = true;
+          overlay.removeAttribute('src');
+        }, { once: true });
+      }
+      container.append(button);
+    });
+  }
+
+  function renderFinderDiagnostics(card, result) {
+    const breakdown = $('.finder-score-breakdown', card);
+    const scores = [
+      ['exact', 'Exact', result.exactScore],
+      ['pose', 'Pose', result.poseScore],
+      ['appearance', 'Appearance', result.appearanceScore]
+    ];
+    scores.forEach(([kind, label, score]) => {
+      if (score === null || score === undefined) return;
+      const badge = document.createElement('span');
+      const displayLabel = kind === 'pose' && !result.poseReliable ? 'Pose (low)' : label;
+      badge.className = `finder-score-chip is-${kind}`;
+      badge.title = `${displayLabel} score ${finderScoreLabel(score)}`;
+      badge.innerHTML = '<i></i><span></span><b></b>';
+      $('span', badge).textContent = displayLabel;
+      $('b', badge).textContent = finderScoreLabel(score);
+      breakdown.append(badge);
+    });
+    const people = $('.finder-person-count', card);
+    people.hidden = !result.personCount;
+    if (result.personCount) $('b', people).textContent = `${result.personCount} ${result.personCount === 1 ? 'person' : 'people'}`;
+    const overlay = $('.finder-overlay-toggle', card);
+    overlay.hidden = !result.hasOverlay;
+    $('.finder-diagnostic-toolbar', card).hidden = !breakdown.children.length && !result.personCount && !result.hasOverlay;
+  }
+
   function renderFinderResults() {
     const ranked = [...state.finderResults].sort((a, b) => b.score - a.score || a.rank - b.rank);
     const counts = {
@@ -2034,13 +2198,23 @@
       card.classList.toggle('is-explore', result.score < 0.70);
       card.classList.toggle('is-accepted', result.review === 'accepted');
       card.classList.toggle('is-rejected', result.review === 'rejected');
-      loadImage($('.card-image img', card), result.bestPreviewUrl, `${result.title}, best matching image`);
-      $('.finder-rank', card).textContent = `#${String(result.rank || ranked.indexOf(result) + 1).padStart(2, '0')}`;
-      $('.finder-similarity', card).textContent = `${result.score.toFixed(2)} similarity`;
-      $('.finder-ordinal', card).textContent = result.bestOrdinal ? `Image ${String(result.bestOrdinal).padStart(2, '0')}` : 'Best image';
+      appendFinderMatchMedia($('.finder-match-gallery', card), result);
+      $('.finder-rank', card).textContent = `#${String(ranked.indexOf(result) + 1).padStart(2, '0')}`;
+      $('.finder-similarity', card).textContent = `${finderScoreLabel(result.score)} match`;
+      const matchKind = $('.finder-match-kind', card);
+      const kindCopy = result.isExact
+        ? 'Exact image'
+        : result.matchType === 'pose'
+          ? 'Pose-assisted'
+          : result.poseScore !== null && result.poseScore !== undefined && !result.poseReliable
+            ? 'Appearance · pose uncertain'
+            : result.appearanceScore !== null && result.appearanceScore !== undefined ? 'Appearance' : '';
+      matchKind.hidden = !kindCopy;
+      matchKind.textContent = kindCopy;
       $('.finder-card-title', card).textContent = result.title;
       const matchCopy = `${formatNumber(result.matchCount)} ${result.matchCount === 1 ? 'image' : 'images'} compared`;
       $('.finder-card-copy p', card).textContent = `${matchCopy}${result.imageCount ? ` · ${formatNumber(result.imageCount)} total` : ''}`;
+      renderFinderDiagnostics(card, result);
       $$('.finder-card-open', card).forEach(button => {
         button.dataset.finderAction = 'open';
         button.dataset.finderResult = String(result.key);
@@ -2361,7 +2535,13 @@
           title: updated.title === 'Untitled gallery' ? result.title : updated.title,
           bestImageUrl: updated.bestImageUrl || result.bestImageUrl,
           bestPreviewUrl: updated.bestPreviewUrl || result.bestPreviewUrl,
-          imageCount: updated.imageCount || result.imageCount
+          imageCount: updated.imageCount || result.imageCount,
+          matches: updated.matches?.length ? updated.matches : result.matches,
+          exactScore: updated.exactScore ?? result.exactScore,
+          poseScore: updated.poseScore ?? result.poseScore,
+          appearanceScore: updated.appearanceScore ?? result.appearanceScore,
+          personCount: updated.personCount || result.personCount,
+          hasOverlay: updated.hasOverlay || result.hasOverlay
         };
       }
       recountFinderReviews();
@@ -2401,7 +2581,11 @@
       },
       mode: 'pose',
       poseTag: finderPoseTagForScan(),
-      suggestions: [{ imageUrl: result.bestImageUrl, ordinal: result.bestOrdinal, score: result.score }]
+      suggestions: (result.matches?.length ? result.matches : [{ imageUrl: result.bestImageUrl, ordinal: result.bestOrdinal, score: result.score }]).map(match => ({
+        imageUrl: match.imageUrl,
+        ordinal: match.ordinal,
+        score: firstFinderScore(match.score, result.score) ?? 0
+      }))
     });
   }
 
@@ -2982,7 +3166,15 @@
       if (!button) return;
       const result = state.finderResults.find(item => String(item.key) === String(button.dataset.finderResult));
       if (!result) return;
-      if (button.dataset.finderAction === 'open') openFinderResult(result);
+      if (button.dataset.finderAction === 'overlay') {
+        const card = button.closest('.finder-card');
+        const visible = !card.classList.contains('is-overlay-visible');
+        card.classList.toggle('is-overlay-visible', visible);
+        button.setAttribute('aria-pressed', String(visible));
+        $('span', button).textContent = visible ? 'Hide overlay' : 'Pose overlay';
+        const use = $('use', button);
+        if (use) use.setAttribute('href', visible ? '#i-eye-off' : '#i-eye');
+      } else if (button.dataset.finderAction === 'open') openFinderResult(result);
       else reviewFinderResult(result, button.dataset.finderAction, button);
     });
     $('#active-profile').addEventListener('change', event => selectProfile(event.target.value));

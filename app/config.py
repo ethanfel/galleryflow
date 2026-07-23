@@ -28,6 +28,13 @@ def _optional_path_from_env(name: str) -> Path | None:
     return Path(value).expanduser().resolve() if value else None
 
 
+def _bool_from_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
 @dataclass(slots=True)
 class AppConfig:
     app_root: Path = APP_ROOT
@@ -55,6 +62,21 @@ class AppConfig:
     finder_model_path: Path | None = field(
         default_factory=lambda: _optional_path_from_env(
             "PORNPIC_WEBUI_FINDER_MODEL_PATH"
+        )
+    )
+    finder_pose_model_path: Path | None = field(
+        default_factory=lambda: _optional_path_from_env(
+            "PORNPIC_WEBUI_FINDER_POSE_MODEL_PATH"
+        )
+    )
+    finder_execution_provider: str = field(
+        default_factory=lambda: os.getenv(
+            "PORNPIC_WEBUI_FINDER_EXECUTION_PROVIDER", "auto"
+        ).strip().lower()
+    )
+    finder_pose_enabled: bool = field(
+        default_factory=lambda: _bool_from_env(
+            "PORNPIC_WEBUI_FINDER_POSE_ENABLED", True
         )
     )
     source_home: str = os.getenv(
@@ -91,6 +113,17 @@ class AppConfig:
         1_000_000,
         int(os.getenv("PORNPIC_WEBUI_FINDER_MAX_IMAGE_PIXELS", "40000000")),
     )
+    finder_cache_max_bytes: int = max(
+        1,
+        int(
+            os.getenv(
+                "PORNPIC_WEBUI_FINDER_CACHE_MAX_BYTES", str(2 * 1024 * 1024 * 1024)
+            )
+        ),
+    )
+    finder_cache_max_entries: int = max(
+        1, int(os.getenv("PORNPIC_WEBUI_FINDER_CACHE_MAX_ENTRIES", "50000"))
+    )
     max_image_bytes: int = max(
         1_000_000,
         int(os.getenv("PORNPIC_WEBUI_MAX_IMAGE_BYTES", str(80 * 1024 * 1024))),
@@ -108,6 +141,10 @@ class AppConfig:
     sqlite_vfs: str | None = field(default_factory=_sqlite_vfs)
 
     def __post_init__(self) -> None:
+        if self.finder_execution_provider not in {"auto", "cuda", "cpu"}:
+            raise ValueError(
+                "PORNPIC_WEBUI_FINDER_EXECUTION_PROVIDER must be auto, cuda, or cpu"
+            )
         if self.finder_examples_root is None:
             # Finder paths share the same server-side boundary as the sorter by
             # default.  This lets a user point Finder at any existing library
@@ -117,6 +154,10 @@ class AppConfig:
         if self.finder_model_path is None:
             self.finder_model_path = (
                 self.data_dir / "models" / "dinov2-small.onnx"
+            ).resolve()
+        if self.finder_pose_model_path is None:
+            self.finder_pose_model_path = (
+                self.data_dir / "models" / "rtmo-l.onnx"
             ).resolve()
 
     @property
@@ -142,8 +183,10 @@ class AppConfig:
         self.pose_root_path.mkdir(parents=True, exist_ok=True)
         assert self.finder_examples_root is not None
         assert self.finder_model_path is not None
+        assert self.finder_pose_model_path is not None
         self.finder_examples_root.mkdir(parents=True, exist_ok=True)
         self.finder_model_path.parent.mkdir(parents=True, exist_ok=True)
+        self.finder_pose_model_path.parent.mkdir(parents=True, exist_ok=True)
 
 
 config = AppConfig()

@@ -186,6 +186,15 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
         result = dict(item)
         preview = result.pop("best_preview_remote_url", "")
         thumbnail = result.pop("thumbnail_remote_url", "")
+        top_matches: list[dict] = []
+        for item_match in result.get("top_matches") or []:
+            match = dict(item_match)
+            match_preview = match.pop("preview_remote_url", "")
+            match["preview_url"] = (
+                media_url(match_preview) if match_preview else None
+            )
+            top_matches.append(match)
+        result["top_matches"] = top_matches
         result["best_preview_url"] = media_url(preview) if preview else None
         result["thumbnail_url"] = media_url(thumbnail) if thumbnail else None
         result["gallery_id"] = encode_gallery_id(result["gallery_url"])

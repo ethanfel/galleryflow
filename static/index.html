@@ -549,10 +549,21 @@
 
   <template id="finder-card-template">
     <article class="gallery-card finder-card">
-      <button class="finder-card-open finder-card-media" type="button" aria-label="Open gallery">
-        <div class="card-image"><div class="image-placeholder"><svg><use href="#i-image"></use></svg></div><img alt="" loading="lazy" decoding="async"><span class="finder-rank"></span><span class="finder-similarity"></span><span class="finder-ordinal"></span><span class="card-open-hint">Open gallery <svg><use href="#i-arrow"></use></svg></span></div>
-      </button>
-      <div class="finder-card-copy"><button class="finder-card-title finder-card-open" type="button"></button><p></p></div>
+      <header class="finder-card-head">
+        <span class="finder-rank"></span>
+        <span class="finder-match-kind" hidden></span>
+        <span class="finder-similarity"></span>
+      </header>
+      <div class="finder-match-gallery" aria-label="Top matching images"></div>
+      <div class="finder-card-copy">
+        <button class="finder-card-title finder-card-open" type="button"></button>
+        <p></p>
+        <div class="finder-diagnostic-toolbar" hidden>
+          <div class="finder-score-breakdown" aria-label="Match score breakdown"></div>
+          <span class="finder-person-count" hidden><svg><use href="#i-layers"></use></svg><b></b></span>
+          <button class="finder-overlay-toggle" type="button" data-finder-action="overlay" aria-pressed="false" hidden><svg><use href="#i-eye"></use></svg><span>Pose overlay</span></button>
+        </div>
+      </div>
       <div class="finder-card-actions">
         <button class="button finder-accept" type="button" data-finder-action="accepted"><svg><use href="#i-check"></use></svg><span>Accept</span></button>
         <button class="button finder-reject" type="button" data-finder-action="rejected"><svg><use href="#i-close"></use></svg><span>Reject</span></button>

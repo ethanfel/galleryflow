@@ -7,7 +7,7 @@ A self-contained, server-side PornPics gallery browser and downloader. The compl
 - Browse the current PornPics catalog, search, paste a category URL, and keep loading additional pages into one portrait gallery grid.
 - Green complete, blue partial, and red ignored states, scoped correctly per profile.
 - Open original-resolution images in a full-screen lightbox with zoom and keyboard navigation, then download a whole gallery or select individual images in their original order.
-- Find hard-to-name poses from your own examples: a local DINOv2 vision model scans complete galleries, flags the gallery when any image is similar, and ranks the results by their best matching image.
+- Find hard-to-name poses from your own examples with a hybrid matcher: spatial DINOv2 features handle crops and appearance, RTMO-L adds confidence-aware multi-person geometry, and perceptual hashes recognize true source-image matches.
 - Build training-ready pose pairs while browsing: assign one solo, couple, or group control to each target, add a pose tag, and export matched target/control folders with shared IDs.
 - Automatic profile folders with safe, server-controlled paths.
 - Persistent queue with live progress, cancellation, per-image results, retries for transient failures, and restart recovery.
@@ -65,6 +65,28 @@ docker run -d --name galleryflow --restart unless-stopped \
   ghcr.io/ethanfel/galleryflow:latest
 ```
 
+For an NVIDIA GPU, use the CUDA image. The NVIDIA Container Toolkit must already make `--gpus all` available to Docker:
+
+```bash
+docker pull ghcr.io/ethanfel/galleryflow:gpu
+docker run -d --name galleryflow --restart unless-stopped \
+  --gpus all \
+  -p 8100:8099 \
+  -v galleryflow-data:/data \
+  -v /path/to/existing/library:/library \
+  -e PORNPIC_WEBUI_SORT_ROOT=/library \
+  -e PORNPIC_WEBUI_FINDER_EXECUTION_PROVIDER=auto \
+  ghcr.io/ethanfel/galleryflow:gpu
+```
+
+From a checkout, the equivalent Compose command layers the GPU override over the normal ports, volumes, and environment:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+```
+
+`auto` prefers CUDA for both DINOv2 and RTMO-L and falls back to CPU if CUDA cannot initialize. Use `cuda` when a missing GPU should be treated as an error, or `cpu` to force CPU inference.
+
 State and downloads are stored in the Docker-managed `galleryflow-data` volume. To place the library directly on another disk, replace that volume with a bind mount such as `/path/to/library:/data` and make the host directory writable by container UID/GID `10001:10001`.
 
 An existing sort library can instead be mounted separately:
@@ -110,9 +132,11 @@ You can paste either `sorted_outpaint/mating press - backview/selected_target_up
 
 If you previously added `PORNPIC_WEBUI_FINDER_EXAMPLES_ROOT=/references` or pointed it at a special examples folder, remove that variable once so Finder defaults to the complete `PORNPIC_WEBUI_SORT_ROOT`. Keeping the variable intentionally confines Finder to that older root.
 
-There must be no space after either bind-mount colon. The first scan needs outbound HTTPS access to Hugging Face and downloads the pinned 85 MB DINOv2-S ONNX model into `/data/models`, where the persistent data mount caches it for later scans. For an offline container, pre-provision the verified model at `/data/models/dinov2-small.onnx` instead.
+There must be no space after either bind-mount colon. The first scan needs outbound HTTPS access and downloads the pinned 85 MB DINOv2-S model plus the pinned 168 MB RTMO-L model into `/data/models`; the persistent data mount caches both. For an offline container, pre-provision the verified files at `/data/models/dinov2-small.onnx` and `/data/models/rtmo-l.onnx`.
 
 Finder uses the FP32 [DINOv2-S ONNX conversion](https://huggingface.co/onnx-community/dinov2-small-ONNX/tree/08c606e3123472a388efa59181b677d428f69bbd/onnx) pinned at revision `08c606e3123472a388efa59181b677d428f69bbd` and verifies SHA-256 `6266c3cd72db6953cecdcbfeab9422a9f783d96f1a4e296ba70ffbac43b54a18` before loading it. The upstream model is Apache-2.0 licensed; see the [Meta DINOv2 model card](https://github.com/facebookresearch/dinov2/blob/main/MODEL_CARD.md).
+
+Pose geometry uses OpenMMLab RTMO-L body7's official ONNX SDK artifact. GalleryFlow pins and verifies both the archive and its exact `end2end.onnx` member before publishing the model into the persistent cache; zip paths, links, oversized members, and hash mismatches are rejected.
 
 ## Import the old history
 
@@ -172,11 +196,13 @@ Gallery URLs and output paths are validated, symlinks and path traversal are rej
 
 Open **Finder**, type or paste the path of any example folder inside the configured library root, select or create its pose tag, and enter the PornPics page from which scanning should begin. Both library-relative paths and full container paths under that root are accepted; spaces and hyphens are preserved. The page can be the home page, a search result, a category, or another supported browse page. Set the number of pages and the minimum similarity, then start the background scan.
 
-Finder opens every listed gallery and compares all of its preview images against all examples in the selected folder, including mirrored examples. A gallery is flagged when at least one image crosses the threshold. Its score is exactly the best individual-image cosine similarity; images from a gallery are not averaged together. Scores are useful for ranking candidates but are not statistical probabilities.
+Finder opens every listed gallery and compares every preview image against all examples, including mirrored examples. Spatial DINOv2 patch pyramids preserve coarse image layout and remain useful when bodies overlap or extend beyond the frame. RTMO-L compares visible joints, mirror variants, person assignments, and group layout only when its detections have enough coverage; uncertain keypoints cannot overrule the visual match. A strict perceptual-hash lane gives priority to a resized or recompressed copy of an example, but does not treat merely similar scenes as duplicates.
+
+A gallery is flagged when its best image crosses the threshold, but its three strongest images are retained for review. Each result shows appearance, pose, and exact-match diagnostics, detected person count, and a skeleton overlay when pose output is reliable. Scores are calibrated ranking signals, not statistical probabilities, and images within a gallery are never averaged together.
 
 Results remain ordinary galleries. **Open gallery** loads the complete gallery in Pose dataset mode, checks and highlights the matching image, and fills in the pose tag. You can then find the related solo, couple, or group control image in the same gallery and explicitly apply or export the pair. Accepting or rejecting a Finder suggestion only changes that scan's review state; it never downloads, globally ignores, or silently tags a gallery.
 
-Scans and results live in SQLite and survive browser or container restarts. They can be paused, resumed, canceled, and filtered by review state or similarity. Image embeddings are cached, so rescanning an unchanged image avoids another model pass.
+Scans and results live in SQLite and survive browser or container restarts. They can be paused, resumed, canceled, and filtered by review state or similarity. Versioned spatial descriptors, hashes, and pose analyses are cached, so rescanning unchanged images avoids repeating model work while a matcher/model upgrade automatically gets a fresh cache namespace. Obsolete model namespaces are removed when a model is prepared, and the least-recently-used descriptor cache is bounded to 50,000 images or 2 GiB by default.
 
 ## Configuration
 
@@ -190,6 +216,9 @@ Environment variables:
 | `PORNPIC_WEBUI_POSE_ROOT` | `<sort-root>/pose_pairs` | Training-ready pose-pair datasets |
 | `PORNPIC_WEBUI_FINDER_EXAMPLES_ROOT` | sort root | Optional override for the highest folder Finder may read; normally unnecessary |
 | `PORNPIC_WEBUI_FINDER_MODEL_PATH` | `<data-dir>/models/dinov2-small.onnx` | Cached or pre-provisioned DINOv2-S ONNX model |
+| `PORNPIC_WEBUI_FINDER_POSE_MODEL_PATH` | `<data-dir>/models/rtmo-l.onnx` | Cached or pre-provisioned RTMO-L ONNX model |
+| `PORNPIC_WEBUI_FINDER_EXECUTION_PROVIDER` | `auto` | `auto`, `cuda`, or `cpu` inference provider preference |
+| `PORNPIC_WEBUI_FINDER_POSE_ENABLED` | `true` | Enable RTMO pose diagnostics and geometry scoring |
 | `PORNPIC_WEBUI_FINDER_WORKERS` | `1` | Concurrent background Finder scans (maximum 2) |
 | `PORNPIC_WEBUI_FINDER_NETWORK_WORKERS` | `3` | Concurrent Finder preview requests (maximum 8) |
 | `PORNPIC_WEBUI_FINDER_REQUEST_DELAY` | `0.15` | Minimum delay between Finder network requests in seconds |
@@ -197,6 +226,8 @@ Environment variables:
 | `PORNPIC_WEBUI_FINDER_MAX_GALLERY_IMAGES` | `2000` | Maximum images scored in one source gallery |
 | `PORNPIC_WEBUI_FINDER_MAX_IMAGE_BYTES` | `12582912` | Per-image Finder byte ceiling |
 | `PORNPIC_WEBUI_FINDER_MAX_IMAGE_PIXELS` | `40000000` | Per-image Finder decoded-pixel ceiling |
+| `PORNPIC_WEBUI_FINDER_CACHE_MAX_BYTES` | `2147483648` | Maximum persistent descriptor-cache bytes before LRU pruning |
+| `PORNPIC_WEBUI_FINDER_CACHE_MAX_ENTRIES` | `50000` | Maximum persistent descriptor-cache entries before LRU pruning |
 | `PORNPIC_WEBUI_JOB_WORKERS` | `2` | Concurrent gallery jobs |
 | `PORNPIC_WEBUI_IMAGE_WORKERS` | `6` | Global concurrent image requests |
 | `PORNPIC_WEBUI_REQUEST_TIMEOUT` | `25` | Browse timeout in seconds |
@@ -213,7 +244,8 @@ Concurrency and theme can also be adjusted in the WebUI. A changed gallery-worke
 data/
 ├── pornpic_webui.sqlite3
 ├── models/
-│   └── dinov2-small.onnx
+│   ├── dinov2-small.onnx
+│   └── rtmo-l.onnx
 └── downloads/
     ├── pose_pairs/
     │   └── <pose-slug>/
