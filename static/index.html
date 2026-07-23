@@ -216,10 +216,26 @@
             </header>
 
             <div class="finder-progress-wrap" id="finder-progress-wrap" hidden>
-              <div class="finder-progress-copy"><span><b id="finder-pages-scanned">0</b> of <b id="finder-pages-total">0</b> pages</span><span id="finder-progress-state">Preparing…</span></div>
+              <div class="finder-progress-copy">
+                <span>
+                  <span id="finder-pages-budget"><b id="finder-pages-scanned">0</b> of <b id="finder-pages-total">0</b> pages</span>
+                  <span id="finder-pages-exhausted" hidden>Source exhausted after <b id="finder-pages-exhausted-count">0</b> <span id="finder-pages-exhausted-unit">pages</span></span>
+                </span>
+                <span id="finder-progress-state">Preparing…</span>
+              </div>
               <div class="sort-progress finder-progress" role="progressbar" aria-label="Finder scan progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="finder-progress-bar"></span></div>
               <div class="finder-progress-stats"><span><b id="finder-galleries-scanned">0</b> galleries</span><i></i><span><b id="finder-images-scanned">0</b> images</span><i></i><span><b id="finder-candidates-found">0</b> candidates</span></div>
               <p class="finder-scan-error" id="finder-scan-error" hidden></p>
+              <div class="finder-continuation finder-extend" id="finder-extend" hidden>
+                <span class="finder-extend-icon" aria-hidden="true"><svg><use href="#i-plus"></use></svg></span>
+                <span class="finder-extend-copy"><strong>Continue exploring</strong><span id="finder-extend-summary">5 pages → 10 pages</span></span>
+                <label class="finder-extend-pages"><span>More pages</span><input id="finder-extend-pages" type="number" min="1" max="50" step="1" value="5" inputmode="numeric" aria-label="Additional pages to scan" aria-describedby="finder-extend-summary"></label>
+                <button class="button button-primary finder-extend-button" id="finder-extend-button" type="button" aria-describedby="finder-extend-summary"><svg><use href="#i-arrow"></use></svg><span>Extend search</span></button>
+              </div>
+              <div class="finder-limit-note" id="finder-limit-note" role="status" hidden>
+                <svg aria-hidden="true"><use href="#i-info"></use></svg>
+                <span><strong>500-page limit reached</strong><span>This scan cannot be extended further.</span></span>
+              </div>
             </div>
 
             <div class="finder-welcome" id="finder-welcome">

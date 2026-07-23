@@ -134,6 +134,43 @@ class PornPicsScraper:
         except ValueError:
             return None
 
+    @staticmethod
+    def _infinite_scroll_url(
+        soup: BeautifulSoup, base_url: str, item_count: int
+    ) -> str | None:
+        """Build the cursor used by PornPics category/tag infinite scrolling.
+
+        Those pages render their first 20 galleries in HTML and fetch later
+        batches from the same path as JSON using ``offset`` and ``limit``.
+        They do not expose a conventional ``rel=next`` link.
+        """
+        if item_count <= 0:
+            return None
+        scripts = "\n".join(
+            script.get_text(" ", strip=False) for script in soup.select("script")
+        )
+        page_type = re.search(
+            r"\bPP_PAGE_TYPE\s*=\s*['\"]"
+            r"(category_rotator_maps|tag_rotator_maps)['\"]",
+            scripts,
+        )
+        if not page_type:
+            return None
+        parts = urlsplit(base_url)
+        # PornPics' category strategy starts its JSON cursor at 20 even when
+        # one rendered card is filtered locally (for example, an ad or a
+        # thumbnail from an unapproved media host). It also deliberately drops
+        # the original page query and sends only its cursor parameters.
+        params = {"offset": "20", "limit": "20"}
+        try:
+            return validate_source_url(
+                urlunsplit(
+                    (parts.scheme, parts.netloc, parts.path, urlencode(params), "")
+                )
+            )
+        except ValueError:
+            return None
+
     async def browse(
         self, *, url: str | None = None, query: str | None = None, page: int = 1
     ) -> dict:
@@ -221,9 +258,9 @@ class PornPicsScraper:
             return {
                 "items": items,
                 "source_url": fetched.url,
-                "next_url": with_offset(offset + len(payload))
-                if len(payload) >= limit
-                else None,
+                # The site's rotator advances fixed-size windows and declares
+                # exhaustion only when the endpoint returns an empty array.
+                "next_url": with_offset(offset + limit) if payload else None,
                 "previous_url": with_offset(offset - limit) if offset > 0 else None,
             }
 
@@ -324,10 +361,14 @@ class PornPicsScraper:
                         }
                     )
 
+        next_url = self._navigation_url(soup, fetched.url, "next")
+        if not next_url:
+            next_url = self._infinite_scroll_url(soup, fetched.url, len(items))
+
         return {
             "items": items,
             "source_url": fetched.url,
-            "next_url": self._navigation_url(soup, fetched.url, "next"),
+            "next_url": next_url,
             "previous_url": self._navigation_url(soup, fetched.url, "prev"),
         }
 

@@ -78,6 +78,10 @@ class FinderScanCreate(BaseModel):
     minimum_score: float = Field(default=0.7, ge=0, le=1)
 
 
+class FinderScanExtend(BaseModel):
+    additional_pages: int = Field(ge=1, le=50, strict=True)
+
+
 class FinderReviewPatch(BaseModel):
     review: Literal["pending", "accepted", "rejected"]
 

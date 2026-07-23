@@ -36,6 +36,8 @@ ANALYZER_VERSION = (
     "hybrid-spatial-pyramid-v1+rtmo-l-geometry-v1+phash64-gate-v1"
 )
 EXACT_HASH_MAX_DISTANCE = 8
+MAX_SCAN_PAGES = 500
+MAX_EXTEND_PAGES = 50
 
 try:
     from .vision import perceptual_hash_bytes as _perceptual_hash_bytes
@@ -616,6 +618,7 @@ class FinderService:
         scan["cancel_requested"] = bool(scan["cancel_requested"])
         scan["pause_requested"] = bool(scan["pause_requested"])
         scan["reference_ready"] = bool(scan["reference_ready"])
+        scan["has_next_page"] = bool(scan.get("next_url"))
         if scan["status"] in {"completed", "completed_with_errors"}:
             scan["progress"] = 100.0
         else:
@@ -787,6 +790,95 @@ class FinderService:
             finished_at=None,
         )
         self.queue.put_nowait(scan_id)
+        scan = self.get_scan(scan_id) or {}
+        self._publish(scan, force=True)
+        return scan
+
+    def extend(self, scan_id: str, *, additional_pages: int) -> dict[str, Any]:
+        """Extend a scan from its durable pagination cursor.
+
+        Completed scans are queued again. Active scans observe the larger limit
+        on their next loop iteration, while paused scans intentionally remain
+        paused until the user resumes them.
+        """
+
+        if (
+            isinstance(additional_pages, bool)
+            or not isinstance(additional_pages, int)
+            or not 1 <= additional_pages <= MAX_EXTEND_PAGES
+        ):
+            raise ValueError(
+                f"Additional pages must be between 1 and {MAX_EXTEND_PAGES}"
+            )
+        if not self._available:
+            raise FinderUnavailable(
+                self._prepare_error or "Finder vision support is unavailable"
+            )
+
+        enqueue = False
+        with self._lock, self.database.connect() as db:
+            row = db.execute(
+                """SELECT status, page_limit, pages_completed, next_url,
+                          cancel_requested, pause_requested
+                   FROM finder_scans WHERE id = ?""",
+                (scan_id,),
+            ).fetchone()
+            if not row:
+                raise FinderNotFound("Finder scan not found")
+
+            status = str(row["status"])
+            if bool(row["cancel_requested"]) or status in {"canceling", "canceled"}:
+                raise FinderConflict("A canceled Finder scan cannot be extended")
+            if status == "failed":
+                raise FinderConflict("A failed Finder scan cannot be extended")
+            if status not in {
+                "queued",
+                "preparing",
+                "scanning",
+                "pausing",
+                "paused",
+                "completed",
+                "completed_with_errors",
+            }:
+                raise FinderConflict(
+                    f"A Finder scan in the '{status}' state cannot be extended"
+                )
+            if not row["next_url"]:
+                raise FinderConflict(
+                    "This Finder scan exhausted the available source pages"
+                )
+
+            page_limit = int(row["page_limit"])
+            new_limit = page_limit + additional_pages
+            if new_limit > MAX_SCAN_PAGES:
+                raise ValueError(
+                    f"A Finder scan may contain at most {MAX_SCAN_PAGES} pages"
+                )
+
+            resume_completed = status in {"completed", "completed_with_errors"}
+            next_status = "queued" if resume_completed else status
+            if resume_completed:
+                enqueue = True
+
+            now = utc_now()
+            if resume_completed:
+                db.execute(
+                    """UPDATE finder_scans
+                       SET page_limit = ?, status = ?, finished_at = NULL,
+                           error = '', updated_at = ?
+                       WHERE id = ?""",
+                    (new_limit, next_status, now, scan_id),
+                )
+            else:
+                db.execute(
+                    """UPDATE finder_scans
+                       SET page_limit = ?, status = ?, updated_at = ?
+                       WHERE id = ?""",
+                    (new_limit, next_status, now, scan_id),
+                )
+
+        if enqueue:
+            self.queue.put_nowait(scan_id)
         scan = self.get_scan(scan_id) or {}
         self._publish(scan, force=True)
         return scan
@@ -1015,6 +1107,7 @@ class FinderService:
             "status",
             "pages_completed",
             "page_limit",
+            "has_next_page",
             "total_galleries",
             "processed_galleries",
             "processed_images",
@@ -1878,6 +1971,68 @@ class FinderService:
             "failed_galleries": int(row["failed"]),
         }
 
+    def _finalize_scan_if_done(self, scan_id: str) -> bool:
+        """Atomically finalize only when no extension has moved the limit.
+
+        The extension endpoint and this check share the service lock. This
+        closes the small race where a worker had observed its old limit just
+        before another request increased it.
+        """
+
+        with self._lock, self.database.connect() as db:
+            scan = db.execute(
+                """SELECT status, pages_completed, page_limit, next_url,
+                          cancel_requested, pause_requested
+                   FROM finder_scans WHERE id = ?""",
+                (scan_id,),
+            ).fetchone()
+            if not scan:
+                raise _FinderCanceled("Finder scan was deleted")
+            if (
+                bool(scan["cancel_requested"])
+                or bool(scan["pause_requested"])
+                or scan["status"] != "scanning"
+            ):
+                return False
+            if scan["next_url"] and int(scan["pages_completed"]) < int(
+                scan["page_limit"]
+            ):
+                return False
+
+            counts = db.execute(
+                """SELECT COUNT(*) AS processed,
+                          COALESCE(SUM(images_scored), 0) AS images,
+                          COALESCE(SUM(
+                              CASE WHEN status = 'failed' THEN 1 ELSE 0 END
+                          ), 0) AS failed
+                   FROM finder_results WHERE scan_id = ?""",
+                (scan_id,),
+            ).fetchone()
+            processed = int(counts["processed"])
+            images = int(counts["images"])
+            failed = int(counts["failed"])
+            status = "completed_with_errors" if failed else "completed"
+            now = utc_now()
+            updated = db.execute(
+                """UPDATE finder_scans
+                   SET status = ?, total_galleries = ?,
+                       processed_galleries = ?, processed_images = ?,
+                       failed_galleries = ?, finished_at = ?, updated_at = ?
+                   WHERE id = ? AND status = 'scanning'
+                     AND cancel_requested = 0 AND pause_requested = 0""",
+                (
+                    status,
+                    processed,
+                    processed,
+                    images,
+                    failed,
+                    now,
+                    now,
+                    scan_id,
+                ),
+            )
+            return bool(updated.rowcount)
+
     def _missing_on_page(self, scan_id: str, cards: list[dict]) -> int:
         keys = [gallery_key(card["url"]) for card in cards]
         if not keys:
@@ -2008,10 +2163,14 @@ class FinderService:
             if not current:
                 raise _FinderCanceled("Finder scan was deleted")
             if current["pages_completed"] >= current["page_limit"]:
-                break
+                if self._finalize_scan_if_done(scan["id"]):
+                    return
+                continue
             page_url = current.get("next_url")
             if not page_url:
-                break
+                if self._finalize_scan_if_done(scan["id"]):
+                    return
+                continue
             page_url = validate_source_url(page_url)
             await self._wait_for_request_slot()
             page_number = int(current["pages_completed"]) + 1
@@ -2075,16 +2234,5 @@ class FinderService:
                 next_url=next_url,
             )
             if not next_url:
-                break
-
-        counts = self._progress_counts(scan["id"])
-        status = (
-            "completed_with_errors" if counts["failed_galleries"] else "completed"
-        )
-        self._update_scan(
-            scan["id"],
-            status=status,
-            total_galleries=counts["processed_galleries"],
-            **counts,
-            finished_at=utc_now(),
-        )
+                if self._finalize_scan_if_done(scan["id"]):
+                    return

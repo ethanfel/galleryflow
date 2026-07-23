@@ -15,6 +15,32 @@ from app.scraper import PornPicsScraper
 
 async def check(download: bool = False) -> None:
     scraper = PornPicsScraper(AppConfig(request_timeout=20))
+    category = await scraper.browse(url="https://www.pornpics.com/hardcore/", page=1)
+    if not category["items"]:
+        raise RuntimeError("Live category returned no galleries")
+    if not category["next_url"] or "offset=20" not in category["next_url"]:
+        raise RuntimeError("Live category did not expose its JSON scroll cursor")
+    category_page_two = await scraper.browse(url=category["next_url"], page=2)
+    if not category_page_two["items"]:
+        raise RuntimeError("Live category page two returned no galleries")
+    category_first_keys = {item["key"] for item in category["items"]}
+    category_second_keys = {item["key"] for item in category_page_two["items"]}
+    if not category_second_keys - category_first_keys:
+        raise RuntimeError("Live category page two returned no new galleries")
+    if not category_page_two["next_url"] or "offset=40" not in category_page_two[
+        "next_url"
+    ]:
+        raise RuntimeError("Live category page two did not advance its JSON cursor")
+    category_page_three = await scraper.browse(
+        url=category_page_two["next_url"], page=3
+    )
+    if not category_page_three["items"]:
+        raise RuntimeError("Live category page three returned no galleries")
+    previous_category_keys = category_first_keys | category_second_keys
+    category_third_keys = {item["key"] for item in category_page_three["items"]}
+    if not category_third_keys - previous_category_keys:
+        raise RuntimeError("Live category page three returned no new galleries")
+
     listing = await scraper.browse(query="pov", page=1)
     if not listing["items"]:
         raise RuntimeError("Live search returned no galleries")
@@ -37,6 +63,9 @@ async def check(download: bool = False) -> None:
     ):
         raise RuntimeError("Pasted gallery URL did not resolve to one gallery card")
     result = {
+        "category_items": len(category["items"]),
+        "category_second_page_items": len(category_page_two["items"]),
+        "category_third_page_items": len(category_page_three["items"]),
         "search_items": len(listing["items"]),
         "second_page_items": len(second_page["items"]),
         "direct_gallery_items": len(direct_gallery["items"]),

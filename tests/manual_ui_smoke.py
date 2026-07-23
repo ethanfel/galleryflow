@@ -29,6 +29,7 @@ def build_visual_app(
     open_lightbox: bool = False,
     open_pose: bool = False,
     open_finder: bool = False,
+    finder_exhausted: bool = False,
 ):
     config = AppConfig(
         data_dir=temp_root / "data",
@@ -144,8 +145,11 @@ def build_visual_app(
         "pose_tag_id": 1,
         "pose_tag_label": "mating press - backview",
         "source_url": "https://www.pornpics.com/",
+        "next_url": None
+        if finder_exhausted
+        else "https://www.pornpics.com/?page=6",
         "page_limit": 5,
-        "pages_completed": 5,
+        "pages_completed": 3 if finder_exhausted else 5,
         "processed_galleries": 64,
         "processed_images": 1280,
         "candidate_count": 2,
@@ -279,12 +283,18 @@ def main() -> None:
     parser.add_argument("--lightbox", action="store_true")
     parser.add_argument("--pose", action="store_true")
     parser.add_argument("--finder", action="store_true")
+    parser.add_argument("--finder-exhausted", action="store_true")
     args = parser.parse_args()
+    finder_mode = args.finder or args.finder_exhausted
     suffix = (
-        "finder-mobile"
-        if args.finder and args.mobile
+        "finder-exhausted-mobile"
+        if args.finder_exhausted and args.mobile
+        else "finder-exhausted"
+        if args.finder_exhausted
+        else "finder-mobile"
+        if finder_mode and args.mobile
         else "finder"
-        if args.finder
+        if finder_mode
         else "pose-mobile"
         if args.pose and args.mobile
         else "pose"
@@ -322,7 +332,8 @@ def main() -> None:
                     open_gallery=args.gallery or args.lightbox or args.pose,
                     open_lightbox=args.lightbox,
                     open_pose=args.pose,
-                    open_finder=args.finder,
+                    open_finder=finder_mode,
+                    finder_exhausted=args.finder_exhausted,
                 ),
                 host="127.0.0.1",
                 port=18101,
@@ -359,7 +370,7 @@ def main() -> None:
                 f"--user-data-dir={Path(directory) / 'chrome-profile'}",
                 f"--window-size={viewport}",
                 f"--screenshot={output}",
-            f"http://127.0.0.1:18101/{'#finder' if args.finder else '#sort' if args.sort else ''}",
+                f"http://127.0.0.1:18101/{'#finder' if finder_mode else '#sort' if args.sort else ''}",
             ],
             check=True,
             timeout=45,

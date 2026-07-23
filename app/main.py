@@ -25,6 +25,7 @@ from .models import (
     DownloadCreate,
     FinderReviewPatch,
     FinderScanCreate,
+    FinderScanExtend,
     GalleryPatch,
     LegacyDownloadRequest,
     LegacyIgnoreRequest,
@@ -531,6 +532,15 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
     @app.post("/api/finder/scans/{scan_id}/resume")
     async def resume_finder_scan(scan_id: str) -> dict:
         return {"scan": finder.resume(scan_id)}
+
+    @app.post("/api/finder/scans/{scan_id}/extend", status_code=202)
+    async def extend_finder_scan(scan_id: str, payload: FinderScanExtend) -> dict:
+        return {
+            "scan": finder.extend(
+                scan_id,
+                additional_pages=payload.additional_pages,
+            )
+        }
 
     @app.delete("/api/finder/scans/{scan_id}")
     async def delete_finder_scan(scan_id: str) -> dict:

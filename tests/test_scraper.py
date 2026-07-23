@@ -33,6 +33,107 @@ async def test_json_search_preserves_order_and_builds_pagination(monkeypatch) ->
 
 
 @pytest.mark.asyncio
+async def test_short_json_batch_advances_fixed_window_and_empty_batch_stops(
+    monkeypatch,
+) -> None:
+    one_item = [
+        {
+            "g_url": "https://www.pornpics.com/galleries/one-10000001/",
+            "t_url_460": "https://cdni.pornpics.com/460/a/one.jpg",
+            "desc": "One",
+        }
+    ]
+    scraper = PornPicsScraper(AppConfig())
+    payload = one_item
+
+    async def fake_get(url: str) -> ScrapedPage:
+        return ScrapedPage(url, json.dumps(payload))
+
+    monkeypatch.setattr(scraper, "_get_html", fake_get)
+    source = "https://www.pornpics.com/hardcore/?offset=20&limit=20"
+    result = await scraper.browse(url=source, page=2)
+    assert "offset=40" in result["next_url"]
+
+    payload = []
+    exhausted = await scraper.browse(url=result["next_url"], page=3)
+    assert exhausted["items"] == []
+    assert exhausted["next_url"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "page_type", ["category_rotator_maps", "tag_rotator_maps"]
+)
+async def test_category_html_builds_infinite_scroll_json_cursor(
+    monkeypatch, page_type: str
+) -> None:
+    category_url = "https://www.pornpics.com/hardcore/?foo=discard-me"
+    html = f"""
+    <html><head><script>
+      var PP_PAGE_TYPE = '{page_type}';
+      var P_MAX = 100;
+      var P_CID = "245";
+    </script></head><body>
+      <ul id="tiles">
+        <li class="thumbwook">
+          <a class="rel-link"
+             href="https://www.pornpics.com/galleries/first-10000001/">
+            <img data-src="https://cdni.pornpics.com/460/a/first.jpg"
+                 alt="First gallery">
+          </a>
+        </li>
+        <li class="thumbwook">
+          <a class="rel-link"
+             href="https://www.pornpics.com/galleries/second-10000002/">
+            <img data-src="https://cdni.pornpics.com/460/a/second.jpg"
+                 alt="Second gallery">
+          </a>
+        </li>
+      </ul>
+    </body></html>
+    """
+    scraper = PornPicsScraper(AppConfig())
+
+    async def fake_get(_: str) -> ScrapedPage:
+        return ScrapedPage(category_url, html)
+
+    monkeypatch.setattr(scraper, "_get_html", fake_get)
+    result = await scraper.browse(url=category_url)
+
+    assert len(result["items"]) == 2
+    assert (
+        result["next_url"]
+        == "https://www.pornpics.com/hardcore/?offset=20&limit=20"
+    )
+
+
+@pytest.mark.asyncio
+async def test_regular_html_without_next_link_is_not_assumed_paginated(
+    monkeypatch,
+) -> None:
+    source_url = "https://www.pornpics.com/custom/"
+    html = """
+    <html><body><ul id="tiles">
+      <li class="thumbwook">
+        <a class="rel-link"
+           href="https://www.pornpics.com/galleries/only-10000001/">
+          <img src="https://cdni.pornpics.com/460/a/only.jpg" alt="Only">
+        </a>
+      </li>
+    </ul></body></html>
+    """
+    scraper = PornPicsScraper(AppConfig())
+
+    async def fake_get(_: str) -> ScrapedPage:
+        return ScrapedPage(source_url, html)
+
+    monkeypatch.setattr(scraper, "_get_html", fake_get)
+    result = await scraper.browse(url=source_url)
+
+    assert result["next_url"] is None
+
+
+@pytest.mark.asyncio
 async def test_current_gallery_markup_extracts_only_ordered_cdni_images(
     monkeypatch,
 ) -> None:

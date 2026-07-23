@@ -522,10 +522,32 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .finder-progress-wrap { padding: 12px 18px 13px; border-bottom: 1px solid var(--border); background: rgba(255,255,255,.012); }
 .finder-progress-copy { display: flex; margin-bottom: 7px; align-items: center; justify-content: space-between; color: var(--muted); font-size: 9px; }
 .finder-progress-copy b { color: var(--text-soft); }
+.finder-progress-wrap.is-source-exhausted .finder-progress-copy { color: var(--amber); }
+.finder-progress-wrap.is-source-exhausted .finder-progress-copy b { color: #ffd394; }
 .finder-progress-stats { display: flex; margin-top: 9px; gap: 8px; align-items: center; color: var(--muted); font-size: 8px; }
 .finder-progress-stats b { color: var(--text-soft); font-size: 9px; }
 .finder-progress-stats i { width: 3px; height: 3px; border-radius: 50%; background: var(--muted-2); }
 .finder-scan-error { margin: 9px 0 0; padding: 7px 9px; border-radius: 7px; background: var(--red-soft); color: #ff9ca1; font-size: 9px; }
+.finder-continuation { display: grid; min-height: 61px; margin-top: 12px; padding: 9px 10px; gap: 10px; align-items: center; border: 1px solid rgba(155,123,250,.2); border-radius: 11px; background: linear-gradient(100deg, rgba(155,123,250,.09), rgba(98,168,250,.035)); }
+.finder-continuation.is-unavailable { border-color: var(--border); background: rgba(255,255,255,.018); }
+.finder-extend { grid-template-columns: 34px minmax(130px, 1fr) auto auto; }
+.finder-extend-icon { display: grid; width: 34px; height: 34px; place-items: center; border-radius: 9px; background: rgba(155,123,250,.13); color: #c8baff; }
+.finder-extend-icon svg { width: 15px; height: 15px; }
+.finder-extend-copy { display: flex; min-width: 0; flex-direction: column; }
+.finder-extend-copy strong { color: var(--text-soft); font-size: 10px; font-weight: 680; }
+.finder-extend-copy span { margin-top: 1px; color: var(--muted); font-size: 8px; font-variant-numeric: tabular-nums; }
+.finder-extend-pages { display: flex; gap: 7px; align-items: center; color: var(--muted); font-size: 8px; white-space: nowrap; }
+.finder-extend-pages input { width: 58px; height: 34px; padding: 0 6px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); color: var(--text-soft); font-size: 10px; font-variant-numeric: tabular-nums; text-align: center; }
+.finder-extend-pages input:hover { border-color: var(--border-strong); }
+.finder-extend-pages input:focus { border-color: rgba(155,123,250,.5); }
+.finder-extend-button { min-height: 35px; padding-inline: 11px; font-size: 9px; white-space: nowrap; }
+.finder-extend-button svg { width: 13px; height: 13px; }
+.finder-continuation.is-unavailable .finder-extend-copy span { color: var(--amber); }
+.finder-limit-note { display: flex; min-height: 46px; margin-top: 12px; padding: 8px 10px; gap: 9px; align-items: center; border: 1px solid var(--border); border-radius: 10px; background: rgba(255,255,255,.018); color: var(--muted); }
+.finder-limit-note > svg { width: 15px; height: 15px; flex: none; color: var(--amber); }
+.finder-limit-note > span { display: flex; min-width: 0; flex-direction: column; }
+.finder-limit-note strong { color: var(--text-soft); font-size: 9px; }
+.finder-limit-note span span { margin-top: 1px; font-size: 8px; }
 .finder-welcome { display: flex; min-height: 585px; padding: 48px 22px; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
 .finder-welcome h3 { margin: 0 0 6px; font-size: 18px; }
 .finder-welcome > p { max-width: 430px; margin: 0; color: var(--muted); font-size: 11px; }
@@ -961,6 +983,10 @@ kbd { min-width: 30px; padding: 4px 8px; border: 1px solid var(--border-strong);
   .finder-results-header { padding-inline: 13px; }
   .finder-session-actions .button { width: 38px; padding: 0; }
   .finder-session-actions .button span { display: none; }
+  .finder-extend { grid-template-columns: 34px minmax(0, 1fr) auto; }
+  .finder-extend-pages { grid-row: 2; grid-column: 1 / 3; }
+  .finder-extend-button { grid-row: 2; grid-column: 3; }
+  .finder-progress-copy { gap: 8px; align-items: flex-start; }
   .finder-results-toolbar { gap: 10px; flex-direction: column; align-items: stretch; }
   .finder-review-tabs { width: 100%; }
   .finder-review-tabs button { min-width: 0; flex: 1; padding-inline: 6px; justify-content: center; font-size: 9px; }
