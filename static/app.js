@@ -66,6 +66,8 @@
     finderFolders: [],
     finderTags: [],
     finderStatus: null,
+    finderCorpus: null,
+    finderCorpusSupported: null,
     finderScans: [],
     finderScan: null,
     finderScanId: storage.get('finder-scan', ''),
@@ -390,6 +392,9 @@
     };
     source.addEventListener('finder', refreshFinderFromEvent);
     source.addEventListener('finder_scan', refreshFinderFromEvent);
+    const refreshFinderCorpusFromEvent = () => loadFinderCorpus({ quiet: true });
+    source.addEventListener('finder_corpus', refreshFinderCorpusFromEvent);
+    source.addEventListener('finder_index', refreshFinderCorpusFromEvent);
     source.addEventListener('settings', () => loadSettings());
   }
 
@@ -1807,6 +1812,55 @@
     };
   }
 
+  function optionalBoolean(value) {
+    if (value === undefined || value === null || value === '') return null;
+    if (typeof value === 'string') {
+      const normalized = value.trim().toLowerCase();
+      if (['false', '0', 'no', 'off'].includes(normalized)) return false;
+      if (['true', '1', 'yes', 'on'].includes(normalized)) return true;
+    }
+    return Boolean(value);
+  }
+
+  function finderCorpusCount(...values) {
+    for (const value of values) {
+      if (value === undefined || value === null || value === '' || typeof value === 'boolean') continue;
+      const number = Number(value);
+      if (Number.isFinite(number)) return Math.max(0, Math.round(number));
+    }
+    return 0;
+  }
+
+  function normalizeFinderCorpus(item) {
+    if (!item || typeof item !== 'object') return null;
+    const wrapped = item.corpus && typeof item.corpus === 'object'
+      ? item.corpus
+      : item.index && typeof item.index === 'object'
+        ? item.index
+        : item.finder?.corpus && typeof item.finder.corpus === 'object' ? item.finder.corpus : item;
+    const recognized = [
+      'galleries', 'gallery_count', 'images', 'image_count', 'complete',
+      'partial', 'ready', 'cache_entries', 'cache_bytes', 'storage_bytes'
+    ].some(key => wrapped[key] !== undefined);
+    if (!recognized) return null;
+    const galleries = finderCorpusCount(wrapped.galleries, wrapped.gallery_count, wrapped.indexed_galleries);
+    const images = finderCorpusCount(wrapped.images, wrapped.image_count, wrapped.indexed_images);
+    const complete = finderCorpusCount(wrapped.complete, wrapped.complete_galleries, wrapped.fully_indexed);
+    const partial = finderCorpusCount(wrapped.partial, wrapped.partial_galleries, wrapped.historic_partial);
+    const ready = finderCorpusCount(wrapped.ready, wrapped.ready_images, wrapped.embedded_images, wrapped.images_ready);
+    return {
+      galleries,
+      images,
+      complete,
+      partial,
+      ready,
+      cacheEntries: finderCorpusCount(wrapped.cache_entries, wrapped.cached_images, wrapped.entries),
+      cacheBytes: finderCorpusCount(wrapped.cache_bytes, wrapped.storage_bytes, wrapped.size_bytes, wrapped.bytes),
+      maxCacheEntries: finderCorpusCount(wrapped.max_cache_entries, wrapped.cache_entry_limit, wrapped.max_entries),
+      maxCacheBytes: finderCorpusCount(wrapped.max_cache_bytes, wrapped.cache_byte_limit, wrapped.max_bytes)
+    };
+  }
+
   function normalizeFinderStatus(item) {
     const data = item?.finder || item || {};
     const model = data.model && typeof data.model === 'object' ? data.model : {};
@@ -1844,7 +1898,8 @@
       name: String(data.model_name || model.name || model.label || data.name || String(data.model_path || '').split('/').pop() || 'Similarity model'),
       detail: details.join(' · ') || (modelReady ? 'Ready to compare images' : ready ? 'Model downloads automatically on the first scan' : 'Model unavailable'),
       defaultSourceUrl: String(data.default_source_url || data.source_url || ''),
-      folderRoot: String(data.folder_root || model.folder_root || '')
+      folderRoot: String(data.folder_root || model.folder_root || ''),
+      corpus: normalizeFinderCorpus(data.corpus || model.corpus)
     };
   }
 
@@ -1872,6 +1927,20 @@
     const rankingCurrent = scan.ranking_current === undefined
       ? rankingVersion === FINDER_RANKING_VERSION
       : Boolean(scan.ranking_current);
+    const scanCorpus = scan.corpus && typeof scan.corpus === 'object' ? scan.corpus : {};
+    const corpusSearchRaw = scan.corpus_search_complete
+      ?? progress.corpus_search_complete
+      ?? scanCorpus.search_complete
+      ?? scanCorpus.searchComplete;
+    const corpusImagesRaw = scan.corpus_images_scored
+      ?? progress.corpus_images_scored
+      ?? scanCorpus.images_scored;
+    const corpusGalleriesRaw = scan.corpus_galleries_scored
+      ?? progress.corpus_galleries_scored
+      ?? scanCorpus.galleries_scored;
+    const corpusProgressAvailable = corpusSearchRaw !== undefined
+      || corpusImagesRaw !== undefined
+      || corpusGalleriesRaw !== undefined;
     if (!Number.isFinite(percentage)) percentage = pagesTotal ? (pagesScanned / pagesTotal) * 100 : 0;
     if (percentage > 0 && percentage <= 1) percentage *= 100;
     const poseTag = scan.pose_tag && typeof scan.pose_tag === 'object' ? scan.pose_tag : {};
@@ -1889,6 +1958,10 @@
       hasNextPage,
       rankingVersion,
       rankingCurrent,
+      corpusProgressAvailable,
+      corpusSearchComplete: optionalBoolean(corpusSearchRaw),
+      corpusImagesScored: finderCorpusCount(corpusImagesRaw),
+      corpusGalleriesScored: finderCorpusCount(corpusGalleriesRaw),
       pages: Number(scan.page_limit ?? config.page_limit ?? pagesTotal),
       pagesScanned,
       galleriesScanned: Number(scan.processed_galleries ?? scan.galleries_scanned ?? progress.processed_galleries ?? progress.galleries_scanned ?? progress.galleries ?? 0),
@@ -2013,6 +2086,10 @@
     const score = firstFinderScore(item?.score, item?.similarity, item?.combined_score, primaryMatch.score, fallback.score) ?? 0;
     const rankingTier = normalizeFinderTier(item?.ranking_tier ?? item?.rank_tier, primaryMatch.rankingTier);
     const matchType = String(item?.match_type || item?.method || best.match_type || best.method || primaryMatch.matchType || finderTierType(rankingTier)).toLowerCase();
+    const origin = String(item?.origin || item?.result_origin || item?.source_origin || '').toLowerCase();
+    const onlineScanned = optionalBoolean(item?.online_scanned ?? item?.scanned_online ?? item?.live_scanned);
+    const indexedOnly = onlineScanned === false
+      || (onlineScanned !== true && ['corpus', 'index', 'indexed', 'local'].includes(origin));
     return {
       ...gallery,
       key: item?.result_id ?? item?.id ?? galleryId,
@@ -2033,6 +2110,9 @@
       appearanceScore: firstFinderScore(fallback.appearanceScore, primaryMatch.appearanceScore),
       personCount: fallback.personCount || primaryMatch.personCount,
       hasOverlay: matches.some(match => Boolean(match.overlayUrl)),
+      origin,
+      onlineScanned,
+      indexedOnly,
       matchCount: Number(item?.images_scored ?? item?.match_count ?? item?.matching_images ?? (Array.isArray(item?.candidate_images) ? item.candidate_images.length : item?.candidate_images) ?? 1)
     };
   }
@@ -2108,6 +2188,58 @@
     $('#finder-folder-hint').textContent = normalizedRoot
       ? `Use poses/matting-press relative to ${normalizedRoot}, or paste ${fullExample}. Existing folders are suggestions only.`
       : 'Use a library-relative path such as poses/matting-press, or paste the full container path. Existing folders are suggestions only.';
+  }
+
+  function renderFinderCorpus() {
+    const card = $('#finder-corpus-card');
+    const corpus = state.finderCorpus;
+    card.classList.remove('is-ready', 'is-building', 'is-unavailable');
+    const setCopy = (lead, detail) => {
+      const copy = $('#finder-corpus-copy');
+      const strong = document.createElement('strong');
+      strong.textContent = lead;
+      copy.replaceChildren(strong, document.createTextNode(` ${detail}`));
+    };
+    if (!corpus) {
+      card.classList.toggle('is-unavailable', state.finderCorpusSupported === false);
+      $('#finder-corpus-state').textContent = state.finderCorpusSupported === false ? 'Unavailable' : 'Checking';
+      ['finder-corpus-galleries', 'finder-corpus-ready', 'finder-corpus-images', 'finder-corpus-bytes', 'finder-corpus-cache-entries'].forEach(id => {
+        $(`#${id}`).textContent = '—';
+      });
+      $('#finder-corpus-coverage').hidden = true;
+      setCopy(
+        state.finderCorpusSupported === false ? 'Index status unavailable.' : 'Saved in /data.',
+        state.finderCorpusSupported === false
+          ? 'This server does not expose Local Gallery Index statistics.'
+          : 'Every new scan searches all indexed galleries first—not only the selected source—then explores that Source URL for more.'
+      );
+      return;
+    }
+    const hasIndex = corpus.galleries > 0 || corpus.images > 0;
+    const partialReady = hasIndex && corpus.ready < corpus.images;
+    card.classList.toggle('is-ready', hasIndex && !partialReady);
+    card.classList.toggle('is-building', partialReady || (!hasIndex && corpus.cacheEntries > 0));
+    $('#finder-corpus-state').textContent = hasIndex ? partialReady ? 'Partial' : 'Ready' : corpus.cacheEntries ? 'Cache saved' : 'Empty';
+    $('#finder-corpus-galleries').textContent = formatNumber(corpus.galleries);
+    $('#finder-corpus-ready').textContent = formatNumber(corpus.ready);
+    $('#finder-corpus-images').textContent = formatNumber(corpus.images);
+    $('#finder-corpus-bytes').textContent = formatBytes(corpus.cacheBytes);
+    $('#finder-corpus-cache-entries').textContent = formatNumber(corpus.cacheEntries);
+    const cacheStat = $('#finder-corpus-bytes').closest('span');
+    const cacheLimits = [];
+    if (corpus.maxCacheBytes) cacheLimits.push(`${formatBytes(corpus.cacheBytes)} of ${formatBytes(corpus.maxCacheBytes)}`);
+    if (corpus.maxCacheEntries) cacheLimits.push(`${formatNumber(corpus.cacheEntries)} of ${formatNumber(corpus.maxCacheEntries)} entries`);
+    cacheStat.title = cacheLimits.length ? `Descriptor cache: ${cacheLimits.join(' · ')}` : 'Descriptor cache usage';
+    $('#finder-corpus-complete').textContent = formatNumber(corpus.complete);
+    $('#finder-corpus-partial').textContent = formatNumber(corpus.partial);
+    $('#finder-corpus-partial-wrap').hidden = !corpus.partial;
+    $('#finder-corpus-coverage').hidden = !corpus.complete && !corpus.partial;
+    setCopy(
+      'Saved in /data.',
+      hasIndex
+        ? 'Every new scan searches all indexed galleries first—not only the selected source—then explores that Source URL for more.'
+        : 'Your first scan will build the index; later poses can search it before exploring their Source URL.'
+    );
   }
 
   function renderFinderScans() {
@@ -2275,9 +2407,11 @@
       card.classList.toggle('is-explore', result.score < 0.70);
       card.classList.toggle('is-accepted', result.review === 'accepted');
       card.classList.toggle('is-rejected', result.review === 'rejected');
+      card.classList.toggle('is-indexed', result.indexedOnly);
       appendFinderMatchMedia($('.finder-match-gallery', card), result);
       $('.finder-rank', card).textContent = `#${String(ranked.indexOf(result) + 1).padStart(2, '0')}`;
       $('.finder-similarity', card).textContent = finderEvidenceLabel(result);
+      $('.finder-indexed-badge', card).hidden = !result.indexedOnly;
       const matchKind = $('.finder-match-kind', card);
       const kindCopy = finderEvidenceKind(result);
       matchKind.hidden = !kindCopy;
@@ -2335,13 +2469,16 @@
     renderFinderFolders();
     renderFinderTags();
     renderFinderStatus();
+    renderFinderCorpus();
     renderFinderScans();
     const scan = state.finderScan;
     const hasScan = Boolean(scan?.id);
     const legacyRanking = hasScan && !scan.rankingCurrent;
+    const hasCorpusProgress = hasScan && Boolean(scan.corpusProgressAvailable);
     $('#finder-welcome').hidden = hasScan;
     $('#finder-results').hidden = !hasScan;
     $('#finder-progress-wrap').hidden = !hasScan;
+    $('#finder-local-progress').hidden = !hasCorpusProgress;
     $('#finder-pause').hidden = !finderScanIsRunning(scan);
     $('#finder-resume').hidden = scan?.status !== 'paused' || legacyRanking;
     $('#finder-cancel').hidden = !hasScan || finderScanIsTerminal(scan) || scan?.status === 'canceling';
@@ -2359,8 +2496,30 @@
     $('#finder-extend-button').title = unavailableTitle;
     if (!hasScan) {
       $('#finder-session-label').textContent = 'Configure a scan to begin';
+      $('#finder-source-progress-copy').textContent = 'Exploring the selected Source URL for new galleries';
       syncFinderConfigAvailability();
       return;
+    }
+    if (hasCorpusProgress) {
+      const corpusComplete = scan.corpusSearchComplete === true;
+      const corpusHadRows = scan.corpusImagesScored > 0 || scan.corpusGalleriesScored > 0;
+      const corpusStopped = !corpusComplete && finderScanIsTerminal(scan);
+      const corpusPaused = !corpusComplete && scan.status === 'paused';
+      $('#finder-local-progress').classList.toggle('is-complete', corpusComplete);
+      $('#finder-local-galleries').textContent = formatNumber(scan.corpusGalleriesScored);
+      $('#finder-local-images').textContent = formatNumber(scan.corpusImagesScored);
+      $('#finder-local-progress-state').textContent = corpusComplete
+        ? corpusHadRows ? 'Done' : 'No data'
+        : corpusStopped ? 'Incomplete' : corpusPaused ? 'Paused' : 'Searching';
+      $('#finder-local-progress-copy').textContent = corpusComplete
+        ? corpusHadRows
+          ? 'All saved galleries searched before live exploration'
+          : 'No reusable indexed images were available for this scan'
+        : corpusStopped
+          ? 'Local index search stopped before completion'
+          : corpusPaused
+            ? 'Local index search is paused'
+            : 'Searching every indexed gallery—not only this source';
     }
     if (canExtend) {
       updateFinderExtendSummary({ commit: true });
@@ -2368,7 +2527,16 @@
     }
     const status = scan.status.replaceAll('_', ' ');
     const sourceExhausted = finderScanSourceExhausted(scan);
+    const waitingForCorpus = hasCorpusProgress
+      && scan.corpusSearchComplete !== true
+      && !finderScanIsTerminal(scan)
+      && scan.pagesScanned === 0;
     $('#finder-progress-wrap').classList.toggle('is-source-exhausted', sourceExhausted);
+    $('#finder-source-progress-copy').textContent = waitingForCorpus
+      ? 'Starts after the Local Gallery Index search'
+      : sourceExhausted
+        ? 'The selected Source URL has no more pages'
+        : `Exploring ${displayHost(scan.sourceUrl)} for new galleries`;
     $('#finder-session-label').textContent = `${scan.poseTagLabel || 'Pose scan'} · ${status}`;
     $('#finder-pages-scanned').textContent = formatNumber(scan.pagesScanned);
     $('#finder-pages-total').textContent = formatNumber(scan.pages || 0);
@@ -2382,7 +2550,9 @@
     $('#finder-images-scanned').textContent = formatNumber(scan.imagesScanned);
     const visibleCandidates = state.finderResults.filter(result => result.score >= scan.minSimilarity).length;
     $('#finder-candidates-found').textContent = formatNumber(Math.max(scan.candidateCount, visibleCandidates));
-    const progressState = sourceExhausted ? 'Source exhausted' : status[0]?.toUpperCase() + status.slice(1);
+    const progressState = waitingForCorpus
+      ? 'Waiting'
+      : sourceExhausted ? 'Source exhausted' : status[0]?.toUpperCase() + status.slice(1);
     $('#finder-progress-state').textContent = `${progressState}${scan.failedGalleries ? ` · ${formatNumber(scan.failedGalleries)} failed` : ''}`;
     $('#finder-progress-bar').style.width = `${scan.percentage}%`;
     $('.finder-progress').setAttribute('aria-valuenow', String(Math.round(scan.percentage)));
@@ -2472,6 +2642,25 @@
     }
   }
 
+  async function loadFinderCorpus({ quiet = false, force = false } = {}) {
+    if (!force && state.finderCorpusSupported === false) return;
+    try {
+      const data = await api('/api/finder/corpus');
+      const corpus = normalizeFinderCorpus(data);
+      if (!corpus) throw new ApiError('The server returned invalid Local Gallery Index statistics.');
+      state.finderCorpus = corpus;
+      state.finderCorpusSupported = true;
+      renderFinderCorpus();
+    } catch (error) {
+      if (error.status === 404) {
+        state.finderCorpusSupported = false;
+        if (!state.finderStatus?.corpus) state.finderCorpus = null;
+      }
+      renderFinderCorpus();
+      if (!quiet && error.status !== 404) toast('Could not refresh the Local Gallery Index', errorMessage(error), 'error');
+    }
+  }
+
   async function loadFinderScan({ quiet = false, applyConfig = false } = {}) {
     const scanId = state.finderScanId;
     if (!scanId) {
@@ -2491,7 +2680,10 @@
       else state.finderScans.unshift(scan);
       if (applyConfig) applyFinderScanConfig(scan);
       renderFinderWorkspace();
-      await loadFinderResults({ quiet: true });
+      await Promise.all([
+        loadFinderResults({ quiet: true }),
+        loadFinderCorpus({ quiet: true })
+      ]);
       scheduleFinderPoll();
     } catch (error) {
       if (error.status === 404) {
@@ -2513,12 +2705,23 @@
       api('/api/finder/folders'),
       api('/api/finder/status'),
       api('/api/pose-tags'),
-      api('/api/finder/scans')
+      api('/api/finder/scans'),
+      api('/api/finder/corpus')
     ]);
-    const [foldersResult, statusResult, tagsResult, scansResult] = requests;
+    const [foldersResult, statusResult, tagsResult, scansResult, corpusResult] = requests;
     if (foldersResult.status === 'fulfilled') state.finderFolders = apiItems(foldersResult.value, 'folders').map(normalizeFinderFolder).filter(folder => folder.path);
     if (statusResult.status === 'fulfilled') state.finderStatus = normalizeFinderStatus(statusResult.value);
     else state.finderStatus = null;
+    if (corpusResult.status === 'fulfilled') {
+      state.finderCorpus = normalizeFinderCorpus(corpusResult.value);
+      state.finderCorpusSupported = Boolean(state.finderCorpus);
+    } else if (state.finderStatus?.corpus) {
+      state.finderCorpus = state.finderStatus.corpus;
+      state.finderCorpusSupported = true;
+    } else {
+      state.finderCorpus = null;
+      state.finderCorpusSupported = corpusResult.reason?.status === 404 ? false : null;
+    }
     if (tagsResult.status === 'fulfilled') state.finderTags = apiItems(tagsResult.value).map(normalizePoseTag).filter(tag => tag.id !== undefined && tag.label);
     if (scansResult.status === 'fulfilled') state.finderScans = apiItems(scansResult.value, 'scans').map(normalizeFinderScan).filter(scan => scan?.id);
     state.finderLoaded = foldersResult.status === 'fulfilled' || scansResult.status === 'fulfilled';
@@ -2534,7 +2737,7 @@
     state.finderLoading = false;
     syncFinderConfigAvailability();
     if (selected?.id) await loadFinderScan({ quiet: true, applyConfig: !preserveConfig });
-    const failures = requests.filter(result => result.status === 'rejected');
+    const failures = requests.slice(0, 4).filter(result => result.status === 'rejected');
     if (!quiet && failures.length) toast('Some Finder options are unavailable', errorMessage(failures[0].reason), 'error');
   }
 

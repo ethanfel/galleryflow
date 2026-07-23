@@ -35,6 +35,8 @@ REVIEW_STATES = {"pending", "accepted", "rejected"}
 ANALYZER_VERSION = "hybrid-spatial-pyramid-v1+rtmo-l-geometry-v1+phash64-gate-v1"
 LEGACY_RANKING_VERSION = "appearance-v1"
 CURRENT_RANKING_VERSION = "pose-first-v1"
+CORPUS_BACKFILL_VERSION = "top-matches-v1"
+CORPUS_SCAN_GUARD_VERSION = "pre-corpus-scans-v1"
 POSE_MATCH_FLOOR = 0.55
 EXACT_HASH_MAX_DISTANCE = 8
 MAX_SCAN_PAGES = 500
@@ -147,6 +149,9 @@ class FinderService:
                     processed_galleries INTEGER NOT NULL DEFAULT 0,
                     processed_images INTEGER NOT NULL DEFAULT 0,
                     failed_galleries INTEGER NOT NULL DEFAULT 0,
+                    corpus_search_complete INTEGER NOT NULL DEFAULT 0,
+                    corpus_images_scored INTEGER NOT NULL DEFAULT 0,
+                    corpus_galleries_scored INTEGER NOT NULL DEFAULT 0,
                     cancel_requested INTEGER NOT NULL DEFAULT 0,
                     pause_requested INTEGER NOT NULL DEFAULT 0,
                     error TEXT NOT NULL DEFAULT '',
@@ -190,6 +195,7 @@ class FinderService:
                     ranking_tier INTEGER NOT NULL DEFAULT 1,
                     matches_json TEXT NOT NULL DEFAULT '[]',
                     images_scored INTEGER NOT NULL DEFAULT 0,
+                    online_scanned INTEGER NOT NULL DEFAULT 1,
                     status TEXT NOT NULL,
                     review TEXT NOT NULL DEFAULT 'pending',
                     error TEXT NOT NULL DEFAULT '',
@@ -199,18 +205,62 @@ class FinderService:
                     UNIQUE (scan_id, gallery_key),
                     FOREIGN KEY (scan_id) REFERENCES finder_scans(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS finder_corpus_galleries (
+                    gallery_key TEXT PRIMARY KEY,
+                    gallery_url TEXT NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    thumbnail_remote_url TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL DEFAULT 'partial'
+                        CHECK (state IN ('complete', 'partial')),
+                    image_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS finder_corpus_images (
+                    gallery_key TEXT NOT NULL,
+                    source_key TEXT NOT NULL,
+                    image_url TEXT NOT NULL,
+                    preview_remote_url TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (gallery_key, source_key),
+                    FOREIGN KEY (gallery_key)
+                        REFERENCES finder_corpus_galleries(gallery_key)
+                        ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS finder_corpus_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_finder_scans_updated
                     ON finder_scans(updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_finder_results_score
                     ON finder_results(scan_id, score DESC, discovered_order);
                 CREATE INDEX IF NOT EXISTS idx_finder_results_review
                     ON finder_results(scan_id, review, score DESC);
+                CREATE INDEX IF NOT EXISTS idx_finder_embedding_cache_source
+                    ON finder_embedding_cache(
+                        model_key, source_key, include_mirror
+                    );
+                CREATE INDEX IF NOT EXISTS idx_finder_corpus_images_source
+                    ON finder_corpus_images(source_key);
+                CREATE INDEX IF NOT EXISTS idx_finder_corpus_images_scan
+                    ON finder_corpus_images(
+                        gallery_key, ordinal, source_key
+                    );
+                CREATE INDEX IF NOT EXISTS idx_finder_corpus_galleries_state
+                    ON finder_corpus_galleries(state, updated_at DESC);
                 """
             )
             migrations = {
                 "finder_scans": {
                     "reference_model_key": "TEXT NOT NULL DEFAULT ''",
                     "ranking_version": ("TEXT NOT NULL DEFAULT 'appearance-v1'"),
+                    "corpus_search_complete": "INTEGER NOT NULL DEFAULT 0",
+                    "corpus_images_scored": "INTEGER NOT NULL DEFAULT 0",
+                    "corpus_galleries_scored": "INTEGER NOT NULL DEFAULT 0",
                 },
                 "finder_scan_references": {
                     "metadata_json": "TEXT NOT NULL DEFAULT '{}'",
@@ -221,6 +271,7 @@ class FinderService:
                 "finder_results": {
                     "matches_json": "TEXT NOT NULL DEFAULT '[]'",
                     "ranking_tier": "INTEGER NOT NULL DEFAULT 1",
+                    "online_scanned": "INTEGER NOT NULL DEFAULT 1",
                 },
             }
             for table, additions in migrations.items():
@@ -245,6 +296,46 @@ class FinderService:
                        scan_id, review, ranking_tier DESC, score DESC
                    )"""
             )
+            db.execute(
+                """CREATE INDEX IF NOT EXISTS idx_finder_results_online
+                   ON finder_results(scan_id, online_scanned, status)"""
+            )
+            scan_guard = db.execute(
+                """SELECT value FROM finder_corpus_meta
+                   WHERE key = 'scan-guard'"""
+            ).fetchone()
+            if not scan_guard or scan_guard["value"] != CORPUS_SCAN_GUARD_VERSION:
+                # Existing and paused scans predate corpus pre-search. Mark
+                # them searched so an upgrade cannot inject local results into
+                # the middle of durable pagination/review state.
+                db.execute(
+                    """UPDATE finder_scans
+                       SET corpus_search_complete = 1"""
+                )
+                db.execute(
+                    """INSERT INTO finder_corpus_meta(key, value, updated_at)
+                       VALUES ('scan-guard', ?, ?)
+                       ON CONFLICT(key) DO UPDATE SET
+                           value = excluded.value,
+                           updated_at = excluded.updated_at""",
+                    (CORPUS_SCAN_GUARD_VERSION, utc_now()),
+                )
+            backfill = db.execute(
+                """SELECT value FROM finder_corpus_meta
+                   WHERE key = 'historical-backfill'"""
+            ).fetchone()
+            if not backfill or backfill["value"] != CORPUS_BACKFILL_VERSION:
+                # The marker and backfill commit together. Rows are streamed so
+                # historical skeleton overlays do not inflate startup memory.
+                self._backfill_corpus_associations(db)
+                db.execute(
+                    """INSERT INTO finder_corpus_meta(key, value, updated_at)
+                       VALUES ('historical-backfill', ?, ?)
+                       ON CONFLICT(key) DO UPDATE SET
+                           value = excluded.value,
+                           updated_at = excluded.updated_at""",
+                    (CORPUS_BACKFILL_VERSION, utc_now()),
+                )
             db.execute(
                 """UPDATE finder_scans
                    SET status = 'canceled', finished_at = ?, updated_at = ?
@@ -284,6 +375,146 @@ class FinderService:
                     CURRENT_RANKING_VERSION,
                 ),
             )
+
+    @staticmethod
+    def _remote_source_key(url: str) -> str:
+        """Return the exact cache namespace used for a remote preview image."""
+
+        return f"url:{canonicalize_url(url)}"
+
+    def _backfill_corpus_associations(self, db: Any) -> None:
+        """Recover partial gallery membership from durable historical top matches.
+
+        Finder has always persisted only the best three images for each result,
+        so these rows can seed useful local searches but cannot prove that a
+        gallery is complete. Complete galleries are intentionally skipped:
+        replaying an old result after an online refresh must not resurrect stale
+        preview URLs that the refresh removed.
+        """
+
+        complete_keys = {
+            str(row["gallery_key"])
+            for row in db.execute(
+                """SELECT gallery_key FROM finder_corpus_galleries
+                   WHERE state = 'complete'"""
+            ).fetchall()
+        }
+        cursor = db.execute(
+            """SELECT gallery_key, gallery_url, title, thumbnail_remote_url,
+                      matches_json, best_image_url, best_preview_remote_url,
+                      best_ordinal, created_at, updated_at
+               FROM finder_results
+               ORDER BY id"""
+        )
+        while True:
+            rows = cursor.fetchmany(32)
+            if not rows:
+                break
+            for row in rows:
+                if str(row["gallery_key"]) in complete_keys:
+                    continue
+                self._backfill_corpus_result(db, row)
+        db.execute(
+            """UPDATE finder_corpus_galleries
+               SET image_count = (
+                   SELECT COUNT(*) FROM finder_corpus_images
+                   WHERE gallery_key = finder_corpus_galleries.gallery_key
+               )
+               WHERE state = 'partial'"""
+        )
+
+    def _backfill_corpus_result(self, db: Any, row: Any) -> None:
+        try:
+            decoded = json.loads(str(row["matches_json"] or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decoded = []
+        raw_matches = decoded if isinstance(decoded, list) else []
+        if not raw_matches and row["best_image_url"] and row["best_preview_remote_url"]:
+            raw_matches = [
+                {
+                    "image_url": row["best_image_url"],
+                    "preview_remote_url": row["best_preview_remote_url"],
+                    "ordinal": row["best_ordinal"] or 0,
+                }
+            ]
+        recovered: dict[str, tuple[str, str, int]] = {}
+        for match in raw_matches:
+            if not isinstance(match, dict):
+                continue
+            try:
+                preview = str(
+                    match.get("preview_remote_url") or match.get("preview_url") or ""
+                )
+                image_url = str(match.get("image_url") or match.get("url") or "")
+                if not preview or not image_url:
+                    continue
+                source_key = self._remote_source_key(preview)
+                ordinal = int(match.get("ordinal") or 0)
+            except (TypeError, ValueError):
+                continue
+            recovered[source_key] = (image_url, preview, max(0, ordinal))
+        if not recovered:
+            return
+        now = utc_now()
+        created_at = str(row["created_at"] or now)
+        updated_at = str(row["updated_at"] or now)
+        db.execute(
+            """INSERT INTO finder_corpus_galleries(
+                   gallery_key, gallery_url, title, thumbnail_remote_url,
+                   state, image_count, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, 'partial', ?, ?, ?)
+               ON CONFLICT(gallery_key) DO UPDATE SET
+                   gallery_url = excluded.gallery_url,
+                   title = CASE
+                       WHEN excluded.title != '' THEN excluded.title
+                       ELSE finder_corpus_galleries.title
+                   END,
+                   thumbnail_remote_url = CASE
+                       WHEN excluded.thumbnail_remote_url != ''
+                           THEN excluded.thumbnail_remote_url
+                       ELSE finder_corpus_galleries.thumbnail_remote_url
+                   END,
+                   image_count = MAX(
+                       finder_corpus_galleries.image_count,
+                       excluded.image_count
+                   ),
+                   updated_at = MAX(
+                       finder_corpus_galleries.updated_at,
+                       excluded.updated_at
+                   )""",
+            (
+                row["gallery_key"],
+                row["gallery_url"],
+                str(row["title"] or ""),
+                str(row["thumbnail_remote_url"] or ""),
+                len(recovered),
+                created_at,
+                updated_at,
+            ),
+        )
+        db.executemany(
+            """INSERT INTO finder_corpus_images(
+                   gallery_key, source_key, image_url, preview_remote_url,
+                   ordinal, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(gallery_key, source_key) DO UPDATE SET
+                   image_url = excluded.image_url,
+                   preview_remote_url = excluded.preview_remote_url,
+                   ordinal = excluded.ordinal,
+                   updated_at = excluded.updated_at""",
+            [
+                (
+                    row["gallery_key"],
+                    source_key,
+                    image_url,
+                    preview,
+                    ordinal,
+                    created_at,
+                    updated_at,
+                )
+                for source_key, (image_url, preview, ordinal) in recovered.items()
+            ],
+        )
 
     async def start(self) -> None:
         self._stopping = False
@@ -440,6 +671,62 @@ class FinderService:
             "queue_depth": self.queue.qsize(),
             "active": sum(counts.get(item, 0) for item in ACTIVE_STATUSES),
             "paused": counts.get("paused", 0),
+        }
+
+    def corpus_status(self) -> dict[str, int]:
+        """Summarize reusable gallery membership and descriptor storage."""
+
+        with self._lock, self.database.connect() as db:
+            galleries = db.execute(
+                """SELECT COUNT(*) AS galleries,
+                          COALESCE(SUM(state = 'complete'), 0) AS complete,
+                          COALESCE(SUM(state = 'partial'), 0) AS partial
+                   FROM finder_corpus_galleries"""
+            ).fetchone()
+            images = int(
+                db.execute("SELECT COUNT(*) FROM finder_corpus_images").fetchone()[0]
+            )
+            cache = db.execute(
+                """SELECT COUNT(*) AS entries,
+                          COALESCE(
+                              SUM(length(embedding) + length(metadata_json)), 0
+                          ) AS stored_bytes
+                   FROM finder_embedding_cache"""
+            ).fetchone()
+            model_key = self._model_key
+            if not model_key:
+                latest = db.execute(
+                    """SELECT reference_model_key FROM finder_scans
+                       WHERE reference_model_key != '' AND ranking_version = ?
+                       ORDER BY updated_at DESC LIMIT 1""",
+                    (CURRENT_RANKING_VERSION,),
+                ).fetchone()
+                model_key = str(latest["reference_model_key"]) if latest else ""
+            ready = 0
+            if model_key:
+                ready = int(
+                    db.execute(
+                        """SELECT COUNT(*)
+                           FROM finder_corpus_images i
+                           WHERE EXISTS (
+                               SELECT 1 FROM finder_embedding_cache c
+                               WHERE c.model_key = ?
+                                 AND c.source_key = i.source_key
+                                 AND c.include_mirror = 0
+                           )""",
+                        (model_key,),
+                    ).fetchone()[0]
+                )
+        return {
+            "galleries": int(galleries["galleries"]),
+            "images": images,
+            "complete": int(galleries["complete"]),
+            "partial": int(galleries["partial"]),
+            "ready": ready,
+            "cache_entries": int(cache["entries"]),
+            "cache_bytes": max(0, int(cache["stored_bytes"] or 0)),
+            "max_cache_entries": int(self.config.finder_cache_max_entries),
+            "max_cache_bytes": int(self.config.finder_cache_max_bytes),
         }
 
     @staticmethod
@@ -660,6 +947,7 @@ class FinderService:
         scan["cancel_requested"] = bool(scan["cancel_requested"])
         scan["pause_requested"] = bool(scan["pause_requested"])
         scan["reference_ready"] = bool(scan["reference_ready"])
+        scan["corpus_search_complete"] = bool(scan["corpus_search_complete"])
         scan["has_next_page"] = bool(scan.get("next_url"))
         scan["ranking_current"] = scan.get("ranking_version") == CURRENT_RANKING_VERSION
         scan["extendable"] = bool(
@@ -798,6 +1086,9 @@ class FinderService:
             "processed_galleries",
             "processed_images",
             "failed_galleries",
+            "corpus_search_complete",
+            "corpus_images_scored",
+            "corpus_galleries_scored",
             "cancel_requested",
             "pause_requested",
             "error",
@@ -1112,6 +1403,9 @@ class FinderService:
         ranking_version: str = LEGACY_RANKING_VERSION,
     ) -> dict[str, Any]:
         item = dict(row)
+        online_state = int(item.get("online_scanned", 1))
+        item["online_scanned"] = online_state > 0
+        item["online_refresh_failed"] = online_state < 0
         raw_matches = item.pop("matches_json", "[]")
         try:
             decoded = json.loads(str(raw_matches or "[]"))
@@ -1235,6 +1529,9 @@ class FinderService:
             "processed_galleries",
             "processed_images",
             "failed_galleries",
+            "corpus_search_complete",
+            "corpus_images_scored",
+            "corpus_galleries_scored",
             "candidate_count",
             "ranking_version",
             "ranking_current",
@@ -1584,7 +1881,7 @@ class FinderService:
 
     async def _remote_descriptor(self, url: str, referer: str) -> _ImageDescriptor:
         canonical = canonicalize_url(url)
-        source_key = f"url:{canonical}"
+        source_key = self._remote_source_key(canonical)
         cached = self._cached_descriptor(source_key, False)
         if cached is not None:
             return cached
@@ -1630,6 +1927,9 @@ class FinderService:
                            next_url = source_url, pages_completed = 0,
                            total_galleries = 0, processed_galleries = 0,
                            processed_images = 0, failed_galleries = 0,
+                           corpus_search_complete = 0,
+                           corpus_images_scored = 0,
+                           corpus_galleries_scored = 0,
                            status = 'preparing', error = '', finished_at = NULL,
                            updated_at = ?
                        WHERE id = ?""",
@@ -1647,6 +1947,9 @@ class FinderService:
                 "processed_galleries": 0,
                 "processed_images": 0,
                 "failed_galleries": 0,
+                "corpus_search_complete": False,
+                "corpus_images_scored": 0,
+                "corpus_galleries_scored": 0,
             }
         directory, _ = self._resolve_example_directory(scan["example_directory"])
         files = self._example_files(directory)
@@ -2026,10 +2329,97 @@ class FinderService:
         with self._lock, self.database.connect() as db:
             row = db.execute(
                 """SELECT status FROM finder_results
-                   WHERE scan_id = ? AND gallery_key = ?""",
+                   WHERE scan_id = ? AND gallery_key = ?
+                     AND online_scanned = 1""",
                 (scan_id, key),
             ).fetchone()
         return bool(row and row["status"] == "completed")
+
+    def _index_corpus_gallery(
+        self,
+        card: dict[str, Any],
+        detail: dict[str, Any],
+        images: list[dict[str, Any]],
+    ) -> None:
+        """Replace one gallery's membership after a complete detail fetch."""
+
+        gallery_url = validate_source_url(
+            str(detail.get("url") or card.get("url") or "")
+        )
+        key = gallery_key(gallery_url)
+        now = utc_now()
+        associations: dict[str, tuple[str, str, int]] = {}
+        for index, image in enumerate(images, start=1):
+            preview = str(image.get("preview_remote_url") or "")
+            image_url = str(image.get("url") or "")
+            if not preview or not image_url:
+                continue
+            try:
+                canonical_preview = canonicalize_url(preview)
+                source_key = self._remote_source_key(preview)
+                ordinal = max(0, int(image.get("ordinal") or index))
+            except (TypeError, ValueError):
+                continue
+            associations[source_key] = (
+                image_url,
+                canonical_preview,
+                ordinal,
+            )
+        with self._lock, self.database.connect() as db:
+            db.execute(
+                """INSERT INTO finder_corpus_galleries(
+                       gallery_key, gallery_url, title, thumbnail_remote_url,
+                       state, image_count, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, 'complete', ?, ?, ?)
+                   ON CONFLICT(gallery_key) DO UPDATE SET
+                       gallery_url = excluded.gallery_url,
+                       title = excluded.title,
+                       thumbnail_remote_url = excluded.thumbnail_remote_url,
+                       state = 'complete',
+                       image_count = excluded.image_count,
+                       updated_at = excluded.updated_at""",
+                (
+                    key,
+                    gallery_url,
+                    str(detail.get("title") or card.get("title") or "Untitled gallery")[
+                        :300
+                    ],
+                    str(
+                        detail.get("thumbnail_remote_url")
+                        or card.get("thumbnail_remote_url")
+                        or ""
+                    ),
+                    len(associations),
+                    now,
+                    now,
+                ),
+            )
+            # Detail pages are the authoritative full association list. Delete
+            # stale preview URLs/ordinals before inserting the refreshed list.
+            db.execute(
+                "DELETE FROM finder_corpus_images WHERE gallery_key = ?",
+                (key,),
+            )
+            db.executemany(
+                """INSERT INTO finder_corpus_images(
+                       gallery_key, source_key, image_url, preview_remote_url,
+                       ordinal, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        key,
+                        source_key,
+                        image_url,
+                        preview,
+                        ordinal,
+                        now,
+                        now,
+                    )
+                    for source_key, (image_url, preview, ordinal) in (
+                        associations.items()
+                    )
+                ],
+            )
 
     def _save_result(
         self,
@@ -2044,6 +2434,7 @@ class FinderService:
         ranking_version: str = LEGACY_RANKING_VERSION,
         error: str = "",
         top_matches: list[dict[str, Any]] | None = None,
+        online_scanned: bool = True,
     ) -> None:
         now = utc_now()
         key = gallery_key(card["url"])
@@ -2081,9 +2472,11 @@ class FinderService:
                        thumbnail_remote_url, best_image_url,
                        best_preview_remote_url, best_ordinal, score,
                        ranking_tier, matches_json, images_scored, status, error,
-                       discovered_order,
+                       online_scanned, discovered_order,
                        created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ) VALUES (
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                   )
                    ON CONFLICT(scan_id, gallery_key) DO UPDATE SET
                        gallery_url = excluded.gallery_url,
                        title = excluded.title,
@@ -2097,6 +2490,10 @@ class FinderService:
                        images_scored = excluded.images_scored,
                        status = excluded.status,
                        error = excluded.error,
+                       online_scanned = MAX(
+                           finder_results.online_scanned,
+                           excluded.online_scanned
+                       ),
                        discovered_order = excluded.discovered_order,
                        updated_at = excluded.updated_at""",
                 (
@@ -2115,20 +2512,67 @@ class FinderService:
                     images_scored,
                     status,
                     error[:1000],
+                    int(online_scanned),
                     order,
                     now,
                     now,
                 ),
             )
 
+    def _preserve_local_result_after_online_error(
+        self,
+        scan_id: str,
+        card: dict[str, Any],
+        *,
+        order: int,
+        error: str,
+    ) -> bool:
+        """Record an online attempt without erasing a usable local candidate."""
+
+        key = gallery_key(card["url"])
+        now = utc_now()
+        with self._lock, self.database.connect() as db:
+            updated = db.execute(
+                """UPDATE finder_results
+                   SET gallery_url = ?,
+                       title = CASE WHEN ? != '' THEN ? ELSE title END,
+                       thumbnail_remote_url = CASE
+                           WHEN ? != '' THEN ? ELSE thumbnail_remote_url
+                       END,
+                       online_scanned = -1,
+                       images_scored = 0,
+                       error = ?,
+                       discovered_order = ?,
+                       updated_at = ?
+                   WHERE scan_id = ? AND gallery_key = ?
+                     AND online_scanned <= 0 AND status = 'completed'""",
+                (
+                    card["url"],
+                    str(card.get("title") or "")[:300],
+                    str(card.get("title") or "")[:300],
+                    str(card.get("thumbnail_remote_url") or ""),
+                    str(card.get("thumbnail_remote_url") or ""),
+                    error[:1000],
+                    order,
+                    now,
+                    scan_id,
+                    key,
+                ),
+            )
+        return bool(updated.rowcount)
+
     def _progress_counts(self, scan_id: str) -> dict[str, int]:
         with self._lock, self.database.connect() as db:
             row = db.execute(
                 """SELECT COUNT(*) AS processed,
                           COALESCE(SUM(images_scored), 0) AS images,
-                          COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0)
-                              AS failed
-                   FROM finder_results WHERE scan_id = ?""",
+                          COALESCE(SUM(
+                              CASE WHEN status = 'failed' OR error != ''
+                                  THEN 1 ELSE 0 END
+                          ), 0) AS failed
+                   FROM finder_results
+                   WHERE scan_id = ? AND online_scanned != 0""",
+                # Corpus-preloaded candidates are not web crawl progress.
                 (scan_id,),
             ).fetchone()
         return {
@@ -2169,9 +2613,11 @@ class FinderService:
                 """SELECT COUNT(*) AS processed,
                           COALESCE(SUM(images_scored), 0) AS images,
                           COALESCE(SUM(
-                              CASE WHEN status = 'failed' THEN 1 ELSE 0 END
+                              CASE WHEN status = 'failed' OR error != ''
+                                  THEN 1 ELSE 0 END
                           ), 0) AS failed
-                   FROM finder_results WHERE scan_id = ?""",
+                   FROM finder_results
+                   WHERE scan_id = ? AND online_scanned != 0""",
                 (scan_id,),
             ).fetchone()
             processed = int(counts["processed"])
@@ -2208,11 +2654,280 @@ class FinderService:
             count = int(
                 db.execute(
                     f"""SELECT COUNT(*) FROM finder_results
-                        WHERE scan_id = ? AND gallery_key IN ({placeholders})""",
+                        WHERE scan_id = ? AND online_scanned != 0
+                          AND gallery_key IN ({placeholders})""",
                     [scan_id, *keys],
                 ).fetchone()[0]
             )
         return len(set(keys)) - count
+
+    def _corpus_descriptor_query(
+        self,
+        after: tuple[str, int, str] | None,
+        *,
+        limit: int = 256,
+    ) -> tuple[str, list[Any]]:
+        condition = ""
+        params: list[Any] = [self._model_key]
+        if after is not None:
+            gallery, ordinal, source_key = after
+            condition = """
+                AND (i.gallery_key, i.ordinal, i.source_key) > (?, ?, ?)
+            """
+            params.extend((gallery, ordinal, source_key))
+        params.append(limit)
+        query = f"""SELECT i.gallery_key, i.source_key, i.image_url,
+                           i.preview_remote_url, i.ordinal,
+                           g.gallery_url, g.title, g.thumbnail_remote_url,
+                           c.cache_key, c.rows, c.dimensions, c.embedding,
+                           c.metadata_json
+                    FROM finder_corpus_images i
+                         INDEXED BY idx_finder_corpus_images_scan
+                    CROSS JOIN finder_corpus_galleries g
+                    CROSS JOIN finder_embedding_cache c
+                         INDEXED BY idx_finder_embedding_cache_source
+                    WHERE g.gallery_key = i.gallery_key
+                      AND c.model_key = ?
+                      AND c.source_key = i.source_key
+                      AND c.include_mirror = 0
+                      {condition}
+                    ORDER BY i.gallery_key, i.ordinal, i.source_key
+                    LIMIT ?"""
+        return query, params
+
+    def _corpus_descriptor_rows(
+        self,
+        after: tuple[str, int, str] | None,
+        *,
+        limit: int = 256,
+    ) -> list[Any]:
+        query, params = self._corpus_descriptor_query(after, limit=limit)
+        with self._lock, self.database.connect() as db:
+            return db.execute(query, params).fetchall()
+
+    def _descriptor_from_corpus_row(
+        self,
+        row: Any,
+        expected_dimensions: int,
+    ) -> _ImageDescriptor | None:
+        rows = int(row["rows"])
+        dimensions = int(row["dimensions"])
+        raw = bytes(row["embedding"])
+        if (
+            rows <= 0
+            or dimensions != expected_dimensions
+            or len(raw) != rows * dimensions * 4
+        ):
+            return None
+        metadata = FinderService._decode_metadata(row["metadata_json"])
+        if metadata.get("analyzer_version") != ANALYZER_VERSION:
+            return None
+        if metadata.get("pose_error") and self._pose_ready:
+            # Let a later online visit retry the transient pose inference
+            # failure through the normal descriptor path.
+            return None
+        appearance = np.frombuffer(raw, dtype="<f4").reshape(rows, dimensions).copy()
+        if not np.all(np.isfinite(appearance)):
+            return None
+        norms = np.linalg.norm(appearance, axis=1)
+        if np.any(norms <= 1e-12):
+            return None
+        return _ImageDescriptor(appearance, metadata)
+
+    def _score_corpus_rows(
+        self,
+        rows: list[Any],
+        references: np.ndarray,
+        reference_hashes: tuple[int, ...],
+        reference_poses: tuple[Any, ...],
+        ranking_version: str,
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        dimensions = int(references.shape[1])
+        decoded: list[tuple[Any, _ImageDescriptor]] = []
+        for row in rows:
+            descriptor = self._descriptor_from_corpus_row(row, dimensions)
+            if descriptor is None:
+                continue
+            decoded.append((row, descriptor))
+        if not decoded:
+            return {}
+        vectors = np.stack([descriptor.appearance[0] for _, descriptor in decoded])
+        raw_scores = np.max(references @ vectors.T, axis=0)
+        scored_by_source: dict[tuple[str, str], dict[str, Any]] = {}
+        for (row, descriptor), raw_score in zip(decoded, raw_scores, strict=True):
+            metadata = descriptor.metadata
+            spatial = metadata.get("descriptor_kind") == "spatial"
+            appearance_score = self._appearance_score(
+                float(raw_score),
+                spatial=spatial,
+            )
+            exact_score = (
+                self._exact_score(
+                    self._metadata_phash(metadata),
+                    reference_hashes,
+                )
+                if spatial
+                else 0.0
+            )
+            pose = self._pose_diagnostics(metadata, reference_poses)
+            ranking_tier, score = self._ranked_score(
+                appearance_score,
+                exact_score,
+                pose,
+                ranking_version=ranking_version,
+            )
+            scored_by_source[(str(row["gallery_key"]), str(row["source_key"]))] = {
+                "image_url": str(row["image_url"]),
+                "preview_remote_url": str(row["preview_remote_url"]),
+                "ordinal": int(row["ordinal"]),
+                "score": score,
+                "ranking_tier": ranking_tier,
+                "appearance_score": appearance_score,
+                "exact_score": exact_score,
+                "_cache_key": str(row["cache_key"]),
+                **pose,
+            }
+        return scored_by_source
+
+    def _touch_corpus_cache_rows(self, cache_keys: set[str]) -> None:
+        if not cache_keys:
+            return
+        now = utc_now()
+        with self._lock, self.database.connect() as db:
+            db.executemany(
+                """UPDATE finder_embedding_cache
+                   SET last_used_at = ? WHERE cache_key = ?""",
+                [(now, key) for key in sorted(cache_keys)],
+            )
+
+    async def _search_corpus(
+        self,
+        scan: dict[str, Any],
+        references: np.ndarray,
+        reference_hashes: tuple[int, ...],
+        reference_poses: tuple[Any, ...],
+    ) -> None:
+        """Score reusable descriptors locally before visiting source pages."""
+
+        current = self.get_scan(scan["id"])
+        if not current or current["corpus_search_complete"]:
+            return
+        self._check_control(scan["id"])
+        self._update_scan(
+            scan["id"],
+            corpus_images_scored=0,
+            corpus_galleries_scored=0,
+        )
+        ranking_version = str(current.get("ranking_version") or LEGACY_RANKING_VERSION)
+        after: tuple[str, int, str] | None = None
+        active_key = ""
+        active_card: dict[str, Any] | None = None
+        active_matches: list[dict[str, Any]] = []
+        active_images = 0
+        images_scored = 0
+        galleries_scored = 0
+        selected_cache_keys: set[str] = set()
+        minimum_score = float(current["minimum_score"])
+
+        def save_active() -> None:
+            nonlocal active_card, active_matches, active_images, galleries_scored
+            if active_card is None or not active_matches:
+                active_card = None
+                active_matches = []
+                active_images = 0
+                return
+            matches = self._normalized_top_matches(
+                active_matches,
+                ranking_version=ranking_version,
+            )
+            if matches[0]["score"] >= minimum_score:
+                leading = matches[0]
+                for raw_match in active_matches:
+                    if (
+                        raw_match["image_url"] == leading["image_url"]
+                        and raw_match["preview_remote_url"]
+                        == leading["preview_remote_url"]
+                        and raw_match["ordinal"] == leading["ordinal"]
+                    ):
+                        selected_cache_keys.add(str(raw_match["_cache_key"]))
+                        break
+            self._save_result(
+                scan["id"],
+                active_card,
+                order=galleries_scored,
+                score=matches[0]["score"],
+                images_scored=active_images,
+                best=None,
+                status="completed",
+                ranking_version=ranking_version,
+                top_matches=matches,
+                online_scanned=False,
+            )
+            galleries_scored += 1
+            active_card = None
+            active_matches = []
+            active_images = 0
+
+        while True:
+            self._check_control(scan["id"])
+            rows = await asyncio.to_thread(self._corpus_descriptor_rows, after)
+            if not rows:
+                break
+            scored_by_source = await asyncio.to_thread(
+                self._score_corpus_rows,
+                rows,
+                references,
+                reference_hashes,
+                reference_poses,
+                ranking_version,
+            )
+
+            for row in rows:
+                self._check_control(scan["id"])
+                gallery = str(row["gallery_key"])
+                if active_key and gallery != active_key:
+                    save_active()
+                if gallery != active_key:
+                    active_key = gallery
+                    active_card = {
+                        "url": str(row["gallery_url"]),
+                        "title": str(row["title"] or "Untitled gallery"),
+                        "thumbnail_remote_url": str(row["thumbnail_remote_url"] or ""),
+                    }
+                match = scored_by_source.get((gallery, str(row["source_key"])))
+                if match is not None:
+                    active_matches.append(match)
+                    active_images += 1
+                    images_scored += 1
+            final_row = rows[-1]
+            after = (
+                str(final_row["gallery_key"]),
+                int(final_row["ordinal"]),
+                str(final_row["source_key"]),
+            )
+            self._update_scan(
+                scan["id"],
+                corpus_images_scored=images_scored,
+                corpus_galleries_scored=galleries_scored,
+            )
+            progress = self.get_scan(scan["id"])
+            if progress:
+                self._publish(progress)
+        save_active()
+        self._check_control(scan["id"])
+        await asyncio.to_thread(
+            self._touch_corpus_cache_rows,
+            selected_cache_keys,
+        )
+        self._update_scan(
+            scan["id"],
+            corpus_search_complete=1,
+            corpus_images_scored=images_scored,
+            corpus_galleries_scored=galleries_scored,
+        )
+        progress = self.get_scan(scan["id"])
+        if progress:
+            self._publish(progress, force=True)
 
     async def _score_gallery(
         self,
@@ -2239,6 +2954,12 @@ class FinderService:
                 raise ValueError("Gallery exceeds the Finder image-count limit")
             for index, image in enumerate(images, start=1):
                 image.setdefault("ordinal", index)
+            await asyncio.to_thread(
+                self._index_corpus_gallery,
+                card,
+                detail,
+                images,
+            )
 
             async def score_image(image: dict) -> dict[str, Any] | None:
                 self._check_control(scan["id"])
@@ -2316,17 +3037,23 @@ class FinderService:
         except (_FinderPaused, _FinderCanceled):
             raise
         except Exception as exc:
-            self._save_result(
+            if not self._preserve_local_result_after_online_error(
                 scan["id"],
                 card,
                 order=order,
-                score=0,
-                images_scored=0,
-                best=None,
-                status="failed",
-                ranking_version=ranking_version,
                 error=str(exc),
-            )
+            ):
+                self._save_result(
+                    scan["id"],
+                    card,
+                    order=order,
+                    score=0,
+                    images_scored=0,
+                    best=None,
+                    status="failed",
+                    ranking_version=ranking_version,
+                    error=str(exc),
+                )
 
     async def _run_scan(self, scan: dict[str, Any]) -> None:
         if scan.get("ranking_version") != CURRENT_RANKING_VERSION:
@@ -2336,6 +3063,13 @@ class FinderService:
         references = await self._prepare_references(scan)
         reference_hashes = self._load_reference_hashes(scan["id"])
         reference_poses = self._load_reference_poses(scan["id"])
+        self._check_control(scan["id"])
+        await self._search_corpus(
+            scan,
+            references,
+            reference_hashes,
+            reference_poses,
+        )
         self._check_control(scan["id"])
         self._update_scan(scan["id"], status="scanning", error="")
         while True:

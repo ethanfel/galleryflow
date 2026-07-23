@@ -476,6 +476,10 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
     async def finder_status() -> dict:
         return finder.status()
 
+    @app.get("/api/finder/corpus")
+    async def finder_corpus() -> dict:
+        return await asyncio.to_thread(finder.corpus_status)
+
     @app.post("/api/finder/scans", status_code=202)
     async def create_finder_scan(payload: FinderScanCreate) -> dict:
         scan = finder.create_scan(**payload.model_dump())

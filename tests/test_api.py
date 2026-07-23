@@ -87,12 +87,39 @@ async def test_api_profile_browse_ignore_and_settings(
 
     monkeypatch.setattr(app.state.scraper, "browse", fake_browse)
     monkeypatch.setattr(app.state.scraper, "gallery", fake_gallery)
+    monkeypatch.setattr(
+        app.state.finder,
+        "corpus_status",
+        lambda: {
+            "galleries": 9,
+            "images": 204,
+            "complete": 7,
+            "partial": 2,
+            "ready": 188,
+            "cache_entries": 230,
+            "cache_bytes": 8_388_608,
+            "max_cache_entries": 50_000,
+            "max_cache_bytes": 2_147_483_648,
+        },
+    )
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
             transport=transport, base_url="http://testserver"
         ) as client:
             assert (await client.get("/api/health")).json()["status"] == "ok"
+            corpus = (await client.get("/api/finder/corpus")).json()
+            assert corpus == {
+                "galleries": 9,
+                "images": 204,
+                "complete": 7,
+                "partial": 2,
+                "ready": 188,
+                "cache_entries": 230,
+                "cache_bytes": 8_388_608,
+                "max_cache_entries": 50_000,
+                "max_cache_bytes": 2_147_483_648,
+            }
             assert (
                 await client.post("/api/profiles", json={"name": "POV"})
             ).status_code == 201

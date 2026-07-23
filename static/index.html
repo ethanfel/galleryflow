@@ -202,6 +202,24 @@
               <i class="finder-model-state" id="finder-model-state">Checking</i>
             </section>
 
+            <section class="finder-corpus-card" id="finder-corpus-card" aria-labelledby="finder-corpus-title">
+              <header class="finder-corpus-head">
+                <span class="finder-corpus-icon" aria-hidden="true"><svg><use href="#i-layers"></use></svg></span>
+                <span><small>Persistent search memory</small><strong id="finder-corpus-title">Local gallery index</strong></span>
+                <i class="finder-corpus-state" id="finder-corpus-state">Checking</i>
+              </header>
+              <div class="finder-corpus-stats">
+                <span><strong id="finder-corpus-galleries">—</strong><small>galleries</small></span>
+                <span><strong><b id="finder-corpus-ready">—</b> / <b id="finder-corpus-images">—</b></strong><small>ready / indexed</small></span>
+                <span title="Descriptor cache usage"><strong id="finder-corpus-bytes">—</strong><small><b id="finder-corpus-cache-entries">—</b> cached</small></span>
+              </div>
+              <div class="finder-corpus-coverage" id="finder-corpus-coverage" hidden>
+                <span><i></i><b id="finder-corpus-complete">0</b> fully indexed</span>
+                <span id="finder-corpus-partial-wrap"><i></i><b id="finder-corpus-partial">0</b> historic top-three only</span>
+              </div>
+              <p id="finder-corpus-copy"><strong>Saved in /data.</strong> Every new scan searches all indexed galleries first—not only the selected source—then explores that Source URL for more.</p>
+            </section>
+
             <button class="button button-primary finder-start" id="finder-start" type="button" disabled><svg><use href="#i-play"></use></svg><span>Start scan</span></button>
           </aside>
 
@@ -216,15 +234,25 @@
             </header>
 
             <div class="finder-progress-wrap" id="finder-progress-wrap" hidden>
-              <div class="finder-progress-copy">
-                <span>
+              <section class="finder-local-progress" id="finder-local-progress" aria-labelledby="finder-local-progress-title" hidden>
+                <span class="finder-stage-icon" aria-hidden="true"><svg><use href="#i-layers"></use></svg></span>
+                <span class="finder-stage-copy"><strong id="finder-local-progress-title">Local index search</strong><small id="finder-local-progress-copy">Searching every saved gallery first</small></span>
+                <span class="finder-local-counts"><span><b id="finder-local-galleries">0</b> galleries</span><i></i><span><b id="finder-local-images">0</b> images</span></span>
+                <em class="finder-stage-state" id="finder-local-progress-state">Searching</em>
+              </section>
+              <section class="finder-source-progress" aria-labelledby="finder-source-progress-title">
+                <div class="finder-stage-heading">
+                  <span class="finder-stage-icon" aria-hidden="true"><svg><use href="#i-link"></use></svg></span>
+                  <span class="finder-stage-copy"><strong id="finder-source-progress-title">Live source exploration</strong><small id="finder-source-progress-copy">Exploring the selected Source URL for new galleries</small></span>
+                  <em class="finder-stage-state" id="finder-progress-state">Preparing…</em>
+                </div>
+                <div class="finder-progress-copy">
                   <span id="finder-pages-budget"><b id="finder-pages-scanned">0</b> of <b id="finder-pages-total">0</b> pages</span>
                   <span id="finder-pages-exhausted" hidden>Source exhausted after <b id="finder-pages-exhausted-count">0</b> <span id="finder-pages-exhausted-unit">pages</span></span>
-                </span>
-                <span id="finder-progress-state">Preparing…</span>
-              </div>
-              <div class="sort-progress finder-progress" role="progressbar" aria-label="Finder scan progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="finder-progress-bar"></span></div>
-              <div class="finder-progress-stats"><span><b id="finder-galleries-scanned">0</b> galleries</span><i></i><span><b id="finder-images-scanned">0</b> images</span><i></i><span><b id="finder-candidates-found">0</b> candidates</span></div>
+                </div>
+                <div class="sort-progress finder-progress" role="progressbar" aria-label="Live source exploration progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="finder-progress-bar"></span></div>
+                <div class="finder-progress-stats"><span><b id="finder-galleries-scanned">0</b> galleries</span><i></i><span><b id="finder-images-scanned">0</b> images</span><i></i><span><b id="finder-candidates-found">0</b> total candidates</span></div>
+              </section>
               <p class="finder-scan-error" id="finder-scan-error" hidden></p>
               <div class="finder-ranking-note" id="finder-ranking-note" role="status" hidden>
                 <svg aria-hidden="true"><use href="#i-info"></use></svg>
@@ -572,6 +600,7 @@
       <header class="finder-card-head">
         <span class="finder-rank"></span>
         <span class="finder-match-kind" hidden></span>
+        <span class="finder-indexed-badge" title="Found in the saved Local Gallery Index before live source exploration" hidden>Indexed</span>
         <span class="finder-similarity"></span>
       </header>
       <div class="finder-match-gallery" aria-label="Top matching images"></div>

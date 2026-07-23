@@ -369,6 +369,522 @@ async def test_finder_max_score_ranking_review_and_persistent_cache(
 
 
 @pytest.mark.asyncio
+async def test_finder_reuses_persistent_corpus_without_media_or_candidate_inference(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(finder_module, "validate_public_media_url", lambda value: value)
+    config, database, tag_id = configured(tmp_path)
+    first_encoder = FakeEncoder()
+    first_service = FinderService(
+        config,
+        database,
+        FakeScraper(),
+        EventBroker(),
+        encoder=first_encoder,
+        media_fetcher=fake_media,
+    )
+    await first_service.start()
+    try:
+        first = first_service.create_scan(
+            example_directory="pose",
+            pose_tag_id=tag_id,
+            source_url=ROOT,
+            page_limit=1,
+            minimum_score=0,
+        )
+        await asyncio.wait_for(first_service.queue.join(), 30)
+        first_results, _ = first_service.results(
+            first["id"], review="all", min_score=0, limit=20, offset=0
+        )
+        corpus = first_service.corpus_status()
+        assert corpus == {
+            "galleries": 2,
+            "images": 3,
+            "complete": 2,
+            "partial": 0,
+            "ready": 3,
+            "cache_entries": 4,
+            "cache_bytes": corpus["cache_bytes"],
+            "max_cache_entries": config.finder_cache_max_entries,
+            "max_cache_bytes": config.finder_cache_max_bytes,
+        }
+        assert corpus["cache_bytes"] > 0
+        with database.connect() as connection:
+            connection.execute(
+                """UPDATE finder_embedding_cache SET last_used_at = '2000-01-01'
+                   WHERE source_key LIKE 'url:%'"""
+            )
+    finally:
+        await first_service.stop()
+
+    class LocalOnlyScraper:
+        def __init__(self) -> None:
+            self.browse_calls = 0
+            self.gallery_calls = 0
+
+        async def browse(self, **_: object) -> dict:
+            self.browse_calls += 1
+            return {"items": [], "next_url": None}
+
+        async def gallery(self, _: str) -> dict:
+            self.gallery_calls += 1
+            raise AssertionError("A local-only result must not fetch gallery media")
+
+    async def forbidden_media(_: str, __: str) -> bytes:
+        raise AssertionError("A reusable corpus descriptor must not be downloaded")
+
+    local_scraper = LocalOnlyScraper()
+    second_encoder = FakeEncoder()
+    second_service = FinderService(
+        config,
+        database,
+        local_scraper,
+        EventBroker(),
+        encoder=second_encoder,
+        media_fetcher=forbidden_media,
+    )
+    await second_service.start()
+    try:
+        # A restart can report reusable rows before lazy model preparation.
+        assert second_service.corpus_status()["ready"] == 3
+        second = second_service.create_scan(
+            example_directory="pose",
+            pose_tag_id=tag_id,
+            source_url=ROOT,
+            page_limit=1,
+            minimum_score=0,
+        )
+        await asyncio.wait_for(second_service.queue.join(), 30)
+        completed = second_service.get_scan(second["id"])
+        assert completed is not None
+        assert completed["status"] == "completed"
+        assert completed["corpus_search_complete"] is True
+        assert completed["corpus_images_scored"] == 3
+        assert completed["corpus_galleries_scored"] == 2
+        assert completed["processed_galleries"] == 0
+        results, total = second_service.results(
+            second["id"], review="all", min_score=0, limit=20, offset=0
+        )
+        assert total == 2
+        assert all(item["online_scanned"] is False for item in results)
+        assert [(item["title"], item["score"]) for item in results] == [
+            (item["title"], item["score"]) for item in first_results
+        ]
+        assert second_encoder.embed_calls == 0
+        assert local_scraper.browse_calls == 1
+        assert local_scraper.gallery_calls == 0
+        with database.connect() as connection:
+            touched = connection.execute(
+                """SELECT COUNT(*) FROM finder_embedding_cache
+                   WHERE source_key LIKE 'url:%'
+                     AND last_used_at != '2000-01-01'"""
+            ).fetchone()[0]
+        # Only each candidate gallery's leading descriptor is promoted in LRU;
+        # sweeping the corpus must not rewrite every cache row.
+        assert touched == 2
+    finally:
+        await second_service.stop()
+
+
+@pytest.mark.asyncio
+async def test_finder_partial_corpus_refresh_and_pause_preserve_review(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(finder_module, "validate_public_media_url", lambda value: value)
+    config, database, tag_id = configured(tmp_path)
+    encoder = FakeEncoder()
+    service = FinderService(
+        config,
+        database,
+        FakeScraper(),
+        EventBroker(),
+        encoder=encoder,
+        media_fetcher=fake_media,
+    )
+    await service.start()
+    try:
+        seed = service.create_scan(
+            example_directory="pose",
+            pose_tag_id=tag_id,
+            source_url=ROOT,
+            page_limit=1,
+            minimum_score=0,
+        )
+        await asyncio.wait_for(service.queue.join(), 30)
+        assert service.get_scan(seed["id"])["status"] == "completed"
+        key = finder_module.gallery_key(GALLERY_A)
+        black_source = service._remote_source_key(
+            "https://cdni.pornpics.com/p/black.png"
+        )
+        with database.connect() as connection:
+            connection.execute(
+                """DELETE FROM finder_corpus_images
+                   WHERE gallery_key = ? AND source_key = ?""",
+                (key, black_source),
+            )
+            connection.execute(
+                """UPDATE finder_corpus_galleries
+                   SET state = 'partial', image_count = 1
+                   WHERE gallery_key = ?""",
+                (key,),
+            )
+        assert service.corpus_status()["partial"] == 1
+        assert service.corpus_status()["ready"] == 2
+
+        gallery_started = asyncio.Event()
+        release_gallery = asyncio.Event()
+
+        class BlockingRefreshScraper(FakeScraper):
+            def __init__(self) -> None:
+                self.gallery_calls = 0
+
+            async def browse(self, **_: object) -> dict:
+                return {
+                    "items": [
+                        {
+                            "url": GALLERY_A,
+                            "title": "Alpha refreshed",
+                            "thumbnail_remote_url": (
+                                "https://cdni.pornpics.com/t/a-new.png"
+                            ),
+                        }
+                    ],
+                    "next_url": None,
+                }
+
+            async def gallery(self, url: str) -> dict:
+                self.gallery_calls += 1
+                if self.gallery_calls == 1:
+                    gallery_started.set()
+                    await release_gallery.wait()
+                return await super().gallery(url)
+
+        scraper = BlockingRefreshScraper()
+        service.scraper = scraper
+        scan = service.create_scan(
+            example_directory="pose",
+            pose_tag_id=tag_id,
+            source_url=ROOT,
+            page_limit=1,
+            minimum_score=0,
+        )
+        await asyncio.wait_for(gallery_started.wait(), 30)
+        local_results, _ = service.results(
+            scan["id"], review="all", min_score=0, limit=20, offset=0
+        )
+        local_alpha = next(item for item in local_results if item["title"] == "Alpha")
+        assert local_alpha["online_scanned"] is False
+        original_result_id = local_alpha["id"]
+        service.set_review(scan["id"], original_result_id, "accepted")
+
+        assert service.pause(scan["id"])["status"] == "pausing"
+        release_gallery.set()
+        await asyncio.wait_for(service.queue.join(), 30)
+        paused = service.get_scan(scan["id"])
+        assert paused["status"] == "paused"
+        assert paused["pages_completed"] == 0
+        assert paused["corpus_search_complete"] is True
+        corpus_counts = (
+            paused["corpus_images_scored"],
+            paused["corpus_galleries_scored"],
+        )
+
+        service.resume(scan["id"])
+        await asyncio.wait_for(service.queue.join(), 30)
+        completed = service.get_scan(scan["id"])
+        assert completed["status"] == "completed"
+        assert (
+            completed["corpus_images_scored"],
+            completed["corpus_galleries_scored"],
+        ) == corpus_counts
+        results, _ = service.results(
+            scan["id"], review="all", min_score=0, limit=20, offset=0
+        )
+        refreshed = next(item for item in results if item["gallery_key"] == key)
+        assert refreshed["id"] == original_result_id
+        assert refreshed["review"] == "accepted"
+        assert refreshed["online_scanned"] is True
+        assert refreshed["title"] == "Alpha refreshed"
+        assert scraper.gallery_calls == 2
+        with database.connect() as connection:
+            gallery = connection.execute(
+                """SELECT state, image_count FROM finder_corpus_galleries
+                   WHERE gallery_key = ?""",
+                (key,),
+            ).fetchone()
+            associations = connection.execute(
+                """SELECT source_key, ordinal FROM finder_corpus_images
+                   WHERE gallery_key = ? ORDER BY ordinal""",
+                (key,),
+            ).fetchall()
+        assert gallery["state"] == "complete"
+        assert gallery["image_count"] == 2
+        assert len(associations) == 2
+        assert black_source in {row["source_key"] for row in associations}
+        assert service.corpus_status()["ready"] == 3
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_finder_repeated_online_failure_keeps_local_candidate_retryable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(finder_module, "validate_public_media_url", lambda value: value)
+    config, database, tag_id = configured(tmp_path)
+    service = FinderService(
+        config,
+        database,
+        FakeScraper(),
+        EventBroker(),
+        encoder=FakeEncoder(),
+        media_fetcher=fake_media,
+    )
+    await service.start()
+    try:
+        seed = service.create_scan(
+            example_directory="pose",
+            pose_tag_id=tag_id,
+            source_url=ROOT,
+            page_limit=1,
+            minimum_score=0,
+        )
+        await asyncio.wait_for(service.queue.join(), 30)
+        assert service.get_scan(seed["id"])["status"] == "completed"
+
+        gallery_started = asyncio.Event()
+        release_gallery = asyncio.Event()
+
+        class FailingRefreshScraper:
+            def __init__(self) -> None:
+                self.gallery_calls = 0
+
+            async def browse(self, **kwargs: object) -> dict:
+                return {
+                    "items": [
+                        {
+                            "url": GALLERY_A,
+                            "title": "Retry Alpha",
+                            "thumbnail_remote_url": (
+                                "https://cdni.pornpics.com/t/retry.png"
+                            ),
+                        }
+                    ],
+                    "next_url": PAGE_2 if int(kwargs["page"]) == 1 else None,
+                }
+
+            async def gallery(self, _: str) -> dict:
+                self.gallery_calls += 1
+                if self.gallery_calls == 1:
+                    gallery_started.set()
+                    await release_gallery.wait()
+                raise RuntimeError("temporary source failure")
+
+        scraper = FailingRefreshScraper()
+        service.scraper = scraper
+        scan = service.create_scan(
+            example_directory="pose",
+            pose_tag_id=tag_id,
+            source_url=ROOT,
+            page_limit=2,
+            minimum_score=0,
+        )
+        await asyncio.wait_for(gallery_started.wait(), 30)
+        local_results, _ = service.results(
+            scan["id"], review="all", min_score=0, limit=20, offset=0
+        )
+        local = next(item for item in local_results if item["gallery_url"] == GALLERY_A)
+        original_id = local["id"]
+        original_score = local["score"]
+        service.set_review(scan["id"], original_id, "accepted")
+        release_gallery.set()
+        await asyncio.wait_for(service.queue.join(), 30)
+
+        completed = service.get_scan(scan["id"])
+        assert completed["status"] == "completed_with_errors"
+        assert completed["processed_galleries"] == 1
+        assert completed["failed_galleries"] == 1
+        results, _ = service.results(
+            scan["id"], review="all", min_score=0, limit=20, offset=0
+        )
+        preserved = next(item for item in results if item["gallery_url"] == GALLERY_A)
+        assert preserved["id"] == original_id
+        assert preserved["review"] == "accepted"
+        assert preserved["score"] == original_score
+        assert preserved["status"] == "completed"
+        assert preserved["online_scanned"] is False
+        assert preserved["online_refresh_failed"] is True
+        assert "temporary source failure" in preserved["error"]
+        assert scraper.gallery_calls == 2
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_finder_corpus_search_pause_resumes_idempotently(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(finder_module, "validate_public_media_url", lambda value: value)
+    config, database, tag_id = configured(tmp_path)
+    service = FinderService(
+        config,
+        database,
+        FakeScraper(),
+        EventBroker(),
+        encoder=FakeEncoder(),
+        media_fetcher=fake_media,
+    )
+    await service.start()
+    try:
+        seed = service.create_scan(
+            example_directory="pose",
+            pose_tag_id=tag_id,
+            source_url=ROOT,
+            page_limit=1,
+            minimum_score=0,
+        )
+        await asyncio.wait_for(service.queue.join(), 30)
+        assert service.get_scan(seed["id"])["status"] == "completed"
+
+        class EmptyScraper:
+            async def browse(self, **_: object) -> dict:
+                return {"items": [], "next_url": None}
+
+            async def gallery(self, _: str) -> dict:
+                raise AssertionError
+
+        service.scraper = EmptyScraper()
+        original_rows = service._corpus_descriptor_rows
+        scan_holder: dict[str, str] = {}
+        calls = 0
+
+        def pause_after_first_batch(
+            after: tuple[str, int, str] | None,
+            *,
+            limit: int = 256,
+        ):
+            nonlocal calls
+            rows = original_rows(after, limit=limit)
+            calls += 1
+            if calls == 1:
+                service.pause(scan_holder["id"])
+            return rows
+
+        monkeypatch.setattr(service, "_corpus_descriptor_rows", pause_after_first_batch)
+        scan = service.create_scan(
+            example_directory="pose",
+            pose_tag_id=tag_id,
+            source_url=ROOT,
+            page_limit=1,
+            minimum_score=0,
+        )
+        scan_holder["id"] = scan["id"]
+        await asyncio.wait_for(service.queue.join(), 30)
+        paused = service.get_scan(scan["id"])
+        assert paused["status"] == "paused"
+        assert paused["corpus_search_complete"] is False
+
+        monkeypatch.setattr(service, "_corpus_descriptor_rows", original_rows)
+        service.resume(scan["id"])
+        await asyncio.wait_for(service.queue.join(), 30)
+        completed = service.get_scan(scan["id"])
+        assert completed["status"] == "completed"
+        assert completed["corpus_search_complete"] is True
+        assert completed["corpus_images_scored"] == 3
+        assert completed["corpus_galleries_scored"] == 2
+        results, total = service.results(
+            scan["id"], review="all", min_score=0, limit=20, offset=0
+        )
+        assert total == 2
+        assert len({item["gallery_key"] for item in results}) == 2
+    finally:
+        await service.stop()
+
+
+def test_finder_corpus_backfill_unions_historical_top_matches(
+    tmp_path: Path,
+) -> None:
+    config, database, tag_id = configured(tmp_path)
+    service = FinderService(
+        config,
+        database,
+        FakeScraper(),
+        EventBroker(),
+        encoder=FakeEncoder(),
+        media_fetcher=fake_media,
+    )
+    service.ensure_schema()
+    scans = [
+        service.create_scan(
+            example_directory="pose",
+            pose_tag_id=tag_id,
+            source_url=ROOT,
+            page_limit=1,
+            minimum_score=0,
+        )
+        for _ in range(2)
+    ]
+    for scan, ordinals in zip(scans, ((1, 2, 3), (4, 5, 6)), strict=True):
+        service._save_result(
+            scan["id"],
+            {"url": GALLERY_A, "title": "Historical Alpha"},
+            order=1,
+            score=0,
+            images_scored=3,
+            best=None,
+            status="completed",
+            ranking_version=finder_module.CURRENT_RANKING_VERSION,
+            top_matches=[
+                pose_first_match(ordinal, appearance=0.9 - ordinal / 100)
+                for ordinal in ordinals
+            ],
+        )
+    with database.connect() as connection:
+        connection.execute(
+            """DELETE FROM finder_corpus_meta
+               WHERE key = 'historical-backfill'"""
+        )
+    service.ensure_schema()
+    service.ensure_schema()
+
+    with database.connect() as connection:
+        gallery = connection.execute(
+            """SELECT state, image_count FROM finder_corpus_galleries
+               WHERE gallery_key = ?""",
+            (finder_module.gallery_key(GALLERY_A),),
+        ).fetchone()
+        images = connection.execute(
+            """SELECT source_key FROM finder_corpus_images
+               WHERE gallery_key = ?""",
+            (finder_module.gallery_key(GALLERY_A),),
+        ).fetchall()
+        indexes = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA index_list(finder_corpus_images)"
+            ).fetchall()
+        }
+        query, params = service._corpus_descriptor_query(("a", 0, "url:a"))
+        query_plan = [
+            str(row["detail"])
+            for row in connection.execute(
+                f"EXPLAIN QUERY PLAN {query}", params
+            ).fetchall()
+        ]
+    assert gallery["state"] == "partial"
+    assert gallery["image_count"] == 6
+    assert len(images) == 6
+    assert len({row["source_key"] for row in images}) == 6
+    assert "idx_finder_corpus_images_scan" in indexes
+    assert not any("TEMP B-TREE" in detail for detail in query_plan)
+    assert any(
+        "SEARCH i USING INDEX idx_finder_corpus_images_scan" in detail
+        for detail in query_plan
+    )
+    assert any("idx_finder_embedding_cache_source" in detail for detail in query_plan)
+
+
+@pytest.mark.asyncio
 async def test_finder_spatial_top_three_exact_gate_and_versioned_cache(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1049,6 +1565,9 @@ async def test_finder_model_upgrade_restarts_partial_scan_without_mixed_results(
     assert reset["next_url"] == ROOT
     assert reset["processed_galleries"] == 0
     assert reset["processed_images"] == 0
+    assert reset["corpus_search_complete"] is False
+    assert reset["corpus_images_scored"] == 0
+    assert reset["corpus_galleries_scored"] == 0
     assert (
         upgraded.results(scan["id"], review="all", min_score=0, limit=20, offset=0)[1]
         == 0
@@ -1178,6 +1697,28 @@ def test_finder_cache_prunes_stale_models_lru_and_transient_pose_errors(
     assert len(rows) == 3
     assert {row["model_key"] for row in rows} == {"current-model"}
 
+    now = "2026-01-01T00:00:00+00:00"
+    with database.connect() as connection:
+        connection.execute(
+            """INSERT INTO finder_corpus_galleries(
+                   gallery_key, gallery_url, title, state, image_count,
+                   created_at, updated_at
+               ) VALUES ('mapped', ?, 'Mapped', 'partial', 1, ?, ?)""",
+            (GALLERY_A, now, now),
+        )
+        connection.execute(
+            """INSERT INTO finder_corpus_images(
+                   gallery_key, source_key, image_url, preview_remote_url,
+                   ordinal, created_at, updated_at
+               ) VALUES (
+                   'mapped', 'current-0',
+                   'https://cdn.example/full.jpg',
+                   'https://cdn.example/preview.jpg', 1, ?, ?
+               )""",
+            (now, now),
+        )
+    assert service.corpus_status()["ready"] == 1
+
     service._store_embedding("current-extra", False, embedding, metadata)
     assert service._prune_embedding_cache() == 2
     with database.connect() as connection:
@@ -1187,6 +1728,14 @@ def test_finder_cache_prunes_stale_models_lru_and_transient_pose_errors(
             ).fetchone()[0]
             == 2
         )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM finder_corpus_images").fetchone()[
+                0
+            ]
+            == 1
+        )
+    assert service.corpus_status()["images"] == 1
+    assert service.corpus_status()["ready"] == 0
 
     service._pose_ready = True
     service._store_embedding(
@@ -1311,8 +1860,16 @@ def test_finder_schema_migrates_legacy_metadata_and_matches_safely(
                          'completed', 1, ?, ?)""",
             (GALLERY_A, now, now),
         )
+        cache_before = tuple(
+            connection.execute(
+                """SELECT cache_key, model_key, source_key, include_mirror,
+                          rows, dimensions, embedding, created_at, last_used_at
+                   FROM finder_embedding_cache WHERE cache_key = 'old-cache'"""
+            ).fetchone()
+        )
 
     service = FinderService(config, database, FakeScraper(), EventBroker())
+    service.ensure_schema()
     service.ensure_schema()
 
     with database.connect() as connection:
@@ -1330,6 +1887,15 @@ def test_finder_schema_migrates_legacy_metadata_and_matches_safely(
         result_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(finder_results)")
         }
+        scan_after = connection.execute(
+            """SELECT corpus_search_complete, corpus_images_scored,
+                      corpus_galleries_scored
+               FROM finder_scans WHERE id = 'legacy'"""
+        ).fetchone()
+        result_after = connection.execute(
+            """SELECT online_scanned FROM finder_results
+               WHERE id = 'legacy-result'"""
+        ).fetchone()
         reference_metadata = connection.execute(
             "SELECT metadata_json FROM finder_scan_references"
         ).fetchone()[0]
@@ -1354,12 +1920,39 @@ def test_finder_schema_migrates_legacy_metadata_and_matches_safely(
                 "PRAGMA index_list(finder_results)"
             ).fetchall()
         }
+        cache_indexes = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA index_list(finder_embedding_cache)"
+            ).fetchall()
+        }
+        cache_after = tuple(
+            connection.execute(
+                """SELECT cache_key, model_key, source_key, include_mirror,
+                          rows, dimensions, embedding, created_at, last_used_at
+                   FROM finder_embedding_cache WHERE cache_key = 'old-cache'"""
+            ).fetchone()
+        )
+        corpus_gallery = connection.execute(
+            """SELECT state, image_count FROM finder_corpus_galleries
+               WHERE gallery_key = 'legacy-gallery'"""
+        ).fetchone()
+        corpus_images = connection.execute(
+            """SELECT source_key, image_url, preview_remote_url, ordinal
+               FROM finder_corpus_images
+               WHERE gallery_key = 'legacy-gallery'"""
+        ).fetchall()
     assert "reference_model_key" in scan_columns
     assert "ranking_version" in scan_columns
     assert "metadata_json" in reference_columns
     assert "metadata_json" in cache_columns
     assert "matches_json" in result_columns
     assert "ranking_tier" in result_columns
+    assert "online_scanned" in result_columns
+    assert scan_after["corpus_search_complete"] == 1
+    assert scan_after["corpus_images_scored"] == 0
+    assert scan_after["corpus_galleries_scored"] == 0
+    assert result_after["online_scanned"] == 1
     assert json.loads(reference_metadata) == {}
     assert json.loads(cache_metadata) == {}
     assert legacy_scan["ranking_version"] == finder_module.LEGACY_RANKING_VERSION
@@ -1369,6 +1962,16 @@ def test_finder_schema_migrates_legacy_metadata_and_matches_safely(
     assert migrated_result["ranking_tier"] == 1
     assert "idx_finder_results_rank" in indexes
     assert "idx_finder_results_review_rank" in indexes
+    assert "idx_finder_embedding_cache_source" in cache_indexes
+    assert cache_after == cache_before
+    assert corpus_gallery["state"] == "partial"
+    assert corpus_gallery["image_count"] == 1
+    assert len(corpus_images) == 1
+    assert corpus_images[0]["source_key"] == service._remote_source_key(
+        "https://cdn.example/preview.jpg"
+    )
+    assert corpus_images[0]["image_url"].endswith("full.jpg")
+    assert corpus_images[0]["ordinal"] == 4
 
     results, total = service.results(
         "legacy", review="all", min_score=0, limit=10, offset=0

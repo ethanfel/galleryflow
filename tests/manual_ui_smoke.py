@@ -152,6 +152,9 @@ def build_visual_app(
         "pages_completed": 3 if finder_exhausted else 5,
         "processed_galleries": 64,
         "processed_images": 1280,
+        "corpus_search_complete": True,
+        "corpus_galleries_scored": 418,
+        "corpus_images_scored": 8156,
         "candidate_count": 2,
         "minimum_score": 0.65,
         "ranking_version": "pose-first-v1",
@@ -161,6 +164,19 @@ def build_visual_app(
 
     async def fake_finder_status(**kwargs: object) -> dict:
         return {"available": True, "model_ready": True, "model_name": "RTMO-L + visual verifier", "device": "CUDA", "folder_root": "/library"}
+
+    async def fake_finder_corpus(**kwargs: object) -> dict:
+        return {
+            "galleries": 418,
+            "images": 8420,
+            "complete": 374,
+            "partial": 44,
+            "ready": 8156,
+            "cache_entries": 10820,
+            "cache_bytes": 367001600,
+            "max_cache_entries": 50000,
+            "max_cache_bytes": 2147483648,
+        }
 
     async def fake_finder_folders(**kwargs: object) -> dict:
         return {"folders": [{"path": "sorted_outpaint/mating press - backview/selected_target_upscaled", "image_count": 25}]}
@@ -188,6 +204,7 @@ def build_visual_app(
                     "rank": 1,
                     "score": 0.96,
                     "ranking_tier": 2,
+                    "online_scanned": False,
                     "review": "pending",
                     "images_scored": 24,
                     "image_count": 24,
@@ -207,6 +224,7 @@ def build_visual_app(
                     "rank": 2,
                     "score": 1.0,
                     "ranking_tier": 3,
+                    "online_scanned": True,
                     "review": "pending",
                     "images_scored": 21,
                     "image_count": 21,
@@ -260,6 +278,9 @@ def build_visual_app(
         elif open_finder and getattr(route, "path", None) == "/api/finder/status":
             route.endpoint = fake_finder_status
             route.dependant.call = fake_finder_status
+        elif open_finder and getattr(route, "path", None) == "/api/finder/corpus":
+            route.endpoint = fake_finder_corpus
+            route.dependant.call = fake_finder_corpus
         elif open_finder and getattr(route, "path", None) == "/api/finder/folders":
             route.endpoint = fake_finder_folders
             route.dependant.call = fake_finder_folders
@@ -321,7 +342,9 @@ def main() -> None:
     )
     output = Path(f"/tmp/pornpic-webui-{suffix}.png")
     viewport = (
-        "390,844"
+        "390,1800"
+        if args.mobile and finder_mode
+        else "390,844"
         if args.mobile
         else "1920,969"
         if args.gallery or args.lightbox or args.pose
