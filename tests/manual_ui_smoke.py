@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import shutil
 import argparse
+import asyncio
 import json
 import tempfile
 import threading
@@ -29,8 +30,14 @@ def build_visual_app(
     open_lightbox: bool = False,
     open_pose: bool = False,
     open_finder: bool = False,
+    open_finder_feedback: bool = False,
+    open_finder_pose_flow: bool = False,
+    finder_direct_assign: bool = False,
+    finder_race: bool = False,
     finder_exhausted: bool = False,
 ):
+    finder_pose_mode = open_finder_pose_flow or finder_direct_assign
+    finder_review_mode = open_finder_feedback or finder_pose_mode
     config = AppConfig(
         data_dir=temp_root / "data",
         download_root=temp_root / "downloads",
@@ -165,6 +172,9 @@ def build_visual_app(
         "ranking_current": True,
         "progress_percent": 100,
     }
+    finder_race_state = {"review": "pending", "results_calls": 0, "selected": []}
+    if finder_race:
+        finder_scan["status"] = "running"
 
     async def fake_finder_status(**kwargs: object) -> dict:
         return {
@@ -242,95 +252,153 @@ def build_visual_app(
                 f"/api/media?url=https%3A%2F%2Fexample.test%2F{name}.jpg&token=visual"
             )
 
-        return {
-            "results": [
-                {
-                    "id": "visual-result-1",
-                    "gallery_id": galleries[2]["id"],
-                    "gallery_url": galleries[2]["url"],
-                    "title": "High-confidence multi-person pose candidate",
-                    "rank": 1,
-                    "score": 0.96,
-                    "base_score": 0.94,
-                    "feedback_adjustment": 0.02,
-                    "feedback_applied": True,
-                    "feedback_revision": 19,
-                    "ranking_tier": 2,
-                    "online_scanned": False,
-                    "review": "pending",
-                    "feedback_image_urls": [],
-                    "images_scored": 24,
-                    "image_count": 24,
-                    "person_count": 2,
-                    "score_breakdown": {
-                        "exact": 0.31,
-                        "pose": 0.96,
-                        "appearance": 0.72,
+        if finder_race:
+            finder_race_state["results_calls"] += 1
+            results_call = finder_race_state["results_calls"]
+            first_review = finder_race_state["review"]
+            if results_call == 2:
+                await asyncio.sleep(1.2)
+            elif results_call >= 3:
+                await asyncio.sleep(0.1)
+        else:
+            first_review = "accepted" if finder_review_mode else "pending"
+        first_image = (
+            "https://cdni.pornpics.com/1280/manual/001.jpg"
+            if finder_review_mode
+            else "https://example.test/candidate-1.jpg"
+        )
+        feedback_urls = (
+            list(finder_race_state["selected"])
+            if finder_race
+            else [first_image]
+            if finder_review_mode
+            else []
+        )
+        results = [
+            {
+                "id": "visual-result-1",
+                "gallery_id": galleries[2]["id"],
+                "gallery_url": galleries[2]["url"],
+                "title": "High-confidence multi-person pose candidate",
+                "rank": 1,
+                "score": 0.96,
+                "base_score": 0.94,
+                "feedback_adjustment": 0.02,
+                "feedback_applied": True,
+                "feedback_revision": 19,
+                "ranking_tier": 2,
+                "online_scanned": False,
+                "review": first_review,
+                "feedback_image_urls": feedback_urls,
+                "feedback_usable_image_urls": feedback_urls,
+                "feedback_pending_image_urls": [],
+                "images_scored": 24,
+                "image_count": 24,
+                "person_count": 2,
+                "score_breakdown": {
+                    "exact": 0.31,
+                    "pose": 0.96,
+                    "appearance": 0.72,
+                },
+                "top_matches": [
+                    {
+                        "rank": 1,
+                        "image_url": first_image,
+                        "preview_url": media("candidate-1"),
+                        "ordinal": 1 if finder_review_mode else 12,
+                        "score": 0.96,
+                        "base_score": 0.94,
+                        "feedback_adjustment": 0.02,
+                        "feedback_applied": True,
+                        "feedback_revision": 19,
+                        "ranking_tier": 2,
+                        "pose_score": 0.96,
+                        "pose_reliable": True,
+                        "match_type": "pose",
+                        "person_count": 2,
+                        "skeleton_overlay_url": media("overlay-1"),
                     },
-                    "top_matches": [
-                        {
-                            "rank": 1,
-                            "image_url": "https://example.test/candidate-1.jpg",
-                            "preview_url": media("candidate-1"),
-                            "ordinal": 12,
-                            "score": 0.96,
-                            "base_score": 0.94,
-                            "feedback_adjustment": 0.02,
-                            "feedback_applied": True,
-                            "feedback_revision": 19,
-                            "ranking_tier": 2,
-                            "pose_score": 0.96,
-                            "pose_reliable": True,
-                            "match_type": "pose",
-                            "person_count": 2,
-                            "skeleton_overlay_url": media("overlay-1"),
-                        },
-                        {
-                            "rank": 2,
-                            "image_url": "https://example.test/candidate-2.jpg",
-                            "preview_url": media("candidate-2"),
-                            "ordinal": 8,
-                            "score": 0.88,
-                            "ranking_tier": 2,
-                            "pose_score": 0.88,
-                            "pose_reliable": True,
-                            "match_type": "pose",
-                            "person_count": 2,
-                            "skeleton_overlay_url": media("overlay-2"),
-                        },
-                        {
-                            "rank": 3,
-                            "image_url": "https://example.test/candidate-3.jpg",
-                            "preview_url": media("candidate-3"),
-                            "ordinal": 19,
-                            "score": 0.84,
-                            "ranking_tier": 1,
-                            "appearance_score": 0.84,
-                            "match_type": "visual_fallback",
-                            "person_count": 2,
-                        },
-                    ],
-                },
-                {
-                    "id": "visual-result-2",
-                    "gallery_id": galleries[3]["id"],
-                    "gallery_url": galleries[3]["url"],
-                    "title": "Exact source image found in gallery",
-                    "rank": 2,
-                    "score": 1.0,
-                    "ranking_tier": 3,
-                    "online_scanned": True,
-                    "review": "pending",
-                    "feedback_image_urls": [],
-                    "images_scored": 21,
-                    "image_count": 21,
-                    "is_exact": True,
-                    "exact_score": 1.0,
-                    "best_image_url": "https://example.test/candidate-2.jpg",
-                    "best_preview_url": media("candidate-2"),
-                    "best_ordinal": 7,
-                },
-            ]
+                    {
+                        "rank": 2,
+                        "image_url": "https://example.test/candidate-2.jpg",
+                        "preview_url": media("candidate-2"),
+                        "ordinal": 8,
+                        "score": 0.88,
+                        "ranking_tier": 2,
+                        "pose_score": 0.88,
+                        "pose_reliable": True,
+                        "match_type": "pose",
+                        "person_count": 2,
+                        "skeleton_overlay_url": media("overlay-2"),
+                    },
+                    {
+                        "rank": 3,
+                        "image_url": "https://example.test/candidate-3.jpg",
+                        "preview_url": media("candidate-3"),
+                        "ordinal": 19,
+                        "score": 0.84,
+                        "ranking_tier": 1,
+                        "appearance_score": 0.84,
+                        "match_type": "visual_fallback",
+                        "person_count": 2,
+                    },
+                ],
+            },
+            {
+                "id": "visual-result-2",
+                "gallery_id": galleries[3]["id"],
+                "gallery_url": galleries[3]["url"],
+                "title": "Exact source image found in gallery",
+                "rank": 2,
+                "score": 1.0,
+                "ranking_tier": 3,
+                "online_scanned": True,
+                "review": "pending",
+                "feedback_image_urls": [],
+                "images_scored": 21,
+                "image_count": 21,
+                "is_exact": True,
+                "exact_score": 1.0,
+                "best_image_url": "https://example.test/candidate-2.jpg",
+                "best_preview_url": media("candidate-2"),
+                "best_ordinal": 7,
+            },
+        ]
+        counts = {
+            "pending": 1 if first_review != "pending" else 2,
+            "accepted": 1 if first_review == "accepted" else 0,
+            "maybe": 1 if first_review == "maybe" else 0,
+            "rejected": 1 if first_review == "rejected" else 0,
+            "total": 2,
+        }
+        return {
+            "counts": counts,
+            "results": [
+                *results,
+            ],
+        }
+
+    async def fake_finder_review(
+        scan_id: str, result_id: str, payload, **kwargs: object
+    ) -> dict:
+        await asyncio.sleep(0.6 if finder_race else 0)
+        finder_race_state["review"] = payload.review
+        selected = list(payload.feedback_image_urls or [])
+        finder_race_state["selected"] = selected
+        return {
+            "result": {
+                "id": result_id,
+                "gallery_id": galleries[2]["id"],
+                "gallery_url": galleries[2]["url"],
+                "title": "High-confidence multi-person pose candidate",
+                "rank": 1,
+                "score": 0.96,
+                "ranking_tier": 2,
+                "review": payload.review,
+                "feedback_image_urls": selected,
+                "feedback_usable_image_urls": selected,
+                "feedback_pending_image_urls": [],
+            }
         }
 
     async def fake_events(request=None) -> Response:
@@ -349,6 +417,14 @@ def build_visual_app(
             script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const modal=document.querySelector('#gallery-modal');const button=document.querySelector('[data-gallery-mode=pose]');const image=document.querySelector('.image-option:not(.skeleton-image)');if(modal?.open&&button&&image){button.click();clearInterval(poll)}},50)});"
         if open_finder:
             script += "localStorage.setItem('galleryflow:finder-scan', JSON.stringify('visual-finder'));window.addEventListener('load',()=>{const poll=setInterval(()=>{const button=document.querySelector('.finder-overlay-toggle:not([hidden])');if(button){button.click();clearInterval(poll)}},50)});"
+        if finder_review_mode:
+            script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const tab=document.querySelector('[data-finder-review=accepted]');if(tab&&document.querySelector('#finder-accepted-count')?.textContent==='1'){tab.click();requestAnimationFrame(()=>document.querySelector('.finder-open')?.click());clearInterval(poll)}},50)});"
+        if finder_pose_mode:
+            script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const button=document.querySelector('#finder-feedback-prepare-pose:not([hidden])');const grid=document.querySelector('#image-grid');if(button&&document.querySelector('#gallery-modal')?.open&&grid?.getAttribute('aria-busy')==='false'&&grid.querySelector('.image-option')){button.click();clearInterval(poll)}},50)});"
+        if finder_direct_assign:
+            script += "window.addEventListener('load',()=>{let phase=0;const poll=setInterval(()=>{const modal=document.querySelector('#gallery-modal');const options=[...document.querySelectorAll('#image-grid .image-option')];if(!modal?.classList.contains('is-pose-mode')||options.length<2||document.querySelector('#pose-save-status')?.textContent.includes('Loading'))return;if(phase===0){const target=options[0].querySelector('input');const control=options[1].querySelector('input');if(target?.checked)target.click();if(control&&!control.checked)control.click();document.querySelector('[data-pose-assignment=couple]')?.click();phase=1}else if(phase===1&&options[1]?.classList.contains('has-pose-control')){const target=options[0].querySelector('input');if(target&&!target.checked)target.click();document.querySelector('[data-pose-assignment=target]')?.click();phase=2}else if(phase===2&&options[0]?.classList.contains('has-pose-target')){document.documentElement.dataset.finderDirect='pass';clearInterval(poll)}},80);setTimeout(()=>{if(!document.documentElement.dataset.finderDirect)document.documentElement.dataset.finderDirect='fail'},5200)});"
+        if finder_race:
+            script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const button=document.querySelector('.finder-accept:not(:disabled)');if(button){setTimeout(()=>button.click(),1400);clearInterval(poll)}},50);setTimeout(()=>{const passed=document.querySelector('#finder-accepted-count')?.textContent==='1'&&document.querySelector('#finder-pending-count')?.textContent==='1';document.documentElement.dataset.finderRace=passed?'pass':'fail'},3800)});"
         return Response(script, media_type="application/javascript")
 
     async def fake_index() -> Response:
@@ -404,6 +480,13 @@ def build_visual_app(
         ):
             route.endpoint = fake_finder_results
             route.dependant.call = fake_finder_results
+        elif (
+            open_finder
+            and getattr(route, "path", None)
+            == "/api/finder/scans/{scan_id}/results/{result_id}"
+        ):
+            route.endpoint = fake_finder_review
+            route.dependant.call = fake_finder_review
     if open_finder and not any(
         getattr(route, "path", None) == "/api/finder/feedback/{pose_tag_id}"
         for route in app.routes
@@ -425,11 +508,34 @@ def main() -> None:
     parser.add_argument("--lightbox", action="store_true")
     parser.add_argument("--pose", action="store_true")
     parser.add_argument("--finder", action="store_true")
+    parser.add_argument("--finder-feedback", action="store_true")
+    parser.add_argument("--finder-pose-flow", action="store_true")
+    parser.add_argument("--finder-direct-assign", action="store_true")
+    parser.add_argument("--finder-race", action="store_true")
     parser.add_argument("--finder-exhausted", action="store_true")
     args = parser.parse_args()
-    finder_mode = args.finder or args.finder_exhausted
+    finder_mode = (
+        args.finder
+        or args.finder_feedback
+        or args.finder_pose_flow
+        or args.finder_direct_assign
+        or args.finder_race
+        or args.finder_exhausted
+    )
     suffix = (
-        "finder-exhausted-mobile"
+        "finder-direct-assign"
+        if args.finder_direct_assign
+        else "finder-race"
+        if args.finder_race
+        else "finder-pose-flow-mobile"
+        if args.finder_pose_flow and args.mobile
+        else "finder-pose-flow"
+        if args.finder_pose_flow
+        else "finder-feedback-mobile"
+        if args.finder_feedback and args.mobile
+        else "finder-feedback"
+        if args.finder_feedback
+        else "finder-exhausted-mobile"
         if args.finder_exhausted and args.mobile
         else "finder-exhausted"
         if args.finder_exhausted
@@ -477,6 +583,10 @@ def main() -> None:
                     open_lightbox=args.lightbox,
                     open_pose=args.pose,
                     open_finder=finder_mode,
+                    open_finder_feedback=args.finder_feedback,
+                    open_finder_pose_flow=args.finder_pose_flow,
+                    finder_direct_assign=args.finder_direct_assign,
+                    finder_race=args.finder_race,
                     finder_exhausted=args.finder_exhausted,
                 ),
                 host="127.0.0.1",
@@ -497,28 +607,40 @@ def main() -> None:
             raise RuntimeError(
                 "google-chrome-stable is required for this manual smoke check"
             )
-        subprocess.run(
-            [
-                browser,
-                "--headless=new",
-                "--no-sandbox",
-                "--disable-gpu",
-                "--run-all-compositor-stages-before-draw",
-                "--disable-background-networking",
-                "--disable-component-update",
-                "--disable-default-apps",
-                "--disable-sync",
-                "--force-prefers-reduced-motion",
-                "--no-first-run",
-                f"--virtual-time-budget={3000 if args.lightbox or args.pose else 2000 if finder_mode else 1000}",
-                f"--user-data-dir={Path(directory) / 'chrome-profile'}",
-                f"--window-size={viewport}",
-                f"--screenshot={output}",
-                f"http://127.0.0.1:18101/{'#finder' if finder_mode else '#sort' if args.sort else ''}",
-            ],
+        command = [
+            browser,
+            "--headless=new",
+            "--no-sandbox",
+            "--disable-gpu",
+            "--run-all-compositor-stages-before-draw",
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-default-apps",
+            "--disable-sync",
+            "--force-prefers-reduced-motion",
+            "--no-first-run",
+            f"--virtual-time-budget={6500 if args.finder_direct_assign else 4500 if args.finder_race else 4000 if args.finder_pose_flow else 3000 if args.lightbox or args.pose else 2000 if finder_mode else 1000}",
+            f"--user-data-dir={Path(directory) / 'chrome-profile'}",
+            f"--window-size={viewport}",
+            f"--screenshot={output}",
+            f"http://127.0.0.1:18101/{'#finder' if finder_mode else '#sort' if args.sort else ''}",
+        ]
+        if args.finder_race or args.finder_direct_assign:
+            command.insert(1, "--dump-dom")
+        completed = subprocess.run(
+            command,
             check=True,
             timeout=45,
+            capture_output=args.finder_race or args.finder_direct_assign,
+            text=args.finder_race or args.finder_direct_assign,
         )
+        if args.finder_race and 'data-finder-race="pass"' not in completed.stdout:
+            raise AssertionError("stale Finder results overwrote the completed review")
+        if (
+            args.finder_direct_assign
+            and 'data-finder-direct="pass"' not in completed.stdout
+        ):
+            raise AssertionError("direct gallery-grid pose assignment did not complete")
         server.should_exit = True
         thread.join(timeout=5)
     print(output)

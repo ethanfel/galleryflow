@@ -17,7 +17,7 @@ from app.downloader import EventBroker
 from app.finder import FinderService
 from app.main import create_app
 from app.pose_vision import PoseFrame
-from app.security import verify_media_signature
+from app.security import encode_gallery_id, gallery_key, verify_media_signature
 
 
 ROOT = "https://www.pornpics.com/"
@@ -1217,7 +1217,19 @@ def test_pose_first_persists_gallery_tier_and_uses_leading_lane_threshold(
     assert pose_gallery["score"] == pytest.approx(0.6)
     assert pose_gallery["best_ordinal"] == 1
     assert pose_gallery["above_threshold"] is False
-    assert service.get_scan(scan["id"])["candidate_count"] == 2
+    service.set_review(scan["id"], pose_gallery["id"], "maybe")
+    summary = service.get_scan(scan["id"])
+    assert summary["candidate_count"] == 2
+    assert summary["maybe_count"] == 0
+    assert summary["review_counts"] == {
+        "pending": 2,
+        "maybe": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "total": 2,
+    }
+    assert service.result_review_counts(scan["id"], min_score=0)["maybe"] == 1
+    assert service.result_review_counts(scan["id"], min_score=None)["maybe"] == 0
 
 
 @pytest.mark.asyncio
@@ -1980,7 +1992,28 @@ def test_finder_schema_migrates_legacy_metadata_and_matches_safely(
     assert results[0]["id"] == "legacy-result"
     assert results[0]["top_matches"][0]["rank"] == 1
     assert results[0]["top_matches"][0]["image_url"].endswith("full.jpg")
+    neutral = service.set_review("legacy", "legacy-result", "maybe")
+    assert neutral["review"] == "maybe"
+    assert neutral["feedback_image_urls"] == []
+    # No finder_results rebuild is needed: legacy review columns are plain
+    # durable text and remain compatible across repeated schema upgrades.
+    service.ensure_schema()
+    maybe_results, maybe_total = service.results(
+        "legacy", review="maybe", min_score=0, limit=10, offset=0
+    )
+    assert maybe_total == 1
+    assert maybe_results[0]["id"] == "legacy-result"
+    with database.connect() as connection:
+        assert (
+            connection.execute(
+                """SELECT review FROM finder_results
+                   WHERE id = 'legacy-result'"""
+            ).fetchone()[0]
+            == "maybe"
+        )
     legacy = service.get_scan("legacy")
+    assert legacy["maybe_count"] == 1
+    assert legacy["review_counts"]["maybe"] == 1
     assert legacy["ranking_current"] is False
     assert legacy["extendable"] is False
     with pytest.raises(finder_module.FinderConflict, match="legacy-ranked"):
@@ -2014,7 +2047,9 @@ async def test_finder_api_signs_best_preview(tmp_path: Path, monkeypatch) -> Non
     app.state.finder.encoder = FakeEncoder()
     app.state.finder.pose_estimator = FakePoseEstimator()
     app.state.finder.media_fetcher = fake_media
-    app.state.finder.scraper = FakeScraper()
+    fake_scraper = FakeScraper()
+    app.state.finder.scraper = fake_scraper
+    monkeypatch.setattr(app.state.scraper, "gallery", fake_scraper.gallery)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
@@ -2043,6 +2078,50 @@ async def test_finder_api_signs_best_preview(tmp_path: Path, monkeypatch) -> Non
                     json={"label": "Finder pose", "default_role": "solo"},
                 )
             ).json()["tag"]
+            now = finder_module.utc_now()
+            with app.state.db.connect() as connection:
+                connection.execute(
+                    """INSERT INTO finder_corpus_galleries(
+                           gallery_key, gallery_url, title,
+                           thumbnail_remote_url, state, image_count,
+                           created_at, updated_at
+                       ) VALUES (?, ?, 'Historic partial', '', 'partial', 1, ?, ?)""",
+                    (gallery_key(GALLERY_A), GALLERY_A, now, now),
+                )
+                connection.execute(
+                    """INSERT INTO finder_corpus_images(
+                           gallery_key, source_key, image_url,
+                           preview_remote_url, ordinal, created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, 1, ?, ?)""",
+                    (
+                        gallery_key(GALLERY_A),
+                        "url:https://cdni.pornpics.com/p/stale.png",
+                        "https://cdni.pornpics.com/full/stale.png",
+                        "https://cdni.pornpics.com/p/stale.png",
+                        now,
+                        now,
+                    ),
+                )
+            opened_gallery = await client.get(
+                f"/api/galleries/{encode_gallery_id(GALLERY_A)}"
+            )
+            assert opened_gallery.status_code == 200
+            with app.state.db.connect() as connection:
+                promoted = connection.execute(
+                    """SELECT state, image_count
+                       FROM finder_corpus_galleries WHERE gallery_key = ?""",
+                    (gallery_key(GALLERY_A),),
+                ).fetchone()
+                promoted_images = connection.execute(
+                    """SELECT image_url FROM finder_corpus_images
+                       WHERE gallery_key = ? ORDER BY ordinal""",
+                    (gallery_key(GALLERY_A),),
+                ).fetchall()
+            assert dict(promoted) == {"state": "complete", "image_count": 2}
+            assert [row["image_url"] for row in promoted_images] == [
+                "https://cdni.pornpics.com/full/blue.png",
+                "https://cdni.pornpics.com/full/black.png",
+            ]
             response = await client.post(
                 "/api/finder/scans",
                 json={
@@ -2178,6 +2257,42 @@ async def test_finder_api_signs_best_preview(tmp_path: Path, monkeypatch) -> Non
             assert reviewed_body["feedback"]["accepted_samples"] == 1
             assert reviewed_body["feedback"]["applies_to"] == "future_scans"
 
+            invalid_neutral = await client.patch(
+                f"/api/finder/scans/{scan_id}/results/{result['id']}",
+                json={
+                    "review": "maybe",
+                    "feedback_image_urls": [selected_image],
+                },
+            )
+            assert invalid_neutral.status_code == 400
+            neutral = await client.patch(
+                f"/api/finder/scans/{scan_id}/results/{result['id']}",
+                json={"review": "maybe", "feedback_image_urls": []},
+            )
+            assert neutral.status_code == 200
+            assert neutral.json()["result"]["review"] == "maybe"
+            assert neutral.json()["result"]["feedback_image_urls"] == []
+            assert neutral.json()["feedback"]["accepted_samples"] == 0
+            maybe_results = await client.get(
+                f"/api/finder/scans/{scan_id}/results",
+                params={"review": "maybe", "min_score": 0},
+            )
+            assert maybe_results.status_code == 200
+            assert maybe_results.json()["total"] == 1
+            assert maybe_results.json()["items"][0]["id"] == result["id"]
+            assert maybe_results.json()["counts"]["maybe"] == 1
+            scan_response = await client.get(f"/api/finder/scans/{scan_id}")
+            assert scan_response.json()["scan"]["maybe_count"] == 1
+            assert scan_response.json()["scan"]["review_counts"]["maybe"] == 1
+            restored = await client.patch(
+                f"/api/finder/scans/{scan_id}/results/{result['id']}",
+                json={
+                    "review": "accepted",
+                    "feedback_image_urls": [selected_image],
+                },
+            )
+            assert restored.status_code == 200
+
             empty_accept = await client.patch(
                 f"/api/finder/scans/{scan_id}/results/{result['id']}",
                 json={"review": "accepted", "feedback_image_urls": []},
@@ -2251,7 +2366,8 @@ async def test_finder_feedback_curated_samples_persist_and_freeze(
             first_scan["id"], review="all", min_score=0, limit=20, offset=0
         )
         result = results[0]
-        selected_url = result["top_matches"][0]["image_url"]
+        selected_match = result["top_matches"][0]
+        selected_url = selected_match["image_url"]
         review_only = results[1]
         initial_revision = service.feedback_status(tag_id)["revision"]
         rejected_without_samples = service.set_review(
@@ -2263,14 +2379,221 @@ async def test_finder_feedback_curated_samples_persist_and_freeze(
         assert rejected_without_samples["review"] == "rejected"
         assert rejected_without_samples["feedback_image_urls"] == []
         assert service.feedback_status(tag_id)["revision"] == initial_revision
+        with pytest.raises(ValueError, match="cannot include"):
+            service.set_review(
+                first_scan["id"],
+                result["id"],
+                "maybe",
+                [selected_url],
+            )
+        with pytest.raises(ValueError, match="cannot include"):
+            service.set_review(
+                first_scan["id"],
+                result["id"],
+                "pending",
+                [selected_url],
+            )
+        neutral_without_feedback = service.set_review(
+            first_scan["id"],
+            result["id"],
+            "maybe",
+            [],
+        )
+        assert neutral_without_feedback["review"] == "maybe"
+        assert neutral_without_feedback["feedback_image_urls"] == []
+        assert service.feedback_status(tag_id)["revision"] == initial_revision
 
-        accepted = service.set_review(
+        # Feedback always uses the current analyzer cache, even when the result
+        # belongs to a scan created under an older DINO/analyzer namespace.
+        assert service._model_key != "retired-analyzer-model"
+        with database.connect() as connection:
+            connection.execute(
+                """UPDATE finder_scans SET reference_model_key = ?
+                   WHERE id = ?""",
+                ("retired-analyzer-model", first_scan["id"]),
+            )
+
+        adjacent_url = "https://cdni.pornpics.com/full/adjacent-feedback.png"
+        adjacent_preview = "https://cdni.pornpics.com/p/adjacent-feedback.png"
+        now = finder_module.utc_now()
+        with database.connect() as connection:
+            connection.execute(
+                """INSERT INTO finder_corpus_images(
+                       gallery_key, source_key, image_url, preview_remote_url,
+                       ordinal, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    result["gallery_key"],
+                    service._remote_source_key(adjacent_preview),
+                    adjacent_url,
+                    adjacent_preview,
+                    99,
+                    now,
+                    now,
+                ),
+            )
+        assert adjacent_url not in {
+            match["image_url"] for match in result["top_matches"]
+        }
+        with database.connect() as connection:
+            assert (
+                connection.execute(
+                    """SELECT COUNT(*) FROM finder_embedding_cache
+                       WHERE source_key = ? AND include_mirror = 0""",
+                    (service._remote_source_key(adjacent_preview),),
+                ).fetchone()[0]
+                == 0
+            )
+
+        async def unavailable_media(_: str, __: str) -> bytes:
+            raise RuntimeError("temporary image failure")
+
+        service.media_fetcher = unavailable_media
+        with pytest.raises(finder_module.FinderUnavailable, match="could not load"):
+            await service.set_review_ready(
+                first_scan["id"],
+                result["id"],
+                "accepted",
+                [adjacent_url],
+            )
+        unchanged, _ = service.results(
+            first_scan["id"], review="maybe", min_score=0, limit=20, offset=0
+        )
+        assert [item["id"] for item in unchanged] == [result["id"]]
+        assert service.feedback_status(tag_id)["accepted_samples"] == 0
+        with pytest.raises(finder_module.FinderUnavailable, match="usable pose"):
+            service.set_review(
+                first_scan["id"],
+                result["id"],
+                "accepted",
+                [adjacent_url],
+                require_usable=True,
+            )
+        assert service.feedback_status(tag_id)["accepted_samples"] == 0
+
+        service.media_fetcher = fake_media
+        accepted = await service.set_review_ready(
+            first_scan["id"],
+            result["id"],
+            "accepted",
+            [adjacent_url],
+        )
+        assert accepted["feedback_image_urls"] == [adjacent_url]
+        reloaded_adjacent, _ = service.results(
+            first_scan["id"], review="accepted", min_score=0, limit=20, offset=0
+        )
+        assert reloaded_adjacent[0]["feedback_image_urls"] == [adjacent_url]
+        adjacent_status = service.feedback_status(tag_id)
+        assert adjacent_status["accepted_samples"] == 1
+        assert adjacent_status["usable_accepted_samples"] == 1
+        with database.connect() as connection:
+            saved_pose = connection.execute(
+                """SELECT pose_json FROM finder_feedback_samples
+                   WHERE origin_result_id = ?""",
+                (result["id"],),
+            ).fetchone()[0]
+        assert saved_pose
+
+        # The user can curate up to three images, then remove one without the
+        # deselected sample lingering in persisted feedback.
+        all_three = [
+            *(match["image_url"] for match in result["top_matches"]),
+            adjacent_url,
+        ]
+        assert len(all_three) == 3
+        selected_three = await service.set_review_ready(
+            first_scan["id"],
+            result["id"],
+            "accepted",
+            all_three,
+        )
+        assert set(selected_three["feedback_image_urls"]) == set(all_three)
+        three_status = service.feedback_status(tag_id)
+        assert three_status["accepted_samples"] == 3
+        selected_two_urls = all_three[:2]
+        removed_url = all_three[2]
+        selected_two = await service.set_review_ready(
+            first_scan["id"],
+            result["id"],
+            "accepted",
+            selected_two_urls,
+        )
+        assert set(selected_two["feedback_image_urls"]) == set(selected_two_urls)
+        two_status = service.feedback_status(tag_id)
+        assert two_status["accepted_samples"] == 2
+        assert two_status["revision"] == three_status["revision"] + 1
+        two_reload, _ = service.results(
+            first_scan["id"], review="accepted", min_score=0, limit=20, offset=0
+        )
+        assert set(two_reload[0]["feedback_image_urls"]) == set(selected_two_urls)
+        assert removed_url not in two_reload[0]["feedback_image_urls"]
+        repeated_two = await service.set_review_ready(
+            first_scan["id"],
+            result["id"],
+            "accepted",
+            selected_two_urls,
+        )
+        assert set(repeated_two["feedback_image_urls"]) == set(selected_two_urls)
+        assert service.feedback_status(tag_id)["revision"] == two_status["revision"]
+
+        # The curated subset stays editable after acceptance, and omitting it
+        # on a later patch preserves the prior explicit selection.
+        edited = service.set_review(
             first_scan["id"],
             result["id"],
             "accepted",
             [selected_url],
         )
-        assert accepted["feedback_image_urls"] == [selected_url]
+        assert edited["feedback_image_urls"] == [selected_url]
+        preserved = service.set_review(
+            first_scan["id"],
+            result["id"],
+            "accepted",
+        )
+        assert preserved["feedback_image_urls"] == [selected_url]
+        reloaded, _ = service.results(
+            first_scan["id"], review="accepted", min_score=0, limit=20, offset=0
+        )
+        assert reloaded[0]["feedback_image_urls"] == [selected_url]
+
+        # A refreshed full-size URL can legitimately retain the same preview
+        # source key. Persist the new URL instead of treating it as idempotent
+        # and reverting to the old snapshot on reload.
+        changed_url = f"{selected_url}?revision=2"
+        selected_source_key = service._remote_source_key(
+            selected_match["preview_remote_url"]
+        )
+        with database.connect() as connection:
+            changed_rows = connection.execute(
+                """UPDATE finder_corpus_images SET image_url = ?
+                   WHERE gallery_key = ? AND source_key = ?""",
+                (changed_url, result["gallery_key"], selected_source_key),
+            ).rowcount
+        assert changed_rows == 1
+        changed = service.set_review(
+            first_scan["id"],
+            result["id"],
+            "accepted",
+            [changed_url],
+        )
+        assert changed["feedback_image_urls"] == [changed_url]
+        changed_reload, _ = service.results(
+            first_scan["id"], review="accepted", min_score=0, limit=20, offset=0
+        )
+        assert changed_reload[0]["feedback_image_urls"] == [changed_url]
+        with database.connect() as connection:
+            connection.execute(
+                """UPDATE finder_corpus_images SET image_url = ?
+                   WHERE gallery_key = ? AND source_key = ?""",
+                (selected_url, result["gallery_key"], selected_source_key),
+            )
+        restored_url = service.set_review(
+            first_scan["id"],
+            result["id"],
+            "accepted",
+            [selected_url],
+        )
+        assert restored_url["feedback_image_urls"] == [selected_url]
         status = service.feedback_status(tag_id)
         assert status["accepted_galleries"] == 1
         assert status["accepted_samples"] == 1
@@ -2290,13 +2613,46 @@ async def test_finder_feedback_curated_samples_persist_and_freeze(
         assert service.feedback_status(tag_id)["revision"] == first_revision
         with pytest.raises(ValueError, match="requires at least one"):
             service.set_review(first_scan["id"], result["id"], "accepted", [])
-        with pytest.raises(ValueError, match="proposed matches"):
+        with pytest.raises(ValueError, match="belong to"):
             service.set_review(
                 first_scan["id"],
                 result["id"],
                 "rejected",
                 ["https://cdni.pornpics.com/full/not-proposed.jpg"],
             )
+
+        maybe = service.set_review(
+            first_scan["id"],
+            result["id"],
+            "maybe",
+            [],
+        )
+        assert maybe["review"] == "maybe"
+        assert maybe["feedback_image_urls"] == []
+        assert service.feedback_status(tag_id)["accepted_samples"] == 0
+        maybe_results, maybe_total = service.results(
+            first_scan["id"], review="maybe", min_score=0, limit=20, offset=0
+        )
+        assert maybe_total == 1
+        assert [item["id"] for item in maybe_results] == [result["id"]]
+        counts = service.result_review_counts(first_scan["id"], min_score=0)
+        assert counts == {
+            "pending": 0,
+            "maybe": 1,
+            "accepted": 0,
+            "rejected": 1,
+            "total": 2,
+        }
+        scan_counts = service.get_scan(first_scan["id"])
+        assert scan_counts["maybe_count"] == 1
+        assert scan_counts["review_counts"] == counts
+        service.set_review(
+            first_scan["id"],
+            result["id"],
+            "accepted",
+            [selected_url],
+        )
+        first_revision = service.feedback_status(tag_id)["revision"]
 
         # A scan snapshots feedback when it is created. Later review changes
         # cannot alter that scan, including after a pause/resume or extension.
@@ -2355,6 +2711,134 @@ async def test_finder_feedback_curated_samples_persist_and_freeze(
                     (frozen_scan["id"],),
                 ).fetchone()[0]
                 == 1
+            )
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_finder_feedback_review_is_authoritative_per_gallery_across_scans(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(finder_module, "validate_public_media_url", lambda value: value)
+    config, database, tag_id = configured(tmp_path)
+    service = FinderService(
+        config,
+        database,
+        FakeScraper(),
+        EventBroker(),
+        encoder=SpatialFakeEncoder(),
+        pose_estimator=FakePoseEstimator(),
+        media_fetcher=fake_media,
+    )
+    await service.start()
+    try:
+        first_scan = service.create_scan(
+            example_directory="pose",
+            pose_tag_id=tag_id,
+            source_url=ROOT,
+            page_limit=1,
+            minimum_score=0,
+        )
+        await asyncio.wait_for(service.queue.join(), 30)
+        first_results, _ = service.results(
+            first_scan["id"], review="all", min_score=0, limit=20, offset=0
+        )
+        first = next(item for item in first_results if item["gallery_url"] == GALLERY_A)
+        first_url = first["top_matches"][0]["image_url"]
+        await service.set_review_ready(
+            first_scan["id"], first["id"], "accepted", [first_url]
+        )
+        first_revision = service.feedback_status(tag_id)["revision"]
+        assert first_revision == 1
+
+        second_scan = service.create_scan(
+            example_directory="pose",
+            pose_tag_id=tag_id,
+            source_url=ROOT,
+            page_limit=1,
+            minimum_score=0,
+        )
+        await asyncio.wait_for(service.queue.join(), 30)
+        second_results, _ = service.results(
+            second_scan["id"], review="all", min_score=0, limit=20, offset=0
+        )
+        second = next(
+            item
+            for item in second_results
+            if item["gallery_key"] == first["gallery_key"]
+        )
+        replacement_url = next(
+            match["image_url"]
+            for match in second["top_matches"]
+            if match["image_url"] != first_url
+        )
+        await service.set_review_ready(
+            second_scan["id"],
+            second["id"],
+            "accepted",
+            [replacement_url],
+        )
+        replacement_status = service.feedback_status(tag_id)
+        assert replacement_status["revision"] == first_revision + 1
+        assert replacement_status["accepted_galleries"] == 1
+        assert replacement_status["accepted_samples"] == 1
+        with database.connect() as connection:
+            decisions = connection.execute(
+                """SELECT origin_result_id, decision
+                   FROM finder_feedback_decisions
+                   WHERE pose_tag_id = ? AND gallery_key = ?""",
+                (tag_id, first["gallery_key"]),
+            ).fetchall()
+            samples = connection.execute(
+                """SELECT origin_result_id, image_url
+                   FROM finder_feedback_samples"""
+            ).fetchall()
+        assert [tuple(row) for row in decisions] == [(second["id"], "accepted")]
+        assert [tuple(row) for row in samples] == [(second["id"], replacement_url)]
+
+        service.set_review(second_scan["id"], second["id"], "maybe", [])
+        neutral_status = service.feedback_status(tag_id)
+        assert neutral_status["revision"] == replacement_status["revision"] + 1
+        assert neutral_status["accepted_samples"] == 0
+        assert neutral_status["rejected_samples"] == 0
+        with database.connect() as connection:
+            assert (
+                connection.execute(
+                    """SELECT COUNT(*) FROM finder_feedback_decisions
+                       WHERE pose_tag_id = ? AND gallery_key = ?""",
+                    (tag_id, first["gallery_key"]),
+                ).fetchone()[0]
+                == 0
+            )
+
+        await service.set_review_ready(
+            first_scan["id"], first["id"], "accepted", [first_url]
+        )
+        restored_status = service.feedback_status(tag_id)
+        assert restored_status["revision"] == neutral_status["revision"] + 1
+        assert restored_status["accepted_samples"] == 1
+
+        rejected_without_sample = service.set_review(
+            second_scan["id"],
+            second["id"],
+            "rejected",
+            [],
+        )
+        assert rejected_without_sample["review"] == "rejected"
+        assert rejected_without_sample["feedback_image_urls"] == []
+        cleared_status = service.feedback_status(tag_id)
+        assert cleared_status["revision"] == restored_status["revision"] + 1
+        assert cleared_status["accepted_samples"] == 0
+        assert cleared_status["rejected_samples"] == 0
+        with database.connect() as connection:
+            assert (
+                connection.execute(
+                    """SELECT COUNT(*) FROM finder_feedback_decisions
+                       WHERE pose_tag_id = ? AND gallery_key = ?""",
+                    (tag_id, first["gallery_key"]),
+                ).fetchone()[0]
+                == 0
             )
     finally:
         await service.stop()

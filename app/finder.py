@@ -31,7 +31,7 @@ from .security import (
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"}
 ACTIVE_STATUSES = {"queued", "preparing", "scanning", "pausing", "canceling"}
 TERMINAL_STATUSES = {"completed", "completed_with_errors", "failed", "canceled"}
-REVIEW_STATES = {"pending", "accepted", "rejected"}
+REVIEW_STATES = {"pending", "maybe", "accepted", "rejected"}
 ANALYZER_VERSION = "hybrid-spatial-pyramid-v1+rtmo-l-geometry-v1+phash64-gate-v1"
 LEGACY_RANKING_VERSION = "appearance-v1"
 CURRENT_RANKING_VERSION = "pose-first-v1"
@@ -651,24 +651,29 @@ class FinderService:
         """Return source key, pose model key and a validated pose snapshot."""
 
         source_key = self._remote_source_key(preview_remote_url)
-        row = db.execute(
-            """SELECT metadata_json FROM finder_embedding_cache
-               WHERE model_key = ? AND source_key = ? AND include_mirror = 0
-               ORDER BY last_used_at DESC LIMIT 1""",
-            (model_key, source_key),
-        ).fetchone()
-        if not row:
-            return source_key, "", ""
-        metadata = self._decode_metadata(row["metadata_json"])
-        pose = metadata.get("pose")
-        if not isinstance(pose, dict) or self._metadata_pose(metadata) is None:
-            return source_key, "", ""
-        pose_model_key = str(pose.get("model_key") or "")
-        return (
-            source_key,
-            pose_model_key[:500],
-            json.dumps(pose, separators=(",", ":"), sort_keys=True),
-        )
+        model_keys = list(dict.fromkeys([self._model_key, model_key]))
+        for candidate_model_key in model_keys:
+            if not candidate_model_key:
+                continue
+            row = db.execute(
+                """SELECT metadata_json FROM finder_embedding_cache
+                   WHERE model_key = ? AND source_key = ? AND include_mirror = 0
+                   ORDER BY last_used_at DESC LIMIT 1""",
+                (candidate_model_key, source_key),
+            ).fetchone()
+            if not row:
+                continue
+            metadata = self._decode_metadata(row["metadata_json"])
+            pose = metadata.get("pose")
+            if not isinstance(pose, dict) or self._metadata_pose(metadata) is None:
+                continue
+            pose_model_key = str(pose.get("model_key") or "")
+            return (
+                source_key,
+                pose_model_key[:500],
+                json.dumps(pose, separators=(",", ":"), sort_keys=True),
+            )
+        return source_key, "", ""
 
     def _backfill_feedback(self, db: Any) -> None:
         """Preserve pre-upgrade accepted/rejected reviews as weak evidence."""
@@ -1465,6 +1470,11 @@ class FinderService:
         scan["corpus_search_complete"] = bool(scan["corpus_search_complete"])
         scan["has_next_page"] = bool(scan.get("next_url"))
         scan["ranking_current"] = scan.get("ranking_version") == CURRENT_RANKING_VERSION
+        scan["review_counts"] = {
+            state: max(0, int(scan.get(f"{state}_count", 0)))
+            for state in ("pending", "maybe", "accepted", "rejected")
+        }
+        scan["review_counts"]["total"] = sum(scan["review_counts"].values())
         scan["extendable"] = bool(
             scan["ranking_current"]
             and scan["has_next_page"]
@@ -1507,7 +1517,23 @@ class FinderService:
         query = f"""SELECT s.*,
                        (SELECT COUNT(*) FROM finder_results r
                         WHERE r.scan_id = s.id AND r.status = 'completed'
-                          AND r.score >= s.minimum_score) AS candidate_count
+                          AND r.score >= s.minimum_score) AS candidate_count,
+                       (SELECT COUNT(*) FROM finder_results r
+                        WHERE r.scan_id = s.id AND r.status = 'completed'
+                          AND r.score >= s.minimum_score
+                          AND r.review = 'pending') AS pending_count,
+                       (SELECT COUNT(*) FROM finder_results r
+                        WHERE r.scan_id = s.id AND r.status = 'completed'
+                          AND r.score >= s.minimum_score
+                          AND r.review = 'maybe') AS maybe_count,
+                       (SELECT COUNT(*) FROM finder_results r
+                        WHERE r.scan_id = s.id AND r.status = 'completed'
+                          AND r.score >= s.minimum_score
+                          AND r.review = 'accepted') AS accepted_count,
+                       (SELECT COUNT(*) FROM finder_results r
+                        WHERE r.scan_id = s.id AND r.status = 'completed'
+                          AND r.score >= s.minimum_score
+                          AND r.review = 'rejected') AS rejected_count
                     FROM finder_scans s {where}
                     ORDER BY s.created_at DESC"""
         values: list[Any] = list(params)
@@ -1966,20 +1992,20 @@ class FinderService:
         item["feedback_image_urls"] = []
         return item
 
+    @staticmethod
     def _feedback_image_urls_for_results(
-        self, result_ids: list[str]
+        db: Any, result_ids: list[str]
     ) -> dict[str, list[str]]:
         if not result_ids:
             return {}
         placeholders = ",".join("?" for _ in result_ids)
-        with self._lock, self.database.connect() as db:
-            rows = db.execute(
-                f"""SELECT origin_result_id, image_url
-                    FROM finder_feedback_samples
-                    WHERE origin_result_id IN ({placeholders})
-                    ORDER BY origin_result_id, created_at, source_key""",
-                result_ids,
-            ).fetchall()
+        rows = db.execute(
+            f"""SELECT origin_result_id, image_url
+                FROM finder_feedback_samples
+                WHERE origin_result_id IN ({placeholders})
+                ORDER BY origin_result_id, created_at, source_key""",
+            result_ids,
+        ).fetchall()
         selected: dict[str, list[str]] = {}
         for row in rows:
             selected.setdefault(str(row["origin_result_id"]), []).append(
@@ -1987,7 +2013,22 @@ class FinderService:
             )
         return selected
 
-    def results(
+    @staticmethod
+    def _review_counts_from_rows(rows: Any) -> dict[str, int]:
+        counts = {state: 0 for state in REVIEW_STATES}
+        for row in rows:
+            state = str(row["review"])
+            if state in counts:
+                counts[state] = max(0, int(row["count"]))
+        return {
+            "pending": counts["pending"],
+            "maybe": counts["maybe"],
+            "accepted": counts["accepted"],
+            "rejected": counts["rejected"],
+            "total": sum(counts.values()),
+        }
+
+    def results_page(
         self,
         scan_id: str,
         *,
@@ -1995,7 +2036,9 @@ class FinderService:
         min_score: float | None,
         limit: int,
         offset: int,
-    ) -> tuple[list[dict[str, Any]], int]:
+    ) -> tuple[list[dict[str, Any]], int, dict[str, int]]:
+        if review != "all" and review not in REVIEW_STATES:
+            raise ValueError("Invalid Finder review filter")
         scan = self.get_scan(scan_id)
         if not scan:
             raise FinderNotFound("Finder scan not found")
@@ -2012,6 +2055,7 @@ class FinderService:
             else "score DESC, discovered_order, id"
         )
         with self._lock, self.database.connect() as db:
+            db.execute("BEGIN")
             total = int(
                 db.execute(
                     f"SELECT COUNT(*) FROM finder_results WHERE {where}", params
@@ -2022,6 +2066,16 @@ class FinderService:
                     ORDER BY {order_by} LIMIT ? OFFSET ?""",
                 [*params, limit, offset],
             ).fetchall()
+            selected_urls = self._feedback_image_urls_for_results(
+                db, [str(row["id"]) for row in rows]
+            )
+            count_rows = db.execute(
+                """SELECT review, COUNT(*) AS count
+                   FROM finder_results
+                   WHERE scan_id = ? AND status = 'completed' AND score >= ?
+                   GROUP BY review""",
+                (scan_id, threshold),
+            ).fetchall()
         items = [
             self._decode_result(
                 row,
@@ -2031,13 +2085,249 @@ class FinderService:
             )
             for row in rows
         ]
-        selected_urls = self._feedback_image_urls_for_results(
-            [str(item["id"]) for item in items]
-        )
         for item in items:
             item["above_threshold"] = item["score"] >= scan["minimum_score"]
             item["feedback_image_urls"] = selected_urls.get(str(item["id"]), [])
+        return items, total, self._review_counts_from_rows(count_rows)
+
+    def results(
+        self,
+        scan_id: str,
+        *,
+        review: str,
+        min_score: float | None,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[dict[str, Any]], int]:
+        items, total, _ = self.results_page(
+            scan_id,
+            review=review,
+            min_score=min_score,
+            limit=limit,
+            offset=offset,
+        )
         return items, total
+
+    def result_review_counts(
+        self,
+        scan_id: str,
+        *,
+        min_score: float | None,
+    ) -> dict[str, int]:
+        scan = self.get_scan(scan_id)
+        if not scan:
+            raise FinderNotFound("Finder scan not found")
+        threshold = scan["minimum_score"] if min_score is None else min_score
+        with self._lock, self.database.connect() as db:
+            rows = db.execute(
+                """SELECT review, COUNT(*) AS count
+                   FROM finder_results
+                   WHERE scan_id = ? AND status = 'completed' AND score >= ?
+                   GROUP BY review""",
+                (scan_id, threshold),
+            ).fetchall()
+        return self._review_counts_from_rows(rows)
+
+    @staticmethod
+    def _validate_review_request(
+        review: str,
+        feedback_image_urls: list[str] | None,
+    ) -> None:
+        if review not in REVIEW_STATES:
+            raise ValueError("Invalid Finder review state")
+        if feedback_image_urls is not None and len(feedback_image_urls) > 3:
+            raise ValueError("At most three gallery images can train Finder feedback")
+        if review in {"pending", "maybe"} and feedback_image_urls:
+            raise ValueError("Pending and maybe reviews cannot include feedback images")
+
+    def _resolve_review_selection(
+        self,
+        db: Any,
+        *,
+        scan_id: str,
+        result_id: str,
+        review: str,
+        feedback_image_urls: list[str] | None,
+    ) -> tuple[Any, list[Any], list[str], list[dict[str, Any]]]:
+        row = db.execute(
+            """SELECT r.*, s.pose_tag_id, s.reference_model_key,
+                      s.ranking_version
+               FROM finder_results r
+               JOIN finder_scans s ON s.id = r.scan_id
+               WHERE r.id = ? AND r.scan_id = ?""",
+            (result_id, scan_id),
+        ).fetchone()
+        if not row:
+            raise FinderNotFound("Finder result not found")
+        matches = self._feedback_matches(
+            row,
+            ranking_version=str(row["ranking_version"] or LEGACY_RANKING_VERSION),
+        )
+        available = {str(match["image_url"]): match for match in matches}
+        for image in db.execute(
+            """SELECT image_url, preview_remote_url, ordinal
+               FROM finder_corpus_images
+               WHERE gallery_key = ?
+               ORDER BY ordinal, source_key""",
+            (str(row["gallery_key"]),),
+        ).fetchall():
+            image_url = str(image["image_url"])
+            available.setdefault(
+                image_url,
+                {
+                    "image_url": image_url,
+                    "preview_remote_url": str(image["preview_remote_url"]),
+                    "ordinal": int(image["ordinal"]),
+                },
+            )
+        stored_samples = db.execute(
+            """SELECT source_key, image_url, preview_remote_url,
+                      pose_model_key, pose_json
+               FROM finder_feedback_samples
+               WHERE origin_result_id = ?
+               ORDER BY created_at, source_key""",
+            (result_id,),
+        ).fetchall()
+        stored_urls = [str(item["image_url"]) for item in stored_samples]
+        for sample in stored_samples:
+            image_url = str(sample["image_url"])
+            available.setdefault(
+                image_url,
+                {
+                    "image_url": image_url,
+                    "preview_remote_url": str(sample["preview_remote_url"]),
+                    "ordinal": 0,
+                },
+            )
+        selected_urls: list[str] = []
+        if review in {"accepted", "rejected"}:
+            if feedback_image_urls is None:
+                requested = stored_urls or [
+                    str(match["image_url"]) for match in matches
+                ]
+            else:
+                requested = list(dict.fromkeys(feedback_image_urls))
+            unknown = [url for url in requested if url not in available]
+            if unknown:
+                raise ValueError("Feedback images must belong to this result's gallery")
+            requested_set = set(requested)
+            selected_urls = [url for url in available if url in requested_set]
+            if review == "accepted" and not selected_urls:
+                raise ValueError(
+                    "Accepting a gallery requires at least one selected image"
+                )
+        return (
+            row,
+            stored_samples,
+            selected_urls,
+            [available[url] for url in selected_urls],
+        )
+
+    def _review_analysis_targets(
+        self,
+        scan_id: str,
+        result_id: str,
+        review: str,
+        feedback_image_urls: list[str] | None,
+    ) -> list[tuple[str, str]]:
+        self._validate_review_request(review, feedback_image_urls)
+        scan = self.get_scan(scan_id)
+        if not scan:
+            raise FinderNotFound("Finder scan not found")
+        if review not in {"accepted", "rejected"}:
+            return []
+        with self._lock, self.database.connect() as db:
+            row, _, _, selected_matches = self._resolve_review_selection(
+                db,
+                scan_id=scan_id,
+                result_id=result_id,
+                review=review,
+                feedback_image_urls=feedback_image_urls,
+            )
+        return [
+            (str(match["preview_remote_url"]), str(row["gallery_url"]))
+            for match in selected_matches
+        ]
+
+    def _descriptor_has_usable_feedback_pose(
+        self,
+        descriptor: _ImageDescriptor,
+    ) -> bool:
+        pose = descriptor.metadata.get("pose")
+        if not isinstance(pose, dict):
+            return False
+        sample = {
+            "pose_model_key": str(pose.get("model_key") or ""),
+            "pose_json": json.dumps(pose, separators=(",", ":"), sort_keys=True),
+        }
+        return self._feedback_pose(sample) is not None
+
+    def _delete_current_descriptor(self, source_key: str) -> None:
+        cache_key = self._cache_key(source_key, False)
+        with self._lock, self.database.connect() as db:
+            db.execute(
+                "DELETE FROM finder_embedding_cache WHERE cache_key = ?",
+                (cache_key,),
+            )
+
+    async def set_review_ready(
+        self,
+        scan_id: str,
+        result_id: str,
+        review: str,
+        feedback_image_urls: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Analyze selected gallery images before persisting learning feedback."""
+
+        targets = await asyncio.to_thread(
+            self._review_analysis_targets,
+            scan_id,
+            result_id,
+            review,
+            feedback_image_urls,
+        )
+        if targets:
+            await self._ensure_encoder_ready()
+            if self.pose_estimator is None or not self._pose_ready:
+                raise FinderUnavailable(
+                    self._pose_error
+                    or "Finder pose analysis is unavailable for feedback images"
+                )
+            for preview_remote_url, gallery_url in dict.fromkeys(targets):
+                canonical = canonicalize_url(preview_remote_url)
+                source_key = self._remote_source_key(canonical)
+                cached = self._cached_descriptor(source_key, False)
+                if cached is not None and self._descriptor_has_usable_feedback_pose(
+                    cached
+                ):
+                    continue
+                if cached is not None:
+                    await asyncio.to_thread(
+                        self._delete_current_descriptor,
+                        source_key,
+                    )
+                try:
+                    descriptor = await self._remote_descriptor(canonical, gallery_url)
+                except (FinderUnavailable, ValueError):
+                    raise
+                except Exception as exc:
+                    raise FinderUnavailable(
+                        "Finder could not load a selected feedback image for pose "
+                        "analysis"
+                    ) from exc
+                if not self._descriptor_has_usable_feedback_pose(descriptor):
+                    raise ValueError(
+                        "Finder could not detect a reliable pose in a selected "
+                        "feedback image"
+                    )
+        return await asyncio.to_thread(
+            self.set_review,
+            scan_id,
+            result_id,
+            review,
+            feedback_image_urls,
+            require_usable=True,
+        )
 
     def set_review(
         self,
@@ -2045,51 +2335,25 @@ class FinderService:
         result_id: str,
         review: str,
         feedback_image_urls: list[str] | None = None,
+        *,
+        require_usable: bool = False,
     ) -> dict[str, Any]:
-        if review not in REVIEW_STATES:
-            raise ValueError("Invalid Finder review state")
-        if feedback_image_urls is not None and len(feedback_image_urls) > 3:
-            raise ValueError("At most three proposed images can train Finder feedback")
+        self._validate_review_request(review, feedback_image_urls)
         scan = self.get_scan(scan_id)
         if not scan:
             raise FinderNotFound("Finder scan not found")
-        selected_urls: list[str] = []
         with self._lock, self.database.connect() as db:
-            row = db.execute(
-                """SELECT r.*, s.pose_tag_id, s.reference_model_key,
-                          s.ranking_version
-                   FROM finder_results r
-                   JOIN finder_scans s ON s.id = r.scan_id
-                   WHERE r.id = ? AND r.scan_id = ?""",
-                (result_id, scan_id),
-            ).fetchone()
-            if not row:
-                raise FinderNotFound("Finder result not found")
-            matches = self._feedback_matches(
-                row,
-                ranking_version=str(row["ranking_version"] or LEGACY_RANKING_VERSION),
-            )
-            available = {str(match["image_url"]): match for match in matches}
-            if review != "pending":
-                requested = (
-                    list(available)
-                    if feedback_image_urls is None
-                    else list(dict.fromkeys(feedback_image_urls))
+            row, stored_samples, selected_urls, selected_matches = (
+                self._resolve_review_selection(
+                    db,
+                    scan_id=scan_id,
+                    result_id=result_id,
+                    review=review,
+                    feedback_image_urls=feedback_image_urls,
                 )
-                unknown = [url for url in requested if url not in available]
-                if unknown:
-                    raise ValueError(
-                        "Feedback images must be selected from this result's "
-                        "proposed matches"
-                    )
-                selected_urls = [url for url in available if url in set(requested)]
-                if review == "accepted" and not selected_urls:
-                    raise ValueError(
-                        "Accepting a gallery requires at least one selected image"
-                    )
+            )
             selected: list[tuple[dict[str, Any], str, str, str]] = []
-            for image_url in selected_urls:
-                match = available[image_url]
+            for match in selected_matches:
                 try:
                     source_key, pose_model_key, pose_json = (
                         self._feedback_pose_snapshot(
@@ -2102,46 +2366,85 @@ class FinderService:
                     raise ValueError(
                         "A selected feedback image has an invalid preview URL"
                     ) from exc
+                if (
+                    require_usable
+                    and self._feedback_pose(
+                        {
+                            "pose_model_key": pose_model_key,
+                            "pose_json": pose_json,
+                        }
+                    )
+                    is None
+                ):
+                    raise FinderUnavailable(
+                        "A selected feedback image no longer has a usable pose "
+                        "analysis; please retry"
+                    )
                 selected.append((match, source_key, pose_model_key, pose_json))
 
-            previous_decision = db.execute(
-                """SELECT decision FROM finder_feedback_decisions
-                   WHERE origin_result_id = ?""",
-                (result_id,),
-            ).fetchone()
+            previous_decisions = db.execute(
+                """SELECT * FROM finder_feedback_decisions
+                   WHERE pose_tag_id = ? AND gallery_key = ?
+                   ORDER BY updated_at DESC, origin_result_id DESC""",
+                (int(row["pose_tag_id"]), str(row["gallery_key"])),
+            ).fetchall()
+            previous_decision = previous_decisions[0] if previous_decisions else None
+            previous_sample_rows = (
+                db.execute(
+                    """SELECT source_key, image_url, preview_remote_url,
+                              pose_model_key, pose_json
+                       FROM finder_feedback_samples
+                       WHERE origin_result_id = ?""",
+                    (str(previous_decision["origin_result_id"]),),
+                ).fetchall()
+                if previous_decision
+                else []
+            )
             previous_samples = {
                 str(item["source_key"]): (
+                    str(item["image_url"]),
+                    str(item["preview_remote_url"]),
                     str(item["pose_model_key"] or ""),
                     str(item["pose_json"] or ""),
                 )
-                for item in db.execute(
-                    """SELECT source_key, pose_model_key, pose_json
-                       FROM finder_feedback_samples
-                       WHERE origin_result_id = ?""",
-                    (result_id,),
-                ).fetchall()
+                for item in previous_sample_rows
             }
             next_samples = {
-                source_key: (pose_model_key, pose_json)
-                for _, source_key, pose_model_key, pose_json in selected
+                source_key: (
+                    str(match["image_url"]),
+                    str(match["preview_remote_url"]),
+                    pose_model_key,
+                    pose_json,
+                )
+                for match, source_key, pose_model_key, pose_json in selected
             }
             next_feedback_state = (
-                review if review != "pending" and next_samples else "pending"
+                review
+                if review in {"accepted", "rejected"} and next_samples
+                else "pending"
             )
             feedback_changed = (
                 str(previous_decision["decision"]) if previous_decision else "pending"
             ) != next_feedback_state or previous_samples != next_samples
+            relocate_feedback = bool(
+                next_feedback_state != "pending"
+                and (
+                    not previous_decision
+                    or str(previous_decision["origin_result_id"]) != result_id
+                    or len(previous_decisions) > 1
+                )
+            )
             now = utc_now()
             db.execute(
                 """UPDATE finder_results SET review = ?, updated_at = ?
                    WHERE id = ? AND scan_id = ?""",
                 (review, now, result_id, scan_id),
             )
-            if feedback_changed:
+            if feedback_changed or relocate_feedback:
                 db.execute(
                     """DELETE FROM finder_feedback_decisions
-                       WHERE origin_result_id = ?""",
-                    (result_id,),
+                       WHERE pose_tag_id = ? AND gallery_key = ?""",
+                    (int(row["pose_tag_id"]), str(row["gallery_key"])),
                 )
                 if next_feedback_state != "pending":
                     db.execute(
@@ -2179,8 +2482,9 @@ class FinderService:
                             for match, source_key, pose_model_key, pose_json in selected
                         ],
                     )
-                self._increment_feedback_revision(db, int(row["pose_tag_id"]), now)
-                self._prune_feedback_decisions(db, int(row["pose_tag_id"]))
+                if feedback_changed:
+                    self._increment_feedback_revision(db, int(row["pose_tag_id"]), now)
+                    self._prune_feedback_decisions(db, int(row["pose_tag_id"]))
             row = db.execute(
                 "SELECT * FROM finder_results WHERE id = ?", (result_id,)
             ).fetchone()
@@ -2214,6 +2518,11 @@ class FinderService:
             "corpus_images_scored",
             "corpus_galleries_scored",
             "candidate_count",
+            "pending_count",
+            "maybe_count",
+            "accepted_count",
+            "rejected_count",
+            "review_counts",
             "ranking_version",
             "ranking_current",
             "extendable",
@@ -3158,6 +3467,35 @@ class FinderService:
                 (scan_id, key),
             ).fetchone()
         return bool(row and row["status"] == "completed")
+
+    def index_gallery_detail(self, detail: dict[str, Any]) -> bool:
+        """Promote one authoritative gallery detail into the reusable corpus."""
+
+        if not isinstance(detail, dict):
+            return False
+        raw_images = detail.get("images")
+        if not isinstance(raw_images, list) or not raw_images:
+            return False
+        if len(raw_images) > self.config.finder_max_gallery_images:
+            return False
+        images: list[dict[str, Any]] = []
+        for index, image in enumerate(raw_images, start=1):
+            if not isinstance(image, dict):
+                return False
+            normalized = dict(image)
+            normalized.setdefault("ordinal", index)
+            images.append(normalized)
+        gallery_url = str(detail.get("url") or "")
+        card = {
+            "url": gallery_url,
+            "title": str(detail.get("title") or "Untitled gallery"),
+            "thumbnail_remote_url": str(detail.get("thumbnail_remote_url") or ""),
+        }
+        try:
+            self._index_corpus_gallery(card, detail, images)
+        except (KeyError, TypeError, ValueError):
+            return False
+        return True
 
     def _index_corpus_gallery(
         self,

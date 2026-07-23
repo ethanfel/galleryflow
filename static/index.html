@@ -294,6 +294,7 @@
                 <div class="segmented finder-review-tabs" role="tablist" aria-label="Candidate review status">
                   <button class="is-active" type="button" role="tab" aria-selected="true" data-finder-review="pending">To review <b id="finder-pending-count">0</b></button>
                   <button type="button" role="tab" aria-selected="false" data-finder-review="accepted">Accepted <b id="finder-accepted-count">0</b></button>
+                  <button type="button" role="tab" aria-selected="false" data-finder-review="maybe">Maybe <b id="finder-maybe-count">0</b></button>
                   <button type="button" role="tab" aria-selected="false" data-finder-review="rejected">Rejected <b id="finder-rejected-count">0</b></button>
                 </div>
                 <label class="finder-threshold" title="Applied within each evidence tier"><span>Score ≥ <output id="finder-filter-output" for="finder-result-threshold">0.65</output></span><input id="finder-result-threshold" type="range" min="0.40" max="0.99" step="0.01" value="0.65" aria-label="Result match-score threshold"></label>
@@ -491,6 +492,7 @@
               <div class="gallery-mode-switch" role="tablist" aria-label="Gallery workflow">
                 <button class="is-active" type="button" role="tab" aria-selected="true" data-gallery-mode="download"><svg><use href="#i-download"></use></svg><span>Download</span></button>
                 <button type="button" role="tab" aria-selected="false" data-gallery-mode="pose"><svg><use href="#i-layers"></use></svg><span>Pose dataset</span></button>
+                <button type="button" role="tab" aria-selected="false" data-gallery-mode="feedback" id="finder-feedback-gallery-tab" hidden><svg><use href="#i-spark"></use></svg><span>Finder review</span></button>
               </div>
               <div class="picker-actions"><button class="text-button" id="select-all" type="button">Select all</button><span></span><button class="text-button" id="select-none" type="button">Clear</button></div>
             </div>
@@ -501,10 +503,10 @@
               <span class="pose-save-status" id="pose-save-status" role="status">Draft not loaded</span>
             </div>
             <div class="pose-role-switch" role="group" aria-label="Assignment type">
-              <button class="is-active" type="button" data-pose-assignment="target" aria-pressed="true"><b>T</b><span>Target</span></button>
-              <button type="button" data-pose-assignment="solo" aria-pressed="false"><b>C</b><span>Solo control</span></button>
-              <button type="button" data-pose-assignment="couple" aria-pressed="false"><b>C</b><span>Couple control</span></button>
-              <button type="button" data-pose-assignment="group" aria-pressed="false"><b>C</b><span>Group control</span></button>
+              <button class="is-active" type="button" data-pose-assignment="target" aria-pressed="true" title="Apply the checked images as targets when the pose and control are ready"><b>T</b><span>Apply targets</span></button>
+              <button type="button" data-pose-assignment="solo" aria-pressed="false" title="Set the one checked image as the solo control"><b>C</b><span>Set solo</span></button>
+              <button type="button" data-pose-assignment="couple" aria-pressed="false" title="Set the one checked image as the couple control"><b>C</b><span>Set couple</span></button>
+              <button type="button" data-pose-assignment="group" aria-pressed="false" title="Set the one checked image as the group control"><b>C</b><span>Set group</span></button>
             </div>
             <div class="pose-target-fields" id="pose-target-fields">
               <label><span>Pose</span><input id="pose-tag-input" type="text" list="pose-tag-options" maxlength="80" placeholder="Search or create a pose…" autocomplete="off"></label>
@@ -516,6 +518,12 @@
               <button class="button button-primary" id="pose-apply-checked" type="button" disabled><svg><use href="#i-check"></use></svg><span>Apply to checked</span></button>
             </div>
           </section>
+          <section class="finder-feedback-gallery-toolbar" id="finder-feedback-gallery-toolbar" aria-labelledby="finder-feedback-gallery-title" hidden>
+            <span aria-hidden="true"><svg><use href="#i-spark"></use></svg></span>
+            <div><span class="modal-kicker">Pose-specific feedback</span><h4 id="finder-feedback-gallery-title">Choose feedback images</h4><p>Pick up to 3 images from anywhere in this gallery. This is separate from pose dataset tagging.</p></div>
+            <i id="finder-feedback-gallery-review">Accepted</i>
+            <button class="button button-quiet finder-feedback-prepare-pose" id="finder-feedback-prepare-pose" type="button"><svg><use href="#i-layers"></use></svg><span>Prepare controls &amp; targets</span></button>
+          </section>
           <datalist id="pose-tag-options"></datalist>
           <div class="image-grid" id="image-grid" aria-live="polite" aria-busy="true"></div>
           <div class="empty-state compact" id="images-empty" hidden><div class="empty-illustration"><svg><use href="#i-image"></use></svg><span></span></div><h3>No images found</h3><p>The server could not find downloadable images on this page.</p></div>
@@ -523,6 +531,7 @@
       </div>
       <footer class="modal-footer gallery-footer">
         <div class="selection-total" id="download-selection-total"><span id="selected-count">0</span><span>images selected</span></div>
+        <div class="selection-total finder-feedback-gallery-total" id="finder-feedback-gallery-total" hidden><span id="finder-feedback-gallery-count">0</span><span>of 3 feedback images</span></div>
         <div class="pose-preflight" id="pose-preflight" hidden>
           <div><strong id="pose-target-count">0</strong><span>targets</span><i></i><strong id="pose-control-count">0</strong><span>controls</span><i></i><strong id="pose-issue-count">0</strong><span>issues</span></div>
           <small id="pose-preflight-detail">Add at least one target to prepare a dataset.</small>
@@ -530,6 +539,7 @@
         <label class="modal-profile"><span id="modal-profile-label">Download to</span><select id="modal-profile-select" aria-label="Download profile"></select></label>
         <button class="button button-primary button-download" id="queue-download" type="button" disabled><svg><use href="#i-download"></use></svg><span>Add to queue</span></button>
         <button class="button button-primary button-pose-export" id="pose-export" type="button" disabled hidden><svg><use href="#i-layers"></use></svg><span>Download &amp; organize</span></button>
+        <button class="button button-primary finder-feedback-gallery-save" id="finder-feedback-gallery-save" type="button" disabled hidden><svg><use href="#i-edit"></use></svg><span>Save feedback selection</span></button>
       </footer>
     </div>
   </dialog>
@@ -629,8 +639,10 @@
       </div>
       <div class="finder-card-actions">
         <button class="button finder-accept" type="button" data-finder-action="accepted"><svg><use href="#i-check"></use></svg><span>Accept</span></button>
+        <button class="button finder-maybe" type="button" data-finder-action="maybe"><svg><use href="#i-more"></use></svg><span>Maybe</span></button>
         <button class="button finder-reject" type="button" data-finder-action="rejected"><svg><use href="#i-close"></use></svg><span>Reject</span></button>
         <button class="button button-quiet finder-open" type="button" data-finder-action="open"><svg><use href="#i-maximize"></use></svg><span>Open</span></button>
+        <button class="button finder-save-selection" type="button" data-finder-action="save-selection" hidden><svg><use href="#i-edit"></use></svg><span>Save selection</span></button>
       </div>
     </article>
   </template>

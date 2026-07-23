@@ -31,6 +31,9 @@
     jobFilter: 'all',
     gallery: null,
     selectedImages: new Set(),
+    finderFeedbackGallerySelection: new Set(),
+    finderFeedbackGalleryDirty: false,
+    finderFeedbackGallerySaving: false,
     galleryMode: 'download',
     poseSelectedImages: new Set(),
     poseTags: [],
@@ -73,6 +76,8 @@
     finderFeedbackLoading: false,
     finderFeedbackBusy: false,
     finderFeedbackMutations: 0,
+    finderResultMutationEpoch: 0,
+    finderResultRefreshTimer: null,
     finderFeedbackError: '',
     finderFeedbackRequest: 0,
     finderFeedbackTimer: null,
@@ -80,6 +85,7 @@
     finderScan: null,
     finderScanId: storage.get('finder-scan', ''),
     finderResults: [],
+    finderReviewCounts: null,
     finderReview: 'pending',
     finderLoaded: false,
     finderLoading: false,
@@ -911,7 +917,39 @@
     });
   }
 
+  function finderFeedbackGalleryResult() {
+    const key = state.galleryContext?.finderFeedbackResultKey;
+    if (key === undefined || key === null) return null;
+    return state.finderResults.find(result => String(result.key) === String(key)) || null;
+  }
+
+  function finderFeedbackGalleryAvailable() {
+    const result = finderFeedbackGalleryResult();
+    return Boolean(result && ['accepted', 'rejected'].includes(result.review));
+  }
+
+  function restoreFinderFeedbackGallerySelection() {
+    const result = finderFeedbackGalleryResult();
+    const galleryUrls = new Set((state.gallery?.images || []).map(image => image.url));
+    state.finderFeedbackGallerySelection = new Set(
+      (result?.feedbackImageUrls || []).filter(url => galleryUrls.has(url)).slice(0, 3)
+    );
+    state.finderFeedbackGalleryDirty = false;
+  }
+
+  function confirmDiscardFinderFeedbackGalleryChanges(message = 'Discard the unsaved Finder feedback selection?') {
+    if (state.finderFeedbackGallerySaving) {
+      toast('Feedback selection is saving', 'Wait for the save to finish before closing or changing galleries. An in-flight save cannot be cancelled.', 'info');
+      return false;
+    }
+    if (!state.finderFeedbackGalleryDirty) return true;
+    if (!window.confirm(message)) return false;
+    restoreFinderFeedbackGallerySelection();
+    return true;
+  }
+
   async function openGallery(id, context = null) {
+    if (!confirmDiscardFinderFeedbackGalleryChanges('Discard the unsaved Finder feedback selection and open another gallery?')) return;
     if (state.poseLoadedKey && (state.poseDirty || state.poseSaving)) {
       await flushPoseDraft();
       if (state.poseDirty) {
@@ -929,6 +967,9 @@
     state.galleryContext = context ? { ...context, suggestions: Array.isArray(context.suggestions) ? context.suggestions : [] } : null;
     state.gallery = { ...summary, images: [] };
     state.selectedImages = new Set();
+    state.finderFeedbackGallerySelection = new Set();
+    state.finderFeedbackGalleryDirty = false;
+    state.finderFeedbackGallerySaving = false;
     state.poseSelectedImages = new Set();
     state.poseTags = [];
     state.poseDraft = { revision: 0, controls: { solo: '', couple: '', group: '' }, targets: [] };
@@ -938,7 +979,8 @@
     window.clearTimeout(state.poseSaveTimer);
     $('#pose-tag-input').value = '';
     $('#pose-control-role').value = 'solo';
-    const requestedMode = context?.mode === 'pose' ? 'pose' : 'download';
+    const feedbackRequested = context?.mode === 'feedback' && ['accepted', 'rejected'].includes(context?.finderFeedbackReview);
+    const requestedMode = feedbackRequested ? 'feedback' : context?.mode === 'pose' ? 'pose' : 'download';
     if (requestedMode === 'pose' && state.galleryContext?.suggestions.length) state.poseAssignment = 'target';
     setGalleryMode(requestedMode, { load: false, render: false });
     state.loadingDetail = true;
@@ -958,6 +1000,16 @@
       if (listItem) Object.assign(listItem, { saved: state.gallery.saved, ignored: state.gallery.ignored, imageCount: state.gallery.imageCount, thumbnailUrl: state.gallery.thumbnailUrl || listItem.thumbnailUrl });
       const pendingImages = state.gallery.images.filter(image => !image.downloaded);
       state.selectedImages = new Set((pendingImages.length ? pendingImages : state.gallery.images).map(image => image.url));
+      if (feedbackRequested) {
+        const galleryUrls = new Set(state.gallery.images.map(image => image.url));
+        state.finderFeedbackGallerySelection = new Set(
+          (Array.isArray(context?.feedbackImageUrls) ? context.feedbackImageUrls : [])
+            .map(String)
+            .filter(url => galleryUrls.has(url))
+            .slice(0, 3)
+        );
+        setGalleryMode('feedback', { load: false, render: false });
+      }
       if (requestedMode === 'pose') {
         state.poseSelectedImages = new Set(state.gallery.images
           .map((image, index) => finderSuggestionForImage(image, index) ? image.url : '')
@@ -972,7 +1024,7 @@
       renderGalleries();
       $('#gallery-modal-kicker').textContent = displayHost(state.gallery.url);
       $('#gallery-modal-title').textContent = state.gallery.title;
-      if (requestedMode === 'pose') scrollToFinderSuggestion();
+      if (requestedMode === 'pose' || requestedMode === 'feedback') scrollToFinderSuggestion();
     } catch (error) {
       $('#image-grid').replaceChildren();
       $('#images-empty').hidden = false;
@@ -1148,6 +1200,7 @@
       const active = button.dataset.poseAssignment === state.poseAssignment;
       button.classList.toggle('is-active', active);
       button.setAttribute('aria-pressed', String(active));
+      button.disabled = state.poseLoading;
     });
     $('#pose-target-fields').hidden = !isTarget;
     $('#pose-control-hint').hidden = isTarget;
@@ -1230,26 +1283,105 @@
   }
 
   function setGalleryMode(mode, { load = true, render = true } = {}) {
-    state.galleryMode = mode === 'pose' ? 'pose' : 'download';
+    const feedbackAvailable = finderFeedbackGalleryAvailable();
+    const nextMode = mode === 'feedback' && feedbackAvailable ? 'feedback' : mode === 'pose' ? 'pose' : 'download';
+    if (state.finderFeedbackGallerySaving && nextMode !== state.galleryMode) {
+      toast('Feedback selection is saving', 'Wait for the save to finish before switching workflows.', 'info');
+      return false;
+    }
+    state.galleryMode = nextMode;
     const poseMode = state.galleryMode === 'pose';
+    const feedbackMode = state.galleryMode === 'feedback';
     $('#gallery-modal').classList.toggle('is-pose-mode', poseMode);
+    $('#gallery-modal').classList.toggle('is-feedback-mode', feedbackMode);
+    $('#finder-feedback-gallery-tab').hidden = !feedbackAvailable;
     $$('[data-gallery-mode]').forEach(button => {
       const active = button.dataset.galleryMode === state.galleryMode;
       button.classList.toggle('is-active', active);
       button.setAttribute('aria-selected', String(active));
     });
     $('#pose-toolbar').hidden = !poseMode;
-    $('#download-selection-total').hidden = poseMode;
+    $('#finder-feedback-gallery-toolbar').hidden = !feedbackMode;
+    $('#download-selection-total').hidden = poseMode || feedbackMode;
+    $('#finder-feedback-gallery-total').hidden = !feedbackMode;
     $('#pose-preflight').hidden = !poseMode;
-    $('#queue-download').hidden = poseMode;
+    $('#queue-download').hidden = poseMode || feedbackMode;
     $('#pose-export').hidden = !poseMode;
+    $('#finder-feedback-gallery-save').hidden = !feedbackMode;
+    $('.modal-profile').hidden = feedbackMode;
     $('#modal-profile-label').textContent = poseMode ? 'Organize in' : 'Download to';
-    $('#image-picker-title').textContent = poseMode ? 'Prepare pose pairs' : 'Choose images';
+    $('#image-picker-title').textContent = feedbackMode ? 'Review gallery feedback' : poseMode ? 'Prepare pose pairs' : 'Choose images';
+    $('#select-all').hidden = feedbackMode;
+    $('.picker-actions > span').hidden = feedbackMode;
     $('#select-all').textContent = poseMode ? 'Check all' : 'Select all';
-    $('#select-none').textContent = poseMode ? 'Uncheck all' : 'Clear';
+    $('#select-none').textContent = feedbackMode ? 'Clear selection' : poseMode ? 'Uncheck all' : 'Clear';
+    const feedbackResult = finderFeedbackGalleryResult();
+    $('#finder-feedback-gallery-review').textContent = feedbackResult?.review || 'Feedback';
+    $('#finder-feedback-prepare-pose').hidden = feedbackResult?.review !== 'accepted';
     if (render) renderImages();
     renderPoseWorkspace();
     if (poseMode && load) loadPoseWorkspace();
+    return true;
+  }
+
+  function prepareFinderPoseFromFeedback() {
+    const result = finderFeedbackGalleryResult();
+    if (!result || result.review !== 'accepted') return;
+    const poseTag = state.galleryContext?.poseTag || finderPoseTagForScan();
+    state.poseSelectedImages = new Set(state.finderFeedbackGallerySelection);
+    state.poseAssignment = 'target';
+    if (poseTag?.label) $('#pose-tag-input').value = poseTag.label;
+    $('#pose-control-role').value = POSE_ROLES.includes(poseTag?.defaultRole) ? poseTag.defaultRole : 'solo';
+    setGalleryMode('pose');
+    const role = $('#pose-control-role').value;
+    toast(
+      'Target candidates highlighted',
+      `Uncheck the target ${state.poseSelectedImages.size === 1 ? 'candidate' : 'candidates'}, check one ${poseRoleLabel(role).toLowerCase()} control image, and use Set ${poseRoleLabel(role).toLowerCase()}. Then re-check the highlighted targets. Nothing has been assigned yet.`,
+      'info',
+      7000
+    );
+    announce('Pose dataset mode opened. Set a matching control, then apply the highlighted Finder images as targets.');
+  }
+
+  async function handlePoseAssignmentButton(button) {
+    const assignment = button.dataset.poseAssignment;
+    if (!['target', ...POSE_ROLES].includes(assignment)) return;
+    state.poseAssignment = assignment;
+    renderPoseToolbar();
+    if (state.poseLoading) {
+      toast('Pose draft is loading', 'Try the assignment again when the draft is ready.', 'info');
+      return;
+    }
+    const selected = state.poseSelectedImages.size;
+    if (!selected) {
+      toast(
+        assignment === 'target' ? 'Check target images' : `Check one ${poseRoleLabel(assignment).toLowerCase()} control`,
+        assignment === 'target'
+          ? 'Check one or more images, then use Apply targets again.'
+          : 'Check exactly one image in the gallery, then use this control button again.',
+        'info'
+      );
+      return;
+    }
+    if (assignment !== 'target') {
+      if (selected !== 1) {
+        toast('Choose one control image', `A ${poseRoleLabel(assignment).toLowerCase()} control uses exactly one checked image.`, 'info');
+        return;
+      }
+      await applyPoseAssignment(state.poseSelectedImages, assignment, { button, clearChecked: true });
+      return;
+    }
+    if (!$('#pose-tag-input').value.trim()) {
+      toast('Name the pose', 'Choose an existing pose tag or enter a new one before applying targets.', 'info');
+      $('#pose-tag-input').focus();
+      return;
+    }
+    const role = $('#pose-control-role').value;
+    if (!state.poseDraft.controls[role]) {
+      toast(`Set a ${poseRoleLabel(role).toLowerCase()} control first`, `Check one control image and use Set ${poseRoleLabel(role).toLowerCase()} control, then re-check or keep the target candidates highlighted.`, 'info', 7000);
+      return;
+    }
+    await applyPoseAssignment(state.poseSelectedImages, 'target', { button, clearChecked: true });
   }
 
   function poseDraftBody(expectedRevision = state.poseDraft.revision) {
@@ -1445,7 +1577,9 @@
     const grid = $('#image-grid');
     grid.replaceChildren();
     const images = state.gallery?.images || [];
-    const activeSelection = state.galleryMode === 'pose' ? state.poseSelectedImages : state.selectedImages;
+    const activeSelection = state.galleryMode === 'feedback'
+      ? state.finderFeedbackGallerySelection
+      : state.galleryMode === 'pose' ? state.poseSelectedImages : state.selectedImages;
     $('#images-empty').hidden = Boolean(images.length);
     images.forEach((image, index) => {
       const option = document.createElement('div');
@@ -1458,7 +1592,14 @@
       input.id = `gallery-image-${index}`;
       input.type = 'checkbox';
       input.checked = activeSelection.has(image.url);
-      input.setAttribute('aria-label', state.galleryMode === 'pose' ? `Check ${image.filename} for pose tagging` : `Select ${image.filename} for download`);
+      input.setAttribute(
+        'aria-label',
+        state.galleryMode === 'feedback'
+          ? `Use ${image.filename} as Finder pose feedback`
+          : state.galleryMode === 'pose'
+            ? `Check ${image.filename} for pose tagging`
+            : `Select ${image.filename} for download`
+      );
       const previewButton = document.createElement('button');
       previewButton.className = 'image-preview-button';
       previewButton.type = 'button';
@@ -1491,13 +1632,20 @@
       }
       renderPoseBadge(option, image);
       const finderSuggestion = finderSuggestionForImage(image, index);
-      if (finderSuggestion) {
+      const finderFeedbackCandidate = state.galleryMode === 'pose'
+        && Boolean(state.galleryContext?.finderFeedbackResultKey)
+        && finderFeedbackGalleryResult()?.review === 'accepted'
+        && state.finderFeedbackGallerySelection.has(image.url);
+      if (finderSuggestion || finderFeedbackCandidate) {
         option.classList.add('is-finder-suggestion');
+        option.classList.toggle('is-finder-feedback-candidate', finderFeedbackCandidate);
         const badge = document.createElement('span');
         badge.className = 'finder-suggestion-badge';
-        const score = Number(finderSuggestion.score);
+        const score = Number(finderSuggestion?.score);
         badge.innerHTML = '<svg><use href="#i-spark"></use></svg><span></span>';
-        $('span', badge).textContent = Number.isFinite(score) ? `Finder · ${score.toFixed(2)} similarity` : 'Finder suggestion';
+        $('span', badge).textContent = finderFeedbackCandidate
+          ? 'Finder target candidate'
+          : Number.isFinite(score) ? `Finder · ${score.toFixed(2)} similarity` : 'Finder suggestion';
         option.append(badge);
       }
       grid.append(option);
@@ -1599,17 +1747,37 @@
   }
 
   function toggleImage(url, checked) {
-    const selection = state.galleryMode === 'pose' ? state.poseSelectedImages : state.selectedImages;
+    const feedbackMode = state.galleryMode === 'feedback';
+    const selection = feedbackMode
+      ? state.finderFeedbackGallerySelection
+      : state.galleryMode === 'pose' ? state.poseSelectedImages : state.selectedImages;
+    if (feedbackMode && checked && !selection.has(url) && selection.size >= 3) {
+      const option = $$('.image-option', $('#image-grid')).find(item => item.dataset.imageUrl === url);
+      const input = option && $('input', option);
+      if (input) input.checked = false;
+      toast('Choose up to 3 images', 'Remove one feedback image before adding another.', 'info');
+      announce('Finder feedback selection is limited to 3 images.');
+      return;
+    }
+    const changed = checked ? !selection.has(url) : selection.has(url);
     if (checked) selection.add(url);
     else selection.delete(url);
     const option = $$('.image-option', $('#image-grid')).find(item => item.dataset.imageUrl === url);
     option?.classList.toggle('is-selected', checked);
+    if (feedbackMode && changed) state.finderFeedbackGalleryDirty = true;
     updateSelectionUi();
   }
 
   function selectAllImages(selected) {
+    if (state.galleryMode === 'feedback' && selected) {
+      toast('Choose feedback images individually', 'You can select up to 3 images from this gallery.', 'info');
+      return;
+    }
     const selection = new Set(selected ? (state.gallery?.images || []).map(image => image.url) : []);
-    if (state.galleryMode === 'pose') state.poseSelectedImages = selection;
+    if (state.galleryMode === 'feedback') {
+      if (state.finderFeedbackGallerySelection.size) state.finderFeedbackGalleryDirty = true;
+      state.finderFeedbackGallerySelection = selection;
+    } else if (state.galleryMode === 'pose') state.poseSelectedImages = selection;
     else state.selectedImages = selection;
     $$('.image-option', $('#image-grid')).forEach(option => {
       const checked = selection.has(option.dataset.imageUrl);
@@ -1621,18 +1789,104 @@
   }
 
   function updateSelectionUi() {
-    const selection = state.galleryMode === 'pose' ? state.poseSelectedImages : state.selectedImages;
+    const feedbackMode = state.galleryMode === 'feedback';
+    const selection = feedbackMode
+      ? state.finderFeedbackGallerySelection
+      : state.galleryMode === 'pose' ? state.poseSelectedImages : state.selectedImages;
     const selected = selection.size;
     const total = state.gallery?.images?.length || 0;
     $('#selected-count').textContent = formatNumber(selected);
+    $('#finder-feedback-gallery-count').textContent = formatNumber(selected);
     const downloaded = state.gallery?.downloadedImages || 0;
+    const feedbackResult = finderFeedbackGalleryResult();
+    const pendingFeedbackCount = feedbackResult?.feedbackPendingImageUrls?.length || 0;
     $('#selection-summary').textContent = state.loadingDetail
       ? 'Scanning the source page…'
-      : state.galleryMode === 'pose'
-        ? `${formatNumber(selected)} checked for bulk tagging · ${formatNumber(state.poseDraft.targets.length)} targets assigned`
-        : `${formatNumber(selected)} of ${formatNumber(total)} selected${downloaded ? ` · ${formatNumber(downloaded)} already saved` : ''}`;
+      : feedbackMode
+        ? `${formatNumber(selected)} of 3 feedback images selected${
+          state.finderFeedbackGalleryDirty
+            ? ' · unsaved changes'
+            : pendingFeedbackCount
+              ? ` · ${formatNumber(pendingFeedbackCount)} not currently usable for pose ranking`
+              : feedbackResult?.feedbackAnalysisProvided ? ' · selection saved and usable' : ' · selection saved'
+        }`
+        : state.galleryMode === 'pose'
+          ? state.galleryContext?.finderFeedbackResultKey
+            && feedbackResult?.review === 'accepted'
+            && state.finderFeedbackGallerySelection.size
+            ? selected
+              ? state.poseDraft.controls[$('#pose-control-role').value]
+                ? `${formatNumber(selected)} checked · control ready—apply the highlighted Finder target ${selected === 1 ? 'candidate' : 'candidates'}`
+                : `${formatNumber(selected)} target ${selected === 1 ? 'candidate' : 'candidates'} checked · uncheck ${selected === 1 ? 'it' : 'them'} and check one ${poseRoleLabel($('#pose-control-role').value).toLowerCase()} control first`
+              : state.poseDraft.controls[$('#pose-control-role').value]
+                ? `Control ready · re-check the highlighted Finder target ${state.finderFeedbackGallerySelection.size === 1 ? 'candidate' : 'candidates'}, then apply targets`
+                : `Finder target ${state.finderFeedbackGallerySelection.size === 1 ? 'candidate is' : 'candidates are'} highlighted · check one control image first`
+            : `${formatNumber(selected)} checked for bulk tagging · ${formatNumber(state.poseDraft.targets.length)} targets assigned`
+          : `${formatNumber(selected)} of ${formatNumber(total)} selected${downloaded ? ` · ${formatNumber(downloaded)} already saved` : ''}`;
     $('#queue-download').disabled = state.loadingDetail || !selected || !state.activeProfile;
+    const saveFeedback = $('#finder-feedback-gallery-save');
+    saveFeedback.disabled = state.loadingDetail
+      || state.finderFeedbackGallerySaving
+      || Boolean(feedbackResult?.feedbackSaving)
+      || !state.finderFeedbackGalleryDirty
+      || !['accepted', 'rejected'].includes(feedbackResult?.review)
+      || (feedbackResult?.review === 'accepted' && !selected);
+    saveFeedback.title = feedbackResult?.review === 'accepted' && !selected
+      ? 'Accepted feedback needs at least one selected image'
+      : state.finderFeedbackGalleryDirty ? 'Save this Finder feedback selection' : 'Selection is already saved';
     renderPoseToolbar();
+  }
+
+  async function saveFinderGalleryFeedbackSelection() {
+    const result = finderFeedbackGalleryResult();
+    const review = result?.review;
+    if (
+      !result
+      || !['accepted', 'rejected'].includes(review)
+      || state.finderFeedbackGallerySaving
+      || state.finderFeedbackBusy
+      || result.feedbackSaving
+    ) return;
+    const feedbackImageUrls = [...state.finderFeedbackGallerySelection];
+    const resultKey = String(result.key);
+    const galleryId = String(state.gallery?.id ?? '');
+    if (review === 'accepted' && !feedbackImageUrls.length) {
+      toast('Choose a matching image', 'Accepted feedback needs at least one selected gallery image.', 'info');
+      return;
+    }
+    const button = $('#finder-feedback-gallery-save');
+    state.finderFeedbackGallerySaving = true;
+    setButtonBusy(button, true, 'Saving…');
+    updateSelectionUi();
+    try {
+      const saved = await reviewFinderResult(result, review, null, { feedbackImageUrls });
+      if (!saved) return;
+      const sameGallery = String(state.gallery?.id ?? '') === galleryId
+        && String(state.galleryContext?.finderFeedbackResultKey ?? '') === resultKey;
+      if (!sameGallery) return;
+      state.finderFeedbackGalleryDirty = false;
+      if (state.galleryContext) state.galleryContext.feedbackImageUrls = [...feedbackImageUrls];
+      const updated = finderFeedbackGalleryResult();
+      const galleryUrls = new Set((state.gallery?.images || []).map(image => image.url));
+      state.finderFeedbackGallerySelection = new Set(
+        (updated?.feedbackImageUrls || feedbackImageUrls).filter(url => galleryUrls.has(url)).slice(0, 3)
+      );
+      const pending = updated?.feedbackPendingImageUrls?.length || 0;
+      toast(
+        pending ? 'Selection saved; some samples are not usable' : 'Feedback selection saved',
+        pending
+          ? `${formatNumber(pending)} selected ${pending === 1 ? 'image is' : 'images are'} not currently usable for pose ranking.`
+          : `${formatNumber(state.finderFeedbackGallerySelection.size)} ${review} pose-feedback ${state.finderFeedbackGallerySelection.size === 1 ? 'image' : 'images'} saved.`,
+        pending ? 'info' : 'success',
+        pending ? 7000 : 4500
+      );
+      announce(`Finder feedback selection saved for ${result.title}.`);
+      renderImages();
+    } finally {
+      state.finderFeedbackGallerySaving = false;
+      setButtonBusy(button, false);
+      updateSelectionUi();
+    }
   }
 
   async function queueGallery() {
@@ -1975,8 +2229,28 @@
   function normalizeFinderReview(value) {
     const review = String(value || 'pending').toLowerCase();
     if (['accepted', 'accept', 'approved'].includes(review)) return 'accepted';
+    if (['maybe', 'unsure', 'uncertain', 'neutral'].includes(review)) return 'maybe';
     if (['rejected', 'reject', 'dismissed'].includes(review)) return 'rejected';
     return 'pending';
+  }
+
+  function normalizeFinderReviewCounts(value) {
+    if (!value || typeof value !== 'object') return null;
+    const counts = value.review_counts && typeof value.review_counts === 'object'
+      ? value.review_counts
+      : value.counts && typeof value.counts === 'object' ? value.counts : value;
+    if (!['pending', 'accepted', 'maybe', 'rejected'].some(key => counts[key] !== undefined)) return null;
+    const normalized = {
+      pending: Math.max(0, Number(counts.pending || 0)),
+      accepted: Math.max(0, Number(counts.accepted || 0)),
+      maybe: Math.max(0, Number(counts.maybe || 0)),
+      rejected: Math.max(0, Number(counts.rejected || 0))
+    };
+    normalized.total = Math.max(
+      normalized.pending + normalized.accepted + normalized.maybe + normalized.rejected,
+      Number(counts.total || 0)
+    );
+    return normalized;
   }
 
   function normalizeFinderScan(item) {
@@ -2040,6 +2314,7 @@
       candidateCount: Number(scan.candidate_count ?? scan.results_count ?? progress.candidates ?? reviewCounts.total ?? 0),
       pendingCount: Number(scan.pending_count ?? reviewCounts.pending ?? 0),
       acceptedCount: Number(scan.accepted_count ?? reviewCounts.accepted ?? 0),
+      maybeCount: Number(scan.maybe_count ?? reviewCounts.maybe ?? 0),
       rejectedCount: Number(scan.rejected_count ?? reviewCounts.rejected ?? 0),
       minSimilarity: Number(scan.minimum_score ?? scan.min_similarity ?? scan.minimum_similarity ?? config.minimum_score ?? config.min_similarity ?? config.minimum_similarity ?? 0.65),
       percentage: Math.max(0, Math.min(100, percentage)),
@@ -2249,6 +2524,29 @@
         || suppliedFeedbackKeys?.includes(match.feedbackKey)
       )).map(match => match.feedbackKey)
       : review === 'pending' ? matches.filter(match => match.imageUrl).map(match => match.feedbackKey) : [];
+    let feedbackImageUrls;
+    if (!feedbackSelectionProvided) {
+      feedbackImageUrls = review === 'pending'
+        ? matches.map(match => match.imageUrl).filter(Boolean).slice(0, 3)
+        : [];
+    } else {
+      const explicitUrls = [...new Set((suppliedFeedbackUrls || []).filter(Boolean))];
+      feedbackImageUrls = explicitUrls.length
+        ? explicitUrls.slice(0, 3)
+        : suppliedFeedbackKeys?.length
+          ? matches
+            .filter(match => feedbackMatchKeys.includes(match.feedbackKey))
+            .map(match => match.imageUrl)
+            .filter(Boolean)
+            .slice(0, 3)
+          : [];
+    }
+    const suppliedUsableFeedbackUrls = Array.isArray(item?.feedback_usable_image_urls)
+      ? item.feedback_usable_image_urls.map(String).filter(Boolean)
+      : null;
+    const suppliedPendingFeedbackUrls = Array.isArray(item?.feedback_pending_image_urls)
+      ? item.feedback_pending_image_urls.map(String).filter(Boolean)
+      : null;
     return {
       ...gallery,
       key: item?.result_id ?? item?.id ?? galleryId,
@@ -2297,6 +2595,10 @@
       onlineScanned,
       indexedOnly,
       feedbackMatchKeys,
+      feedbackImageUrls,
+      feedbackUsableImageUrls: [...new Set(suppliedUsableFeedbackUrls || [])].slice(0, 3),
+      feedbackPendingImageUrls: [...new Set(suppliedPendingFeedbackUrls || [])].slice(0, 3),
+      feedbackAnalysisProvided: suppliedUsableFeedbackUrls !== null || suppliedPendingFeedbackUrls !== null,
       feedbackSelectionProvided,
       feedbackSelectionDirty: false,
       feedbackSaving: false,
@@ -2690,13 +2992,16 @@
     const ranked = [...state.finderResults].sort(
       (a, b) => b.rankingTier - a.rankingTier || b.score - a.score || (b.appearanceScore ?? -1) - (a.appearanceScore ?? -1) || a.rank - b.rank
     );
-    const counts = {
+    const loadedCounts = {
       pending: ranked.filter(result => result.review === 'pending').length,
       accepted: ranked.filter(result => result.review === 'accepted').length,
+      maybe: ranked.filter(result => result.review === 'maybe').length,
       rejected: ranked.filter(result => result.review === 'rejected').length
     };
+    const counts = state.finderReviewCounts || loadedCounts;
     $('#finder-pending-count').textContent = formatNumber(counts.pending);
     $('#finder-accepted-count').textContent = formatNumber(counts.accepted);
+    $('#finder-maybe-count').textContent = formatNumber(counts.maybe);
     $('#finder-rejected-count').textContent = formatNumber(counts.rejected);
     $$('[data-finder-review]').forEach(button => {
       const active = button.dataset.finderReview === state.finderReview;
@@ -2719,6 +3024,7 @@
       card.classList.toggle('is-likely', result.score >= 0.70 && result.score < 0.85);
       card.classList.toggle('is-explore', result.score < 0.70);
       card.classList.toggle('is-accepted', result.review === 'accepted');
+      card.classList.toggle('is-maybe', result.review === 'maybe');
       card.classList.toggle('is-rejected', result.review === 'rejected');
       card.classList.toggle('is-indexed', result.indexedOnly);
       appendFinderMatchMedia($('.finder-match-gallery', card), result);
@@ -2739,13 +3045,29 @@
       $('.finder-card-meta', card).textContent = `${matchCopy}${result.imageCount ? ` · ${formatNumber(result.imageCount)} total` : ''}`;
       const selectedFeedback = result.matches.filter(match => result.feedbackMatchKeys.includes(match.feedbackKey)).length;
       const feedbackCopy = $('.finder-feedback-selection-copy', card);
+      const savedFeedbackCount = result.feedbackImageUrls.length;
+      const usableFeedbackCount = result.feedbackUsableImageUrls.length;
+      const pendingFeedbackCount = result.feedbackPendingImageUrls.length;
+      const reviewedWithFeedback = ['accepted', 'rejected'].includes(result.review);
       feedbackCopy.textContent = result.feedbackSaving
         ? 'Saving gallery review and pose feedback…'
         : state.finderFeedbackBusy
           ? 'Resetting pose feedback…'
-        : selectedFeedback
-          ? `${selectedFeedback} of ${result.matches.length} suggested ${result.matches.length === 1 ? 'image' : 'images'} checked for pose feedback · uncheck wrong images`
-          : `No suggested images checked · Accept requires at least one`;
+          : result.review === 'maybe'
+            ? selectedFeedback
+              ? `Maybe is neutral—no feedback saved · ${selectedFeedback} checked for a future decision`
+              : 'Maybe is neutral—no pose feedback · check images before changing to Accept'
+            : reviewedWithFeedback
+              ? result.feedbackSelectionDirty
+                ? `${savedFeedbackCount} selected · unsaved changes—use Save selection`
+                : pendingFeedbackCount
+                  ? `${savedFeedbackCount} selected · ${pendingFeedbackCount} not currently usable for pose ranking · ${usableFeedbackCount} usable`
+                  : savedFeedbackCount
+                    ? `${savedFeedbackCount} ${result.review} feedback ${savedFeedbackCount === 1 ? 'image' : 'images'} ${result.feedbackAnalysisProvided ? 'usable' : 'saved'} · edit checks or open the gallery`
+                    : `Gallery ${result.review} · no image-level pose feedback saved`
+              : selectedFeedback
+                ? `${selectedFeedback} of ${result.matches.length} suggested ${result.matches.length === 1 ? 'image' : 'images'} checked for pose feedback · uncheck wrong images`
+                : 'No suggested images checked · Accept requires at least one';
       renderFinderDiagnostics(card, result);
       $$('.finder-card-open', card).forEach(button => {
         button.dataset.finderAction = 'open';
@@ -2753,19 +3075,34 @@
       });
       $$('[data-finder-action]', card).forEach(button => { button.dataset.finderResult = String(result.key); });
       const accept = $('.finder-accept', card);
+      const maybe = $('.finder-maybe', card);
       const reject = $('.finder-reject', card);
+      const saveSelection = $('.finder-save-selection', card);
       accept.classList.toggle('is-active', result.review === 'accepted');
+      maybe.classList.toggle('is-active', result.review === 'maybe');
       reject.classList.toggle('is-active', result.review === 'rejected');
-      accept.disabled = state.finderBusy || state.finderFeedbackBusy || result.feedbackSaving || !selectedFeedback || (result.review === 'accepted' && !result.feedbackSelectionDirty);
-      reject.disabled = state.finderBusy || state.finderFeedbackBusy || result.feedbackSaving || (result.review === 'rejected' && !result.feedbackSelectionDirty);
+      const reviewLocked = state.finderBusy || state.finderFeedbackBusy || result.feedbackSaving;
+      accept.disabled = reviewLocked || !savedFeedbackCount || result.review === 'accepted';
+      maybe.disabled = reviewLocked || result.review === 'maybe';
+      reject.disabled = reviewLocked || result.review === 'rejected';
+      saveSelection.hidden = !reviewedWithFeedback;
+      saveSelection.disabled = reviewLocked
+        || !result.feedbackSelectionDirty
+        || (result.review === 'accepted' && !savedFeedbackCount);
       accept.title = state.finderFeedbackBusy
         ? 'Wait for pose feedback reset to finish'
         : result.feedbackSaving
         ? 'Saving this gallery review'
-        : !selectedFeedback ? 'Check at least one suggested image before accepting' : '';
+        : !savedFeedbackCount ? 'Check at least one matching image before accepting' : '';
       reject.title = state.finderFeedbackBusy
         ? 'Wait for pose feedback reset to finish'
         : result.feedbackSaving ? 'Saving this gallery review' : '';
+      maybe.title = state.finderFeedbackBusy
+        ? 'Wait for pose feedback reset to finish'
+        : result.review === 'maybe' ? 'Maybe is neutral and creates no pose feedback' : 'Keep this gallery without using it as pose feedback';
+      saveSelection.title = result.review === 'accepted' && !savedFeedbackCount
+        ? 'Accepted feedback needs at least one selected image'
+        : result.feedbackSelectionDirty ? 'Save the edited feedback image selection' : 'Selection is already saved';
       grid.append(fragment);
     });
     const empty = $('#finder-empty');
@@ -2949,10 +3286,26 @@
     state.finderPollTimer = window.setTimeout(() => loadFinderScan({ quiet: true }), delay ?? fallback);
   }
 
+  function scheduleFreshFinderResults(delay = 90) {
+    window.clearTimeout(state.finderResultRefreshTimer);
+    state.finderResultRefreshTimer = window.setTimeout(() => {
+      state.finderResultRefreshTimer = null;
+      if (!state.finderScanId) return;
+      if (state.finderFeedbackBusy || finderFeedbackIsSaving()) {
+        scheduleFreshFinderResults(120);
+        return;
+      }
+      loadFinderResults({ quiet: true });
+    }, delay);
+  }
+
   async function loadFinderResults({ quiet = false } = {}) {
     const scanId = state.finderScanId;
+    const mutationEpoch = state.finderResultMutationEpoch;
+    const mutationInFlight = state.finderFeedbackBusy || finderFeedbackIsSaving();
     if (!scanId) {
       state.finderResults = [];
+      state.finderReviewCounts = null;
       renderFinderWorkspace();
       return;
     }
@@ -2964,6 +3317,16 @@
         limit: 500
       }));
       if (String(scanId) !== String(state.finderScanId)) return;
+      if (
+        mutationInFlight
+        || mutationEpoch !== state.finderResultMutationEpoch
+        || state.finderFeedbackBusy
+        || finderFeedbackIsSaving()
+      ) {
+        scheduleFreshFinderResults();
+        return;
+      }
+      state.finderReviewCounts = normalizeFinderReviewCounts(data);
       const previousResults = new Map(state.finderResults.map(result => [String(result.key), result]));
       state.finderResults = apiItems(data, 'results').map(normalizeFinderResult).map(result => {
         const previous = previousResults.get(String(result.key));
@@ -2972,6 +3335,10 @@
           ...result,
           review: previous.feedbackSaving ? previous.review : result.review,
           feedbackMatchKeys: [...previous.feedbackMatchKeys],
+          feedbackImageUrls: [...previous.feedbackImageUrls],
+          feedbackUsableImageUrls: [...previous.feedbackUsableImageUrls],
+          feedbackPendingImageUrls: [...previous.feedbackPendingImageUrls],
+          feedbackAnalysisProvided: previous.feedbackAnalysisProvided,
           feedbackSelectionProvided: previous.feedbackSelectionProvided,
           feedbackSelectionDirty: previous.feedbackSelectionDirty,
           feedbackSaving: previous.feedbackSaving
@@ -3080,6 +3447,7 @@
     const sampleCopy = `${formatNumber(total)} saved feedback ${total === 1 ? 'sample' : 'samples'}`;
     if (!window.confirm(`Reset ${sampleCopy} for “${tag.label}”? This clears only this pose’s ranking feedback; galleries and cached images are not deleted.`)) return;
     const button = $('#finder-feedback-reset');
+    state.finderResultMutationEpoch += 1;
     state.finderFeedbackBusy = true;
     setButtonBusy(button, true, 'Resetting…');
     renderFinderFeedback();
@@ -3106,6 +3474,7 @@
         state.finderResults.forEach(result => {
           if (result.review === 'pending') return;
           result.feedbackMatchKeys = [];
+          result.feedbackImageUrls = [];
           result.feedbackSelectionProvided = true;
           result.feedbackSelectionDirty = false;
         });
@@ -3117,6 +3486,8 @@
       toast('Could not reset pose feedback', errorMessage(error), 'error');
     } finally {
       state.finderFeedbackBusy = false;
+      state.finderResultMutationEpoch += 1;
+      scheduleFreshFinderResults();
       setButtonBusy(button, false);
       renderFinderFeedback();
       renderFinderResults();
@@ -3148,6 +3519,7 @@
     if (!scanId) {
       state.finderScan = null;
       state.finderResults = [];
+      state.finderReviewCounts = null;
       renderFinderWorkspace();
       return;
     }
@@ -3173,6 +3545,7 @@
         state.finderScan = null;
         state.finderScanId = '';
         state.finderResults = [];
+        state.finderReviewCounts = null;
         storage.set('finder-scan', '');
         renderFinderWorkspace();
       } else if (!quiet) toast('Could not load Finder scan', errorMessage(error), 'error');
@@ -3227,6 +3600,10 @@
 
   async function startFinderScan() {
     if (state.finderBusy || state.finderFeedbackBusy || finderFeedbackIsSaving()) return;
+    if (
+      finderFeedbackHasUnsavedSelections()
+      && !window.confirm('Start a new scan and discard unsaved feedback-selection edits on the current results?')
+    ) return;
     const config = readFinderConfig({ validate: true });
     if (!config) return;
     const button = $('#finder-start');
@@ -3252,6 +3629,7 @@
       state.finderScan = scan;
       state.finderScanId = scan.id;
       state.finderResults = [];
+      state.finderReviewCounts = { pending: 0, accepted: 0, maybe: 0, rejected: 0, total: 0 };
       state.finderReview = 'pending';
       state.finderScans = [scan, ...state.finderScans.filter(item => String(item.id) !== String(scan.id))];
       storage.set('finder-scan', state.finderScanId);
@@ -3348,9 +3726,30 @@
 
   function recountFinderReviews() {
     if (!state.finderScan) return;
-    state.finderScan.pendingCount = state.finderResults.filter(result => result.review === 'pending').length;
-    state.finderScan.acceptedCount = state.finderResults.filter(result => result.review === 'accepted').length;
-    state.finderScan.rejectedCount = state.finderResults.filter(result => result.review === 'rejected').length;
+    const counts = state.finderReviewCounts || {
+      pending: state.finderResults.filter(result => result.review === 'pending').length,
+      accepted: state.finderResults.filter(result => result.review === 'accepted').length,
+      maybe: state.finderResults.filter(result => result.review === 'maybe').length,
+      rejected: state.finderResults.filter(result => result.review === 'rejected').length
+    };
+    state.finderScan.pendingCount = counts.pending;
+    state.finderScan.acceptedCount = counts.accepted;
+    state.finderScan.maybeCount = counts.maybe;
+    state.finderScan.rejectedCount = counts.rejected;
+  }
+
+  function finderFeedbackHasUnsavedSelections() {
+    return state.finderResults.some(result => result.feedbackSelectionDirty);
+  }
+
+  function adjustFinderReviewCounts(previousReview, nextReview) {
+    if (!state.finderReviewCounts || previousReview === nextReview) return;
+    if (state.finderReviewCounts[previousReview] !== undefined) {
+      state.finderReviewCounts[previousReview] = Math.max(0, state.finderReviewCounts[previousReview] - 1);
+    }
+    if (state.finderReviewCounts[nextReview] !== undefined) {
+      state.finderReviewCounts[nextReview] += 1;
+    }
   }
 
   function toggleFinderFeedbackMatch(input) {
@@ -3360,35 +3759,59 @@
     const selected = new Set(result.feedbackMatchKeys);
     if (input.checked) selected.add(matchKey);
     else selected.delete(matchKey);
-    result.feedbackMatchKeys = result.matches
+    const nextMatchKeys = result.matches
       .map(match => match.feedbackKey)
       .filter(key => selected.has(key));
+    const topMatchUrls = new Set(result.matches.map(match => match.imageUrl).filter(Boolean));
+    const outsideTopMatches = result.feedbackImageUrls.filter(url => !topMatchUrls.has(url));
+    const selectedTopMatches = result.matches
+      .filter(match => nextMatchKeys.includes(match.feedbackKey))
+      .map(match => match.imageUrl)
+      .filter(Boolean);
+    const nextImageUrls = [...new Set([...outsideTopMatches, ...selectedTopMatches])];
+    if (nextImageUrls.length > 3) {
+      input.checked = false;
+      toast('Choose up to 3 feedback images', 'This gallery already has selections outside the top suggestions. Open it to edit the complete selection.', 'info');
+      renderFinderResults();
+      return;
+    }
+    result.feedbackMatchKeys = nextMatchKeys;
+    result.feedbackImageUrls = nextImageUrls;
     result.feedbackSelectionDirty = true;
     renderFinderResults();
     announce(`${input.checked ? 'Included' : 'Excluded'} suggested image ${result.feedbackMatchKeys.length} of ${result.matches.length} for pose feedback.`);
   }
 
-  async function reviewFinderResult(result, review, button = null) {
-    if (!result || !['pending', 'accepted', 'rejected'].includes(review) || state.finderBusy || state.finderFeedbackBusy || result.feedbackSaving) return;
+  async function reviewFinderResult(result, review, button = null, { feedbackImageUrls: explicitFeedbackUrls = null } = {}) {
+    if (!result || !['pending', 'accepted', 'maybe', 'rejected'].includes(review) || state.finderBusy || state.finderFeedbackBusy || result.feedbackSaving) return false;
     const scanId = String(state.finderScan?.id || '');
-    if (!scanId) return;
+    if (!scanId) return false;
     const resultKey = String(result.key);
     const snapshot = {
       review: result.review,
       feedbackMatchKeys: [...result.feedbackMatchKeys],
+      feedbackImageUrls: [...result.feedbackImageUrls],
+      feedbackUsableImageUrls: [...result.feedbackUsableImageUrls],
+      feedbackPendingImageUrls: [...result.feedbackPendingImageUrls],
+      feedbackAnalysisProvided: result.feedbackAnalysisProvided,
       feedbackSelectionProvided: result.feedbackSelectionProvided,
       feedbackSelectionDirty: result.feedbackSelectionDirty
     };
-    if (snapshot.review === review && !snapshot.feedbackSelectionDirty) return;
-    const selectedMatches = result.matches.filter(match => result.feedbackMatchKeys.includes(match.feedbackKey));
-    const feedbackImageUrls = selectedMatches.map(match => match.imageUrl).filter(Boolean);
+    if (snapshot.review === review && !snapshot.feedbackSelectionDirty && explicitFeedbackUrls === null) return false;
+    const feedbackImageUrls = review === 'maybe'
+      ? []
+      : explicitFeedbackUrls === null
+        ? [...result.feedbackImageUrls]
+        : [...new Set(explicitFeedbackUrls.map(String).filter(Boolean))].slice(0, 3);
     if (review === 'accepted' && !feedbackImageUrls.length) {
       toast('Check a matching image', 'Accept needs at least one checked suggestion. Unchecked images are excluded from feedback.', 'info');
-      return;
+      return false;
     }
     const sameScan = () => String(state.finderScan?.id || '') === scanId;
+    state.finderResultMutationEpoch += 1;
     state.finderFeedbackMutations += 1;
     result.feedbackSaving = true;
+    adjustFinderReviewCounts(snapshot.review, review);
     result.review = review;
     recountFinderReviews();
     renderFinderResults();
@@ -3403,7 +3826,7 @@
           feedback_image_urls: feedbackImageUrls
         }
       });
-      if (!sameScan()) return;
+      if (!sameScan()) return false;
       const index = state.finderResults.findIndex(item => String(item.key) === resultKey);
       const current = index >= 0 ? state.finderResults[index] : result;
       if (data) {
@@ -3424,11 +3847,24 @@
           personCount: updated.personCount || current.personCount,
           hasOverlay: updated.hasOverlay || current.hasOverlay,
           feedbackMatchKeys: updated.feedbackSelectionProvided ? updated.feedbackMatchKeys : snapshot.feedbackMatchKeys,
+          feedbackImageUrls: updated.feedbackSelectionProvided ? updated.feedbackImageUrls : feedbackImageUrls,
+          feedbackUsableImageUrls: updated.feedbackAnalysisProvided ? updated.feedbackUsableImageUrls : [],
+          feedbackPendingImageUrls: updated.feedbackAnalysisProvided ? updated.feedbackPendingImageUrls : [],
+          feedbackAnalysisProvided: updated.feedbackAnalysisProvided,
           feedbackSelectionProvided: updated.feedbackSelectionProvided || snapshot.feedbackSelectionProvided,
           feedbackSelectionDirty: false,
           feedbackSaving: false
         };
       } else {
+        current.review = review;
+        current.feedbackImageUrls = [...feedbackImageUrls];
+        current.feedbackMatchKeys = current.matches
+          .filter(match => feedbackImageUrls.includes(match.imageUrl))
+          .map(match => match.feedbackKey);
+        current.feedbackUsableImageUrls = [];
+        current.feedbackPendingImageUrls = [];
+        current.feedbackAnalysisProvided = false;
+        current.feedbackSelectionProvided = true;
         current.feedbackSelectionDirty = false;
         current.feedbackSaving = false;
       }
@@ -3436,14 +3872,20 @@
       renderFinderWorkspace();
       if (!applyFinderFeedbackResponse(data)) loadFinderFeedback({ quiet: true, force: true });
       announce(`${result.title} ${review}`);
+      return true;
     } catch (error) {
       if (sameScan()) {
+        adjustFinderReviewCounts(review, snapshot.review);
         const index = state.finderResults.findIndex(item => String(item.key) === resultKey);
         if (index >= 0) {
           state.finderResults[index] = {
             ...state.finderResults[index],
             review: snapshot.review,
             feedbackMatchKeys: snapshot.feedbackMatchKeys,
+            feedbackImageUrls: snapshot.feedbackImageUrls,
+            feedbackUsableImageUrls: snapshot.feedbackUsableImageUrls,
+            feedbackPendingImageUrls: snapshot.feedbackPendingImageUrls,
+            feedbackAnalysisProvided: snapshot.feedbackAnalysisProvided,
             feedbackSelectionProvided: snapshot.feedbackSelectionProvided,
             feedbackSelectionDirty: snapshot.feedbackSelectionDirty,
             feedbackSaving: false
@@ -3453,8 +3895,11 @@
         renderFinderWorkspace();
       }
       toast('Could not save review', errorMessage(error), 'error');
+      return false;
     } finally {
       state.finderFeedbackMutations = Math.max(0, state.finderFeedbackMutations - 1);
+      state.finderResultMutationEpoch += 1;
+      if (sameScan()) scheduleFreshFinderResults();
       if (sameScan()) {
         const current = state.finderResults.find(item => String(item.key) === resultKey);
         if (current?.feedbackSaving) {
@@ -3483,6 +3928,7 @@
       toast('Gallery unavailable', 'This Finder result has no gallery identifier.', 'error');
       return;
     }
+    const feedbackReview = ['accepted', 'rejected'].includes(result.review);
     await openGallery(result.galleryId, {
       summary: {
         id: result.galleryId,
@@ -3491,8 +3937,11 @@
         thumbnail_url: result.bestPreviewUrl,
         image_count: result.imageCount
       },
-      mode: 'pose',
+      mode: feedbackReview ? 'feedback' : 'pose',
       poseTag: finderPoseTagForScan(),
+      finderFeedbackResultKey: result.key,
+      finderFeedbackReview: result.review,
+      feedbackImageUrls: [...result.feedbackImageUrls],
       suggestions: (result.matches?.length ? result.matches : [{ imageUrl: result.bestImageUrl, ordinal: result.bestOrdinal, score: result.score }]).map(match => ({
         imageUrl: match.imageUrl,
         ordinal: match.ordinal,
@@ -3503,7 +3952,16 @@
 
   async function selectFinderScan(scanId) {
     if (state.finderFeedbackBusy || finderFeedbackIsSaving()) return;
+    if (
+      String(scanId || '') !== String(state.finderScanId || '')
+      && finderFeedbackHasUnsavedSelections()
+      && !window.confirm('Switch scans and discard unsaved feedback-selection edits on the current results?')
+    ) {
+      renderFinderScans();
+      return;
+    }
     state.finderScanId = scanId;
+    state.finderReviewCounts = null;
     storage.set('finder-scan', scanId);
     if (!scanId) {
       state.finderScan = null;
@@ -3981,7 +4439,13 @@
   }
 
   function closeModal(dialog) {
+    if (
+      dialog?.id === 'gallery-modal'
+      && (state.finderFeedbackGalleryDirty || state.finderFeedbackGallerySaving)
+      && !confirmDiscardFinderFeedbackGalleryChanges('Close the gallery and discard the unsaved Finder feedback selection?')
+    ) return false;
     if (dialog?.open) dialog.close();
+    return true;
   }
 
   function syncFilterControls() {
@@ -4092,7 +4556,8 @@
       if (!button) return;
       const result = state.finderResults.find(item => String(item.key) === String(button.dataset.finderResult));
       if (!result) return;
-      if (button.dataset.finderAction === 'overlay') {
+      const action = button.dataset.finderAction;
+      if (action === 'overlay') {
         const card = button.closest('.finder-card');
         const visible = !card.classList.contains('is-overlay-visible');
         card.classList.toggle('is-overlay-visible', visible);
@@ -4100,8 +4565,9 @@
         $('span', button).textContent = visible ? 'Hide overlay' : 'Pose overlay';
         const use = $('use', button);
         if (use) use.setAttribute('href', visible ? '#i-eye-off' : '#i-eye');
-      } else if (button.dataset.finderAction === 'open') openFinderResult(result);
-      else reviewFinderResult(result, button.dataset.finderAction, button);
+      } else if (action === 'open') openFinderResult(result);
+      else if (action === 'save-selection') reviewFinderResult(result, result.review, button);
+      else reviewFinderResult(result, action, button);
     });
     $('#finder-result-grid').addEventListener('change', event => {
       const input = event.target.closest('input[data-finder-feedback-match]');
@@ -4193,14 +4659,12 @@
     $('#select-all').addEventListener('click', () => selectAllImages(true));
     $('#select-none').addEventListener('click', () => selectAllImages(false));
     $$('[data-gallery-mode]').forEach(button => button.addEventListener('click', () => setGalleryMode(button.dataset.galleryMode)));
-    $$('[data-pose-assignment]').forEach(button => button.addEventListener('click', () => {
-      state.poseAssignment = button.dataset.poseAssignment;
-      renderPoseToolbar();
-      if (state.poseAssignment === 'target') $('#pose-tag-input').focus();
-    }));
+    $('#finder-feedback-gallery-save').addEventListener('click', saveFinderGalleryFeedbackSelection);
+    $('#finder-feedback-prepare-pose').addEventListener('click', prepareFinderPoseFromFeedback);
+    $$('[data-pose-assignment]').forEach(button => button.addEventListener('click', () => handlePoseAssignmentButton(button)));
     $('#pose-tag-input').addEventListener('input', event => syncPoseTagDefault(event.currentTarget, $('#pose-control-role')));
     $('#pose-tag-input').addEventListener('change', event => syncPoseTagDefault(event.currentTarget, $('#pose-control-role')));
-    $('#pose-control-role').addEventListener('change', renderPoseToolbar);
+    $('#pose-control-role').addEventListener('change', updateSelectionUi);
     $('#pose-apply-checked').addEventListener('click', event => applyPoseAssignment(
       state.poseSelectedImages,
       state.poseAssignment,
@@ -4252,6 +4716,14 @@
       closeModal($('#lightbox-modal'));
       flushPoseDraft();
       state.galleryContext = null;
+      state.finderFeedbackGallerySelection = new Set();
+      state.finderFeedbackGalleryDirty = false;
+      state.finderFeedbackGallerySaving = false;
+    });
+    $('#gallery-modal').addEventListener('cancel', event => {
+      if (!state.finderFeedbackGalleryDirty && !state.finderFeedbackGallerySaving) return;
+      event.preventDefault();
+      closeModal(event.currentTarget);
     });
     $('#modal-ignore').addEventListener('click', () => {
       if (!state.gallery) return;

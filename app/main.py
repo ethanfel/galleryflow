@@ -309,6 +309,7 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
         profile = clean_profile_name(profile)
         detail = await scraper.gallery(gallery_url)
         database.register_gallery_images(detail["url"], detail["images"])
+        await asyncio.to_thread(finder.index_gallery_detail, detail)
         status = database.status_for_urls([detail["url"]], profile)[detail["url"]]
         downloaded_images = database.image_statuses(profile, detail["url"])
         for image in detail["images"]:
@@ -514,13 +515,13 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
     async def finder_results(
         scan_id: str,
         review: str = Query(
-            default="pending", pattern="^(pending|accepted|rejected|all)$"
+            default="pending", pattern="^(pending|maybe|accepted|rejected|all)$"
         ),
         min_score: float | None = Query(default=None, ge=0, le=1),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
     ) -> dict:
-        items, total = finder.results(
+        items, total, counts = finder.results_page(
             scan_id,
             review=review,
             min_score=min_score,
@@ -530,6 +531,7 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
         return {
             "items": [decorate_finder_result(item) for item in items],
             "total": total,
+            "counts": counts,
             "limit": limit,
             "offset": offset,
         }
@@ -538,7 +540,7 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
     async def review_finder_result(
         scan_id: str, result_id: str, payload: FinderReviewPatch
     ) -> dict:
-        item = finder.set_review(
+        item = await finder.set_review_ready(
             scan_id,
             result_id,
             payload.review,

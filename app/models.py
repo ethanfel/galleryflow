@@ -83,7 +83,7 @@ class FinderScanExtend(BaseModel):
 
 
 class FinderReviewPatch(BaseModel):
-    review: Literal["pending", "accepted", "rejected"]
+    review: Literal["pending", "maybe", "accepted", "rejected"]
     feedback_image_urls: (
         list[Annotated[str, Field(min_length=1, max_length=2_000)]] | None
     ) = Field(default=None, max_length=3)
