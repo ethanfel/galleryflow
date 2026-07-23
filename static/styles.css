@@ -718,6 +718,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .finder-suggestion-badge { position: absolute; z-index: 4; bottom: 32px; left: 7px; display: inline-flex; max-width: calc(100% - 14px); min-height: 22px; padding: 0 7px; gap: 5px; align-items: center; overflow: hidden; border: 1px solid rgba(155,123,250,.35); border-radius: 7px; background: rgba(8,8,12,.86); color: #d7cdff; font-size: 8px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; pointer-events: none; backdrop-filter: blur(8px); }
 .finder-suggestion-badge svg { width: 11px; height: 11px; flex: none; }
 .finder-suggestion-badge span { overflow: hidden; text-overflow: ellipsis; }
+.finder-feedback-manual-badge { position: absolute; z-index: 4; top: 7px; left: 7px; display: inline-flex; max-width: calc(100% - 54px); min-height: 22px; padding: 0 7px; align-items: center; overflow: hidden; border: 1px solid rgba(255,196,92,.38); border-radius: 7px; background: rgba(48,35,13,.88); color: #ffd98f; font-size: 8px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; pointer-events: none; backdrop-filter: blur(8px); }
 
 .mobile-nav { display: none; }
 

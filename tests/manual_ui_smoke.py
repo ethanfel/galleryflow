@@ -34,10 +34,13 @@ def build_visual_app(
     open_finder_pose_flow: bool = False,
     finder_direct_assign: bool = False,
     finder_race: bool = False,
+    finder_unusable_save: bool = False,
     finder_exhausted: bool = False,
 ):
     finder_pose_mode = open_finder_pose_flow or finder_direct_assign
-    finder_review_mode = open_finder_feedback or finder_pose_mode
+    finder_review_mode = (
+        open_finder_feedback or finder_pose_mode or finder_unusable_save
+    )
     config = AppConfig(
         data_dir=temp_root / "data",
         download_root=temp_root / "downloads",
@@ -260,6 +263,8 @@ def build_visual_app(
                 await asyncio.sleep(1.2)
             elif results_call >= 3:
                 await asyncio.sleep(0.1)
+        elif finder_unusable_save and finder_race_state["selected"]:
+            first_review = finder_race_state["review"]
         else:
             first_review = "accepted" if finder_review_mode else "pending"
         first_image = (
@@ -269,9 +274,19 @@ def build_visual_app(
         )
         feedback_urls = (
             list(finder_race_state["selected"])
-            if finder_race
+            if finder_race or (finder_unusable_save and finder_race_state["selected"])
             else [first_image]
             if finder_review_mode
+            else []
+        )
+        feedback_usable_urls = (
+            []
+            if finder_unusable_save and finder_race_state["selected"]
+            else feedback_urls
+        )
+        feedback_pending_urls = (
+            feedback_urls
+            if finder_unusable_save and finder_race_state["selected"]
             else []
         )
         results = [
@@ -290,8 +305,8 @@ def build_visual_app(
                 "online_scanned": False,
                 "review": first_review,
                 "feedback_image_urls": feedback_urls,
-                "feedback_usable_image_urls": feedback_urls,
-                "feedback_pending_image_urls": [],
+                "feedback_usable_image_urls": feedback_usable_urls,
+                "feedback_pending_image_urls": feedback_pending_urls,
                 "images_scored": 24,
                 "image_count": 24,
                 "person_count": 2,
@@ -385,6 +400,8 @@ def build_visual_app(
         finder_race_state["review"] = payload.review
         selected = list(payload.feedback_image_urls or [])
         finder_race_state["selected"] = selected
+        usable = [] if finder_unusable_save else selected
+        pending = selected if finder_unusable_save else []
         return {
             "result": {
                 "id": result_id,
@@ -396,8 +413,8 @@ def build_visual_app(
                 "ranking_tier": 2,
                 "review": payload.review,
                 "feedback_image_urls": selected,
-                "feedback_usable_image_urls": selected,
-                "feedback_pending_image_urls": [],
+                "feedback_usable_image_urls": usable,
+                "feedback_pending_image_urls": pending,
             }
         }
 
@@ -425,6 +442,8 @@ def build_visual_app(
             script += "window.addEventListener('load',()=>{let phase=0;const poll=setInterval(()=>{const modal=document.querySelector('#gallery-modal');const options=[...document.querySelectorAll('#image-grid .image-option')];if(!modal?.classList.contains('is-pose-mode')||options.length<2||document.querySelector('#pose-save-status')?.textContent.includes('Loading'))return;if(phase===0){const target=options[0].querySelector('input');const control=options[1].querySelector('input');if(target?.checked)target.click();if(control&&!control.checked)control.click();document.querySelector('[data-pose-assignment=couple]')?.click();phase=1}else if(phase===1&&options[1]?.classList.contains('has-pose-control')){const target=options[0].querySelector('input');if(target&&!target.checked)target.click();document.querySelector('[data-pose-assignment=target]')?.click();phase=2}else if(phase===2&&options[0]?.classList.contains('has-pose-target')){document.documentElement.dataset.finderDirect='pass';clearInterval(poll)}},80);setTimeout(()=>{if(!document.documentElement.dataset.finderDirect)document.documentElement.dataset.finderDirect='fail'},5200)});"
         if finder_race:
             script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const button=document.querySelector('.finder-accept:not(:disabled)');if(button){setTimeout(()=>button.click(),1400);clearInterval(poll)}},50);setTimeout(()=>{const passed=document.querySelector('#finder-accepted-count')?.textContent==='1'&&document.querySelector('#finder-pending-count')?.textContent==='1';document.documentElement.dataset.finderRace=passed?'pass':'fail'},3800)});"
+        if finder_unusable_save:
+            script += "window.addEventListener('load',()=>{let submitted=false;const poll=setInterval(()=>{const modal=document.querySelector('#gallery-modal');const grid=document.querySelector('#image-grid');const save=document.querySelector('#finder-feedback-gallery-save');const options=[...document.querySelectorAll('#image-grid .image-option input')];if(!modal?.open||!modal.classList.contains('is-feedback-mode')||grid?.getAttribute('aria-busy')!=='false'||options.length<2)return;if(!submitted){for(const input of options){if(input.checked)input.click()}options[1].click();if(!save?.disabled){save.click();submitted=true}}else{const summary=document.querySelector('#selection-summary')?.textContent||'';const toast=[...document.querySelectorAll('.toast')].map(item=>item.textContent).join(' ');const kept=options[1].checked;const passed=kept&&summary.includes('selection saved')&&summary.includes('not currently pose-usable')&&toast.includes('remains selected for review')&&toast.includes('does not currently affect automatic ranking')&&!toast.includes('Could not save review');if(passed){document.documentElement.dataset.finderUnusableSave='pass';clearInterval(poll)}}},80);setTimeout(()=>{if(!document.documentElement.dataset.finderUnusableSave)document.documentElement.dataset.finderUnusableSave='fail'},6200)});"
         return Response(script, media_type="application/javascript")
 
     async def fake_index() -> Response:
@@ -512,6 +531,7 @@ def main() -> None:
     parser.add_argument("--finder-pose-flow", action="store_true")
     parser.add_argument("--finder-direct-assign", action="store_true")
     parser.add_argument("--finder-race", action="store_true")
+    parser.add_argument("--finder-unusable-save", action="store_true")
     parser.add_argument("--finder-exhausted", action="store_true")
     args = parser.parse_args()
     finder_mode = (
@@ -520,10 +540,13 @@ def main() -> None:
         or args.finder_pose_flow
         or args.finder_direct_assign
         or args.finder_race
+        or args.finder_unusable_save
         or args.finder_exhausted
     )
     suffix = (
-        "finder-direct-assign"
+        "finder-unusable-save"
+        if args.finder_unusable_save
+        else "finder-direct-assign"
         if args.finder_direct_assign
         else "finder-race"
         if args.finder_race
@@ -587,6 +610,7 @@ def main() -> None:
                     open_finder_pose_flow=args.finder_pose_flow,
                     finder_direct_assign=args.finder_direct_assign,
                     finder_race=args.finder_race,
+                    finder_unusable_save=args.finder_unusable_save,
                     finder_exhausted=args.finder_exhausted,
                 ),
                 host="127.0.0.1",
@@ -619,20 +643,28 @@ def main() -> None:
             "--disable-sync",
             "--force-prefers-reduced-motion",
             "--no-first-run",
-            f"--virtual-time-budget={6500 if args.finder_direct_assign else 4500 if args.finder_race else 4000 if args.finder_pose_flow else 3000 if args.lightbox or args.pose else 2000 if finder_mode else 1000}",
+            f"--virtual-time-budget={7500 if args.finder_unusable_save else 6500 if args.finder_direct_assign else 4500 if args.finder_race else 4000 if args.finder_pose_flow else 3000 if args.lightbox or args.pose else 2000 if finder_mode else 1000}",
             f"--user-data-dir={Path(directory) / 'chrome-profile'}",
             f"--window-size={viewport}",
             f"--screenshot={output}",
             f"http://127.0.0.1:18101/{'#finder' if finder_mode else '#sort' if args.sort else ''}",
         ]
-        if args.finder_race or args.finder_direct_assign:
+        if args.finder_race or args.finder_direct_assign or args.finder_unusable_save:
             command.insert(1, "--dump-dom")
         completed = subprocess.run(
             command,
             check=True,
             timeout=45,
-            capture_output=args.finder_race or args.finder_direct_assign,
-            text=args.finder_race or args.finder_direct_assign,
+            capture_output=(
+                args.finder_race
+                or args.finder_direct_assign
+                or args.finder_unusable_save
+            ),
+            text=(
+                args.finder_race
+                or args.finder_direct_assign
+                or args.finder_unusable_save
+            ),
         )
         if args.finder_race and 'data-finder-race="pass"' not in completed.stdout:
             raise AssertionError("stale Finder results overwrote the completed review")
@@ -641,6 +673,13 @@ def main() -> None:
             and 'data-finder-direct="pass"' not in completed.stdout
         ):
             raise AssertionError("direct gallery-grid pose assignment did not complete")
+        if (
+            args.finder_unusable_save
+            and 'data-finder-unusable-save="pass"' not in completed.stdout
+        ):
+            raise AssertionError(
+                "pose-unusable Finder selection was not retained as saved feedback"
+            )
         server.should_exit = True
         thread.join(timeout=5)
     print(output)

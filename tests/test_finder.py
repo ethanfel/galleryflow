@@ -2253,6 +2253,10 @@ async def test_finder_api_signs_best_preview(tmp_path: Path, monkeypatch) -> Non
             assert reviewed.status_code == 200
             reviewed_body = reviewed.json()
             assert reviewed_body["result"]["feedback_image_urls"] == [selected_image]
+            assert reviewed_body["result"]["feedback_usable_image_urls"] == [
+                selected_image
+            ]
+            assert reviewed_body["result"]["feedback_pending_image_urls"] == []
             assert reviewed_body["feedback"]["accepted_galleries"] == 1
             assert reviewed_body["feedback"]["accepted_samples"] == 1
             assert reviewed_body["feedback"]["applies_to"] == "future_scans"
@@ -2449,18 +2453,25 @@ async def test_finder_feedback_curated_samples_persist_and_freeze(
             raise RuntimeError("temporary image failure")
 
         service.media_fetcher = unavailable_media
-        with pytest.raises(finder_module.FinderUnavailable, match="could not load"):
-            await service.set_review_ready(
-                first_scan["id"],
-                result["id"],
-                "accepted",
-                [adjacent_url],
-            )
-        unchanged, _ = service.results(
-            first_scan["id"], review="maybe", min_score=0, limit=20, offset=0
+        accepted_pending = await service.set_review_ready(
+            first_scan["id"],
+            result["id"],
+            "accepted",
+            [adjacent_url],
         )
-        assert [item["id"] for item in unchanged] == [result["id"]]
-        assert service.feedback_status(tag_id)["accepted_samples"] == 0
+        assert accepted_pending["feedback_image_urls"] == [adjacent_url]
+        assert accepted_pending["feedback_usable_image_urls"] == []
+        assert accepted_pending["feedback_pending_image_urls"] == [adjacent_url]
+        saved_pending, _ = service.results(
+            first_scan["id"], review="accepted", min_score=0, limit=20, offset=0
+        )
+        assert saved_pending[0]["feedback_image_urls"] == [adjacent_url]
+        assert saved_pending[0]["feedback_usable_image_urls"] == []
+        assert saved_pending[0]["feedback_pending_image_urls"] == [adjacent_url]
+        pending_status = service.feedback_status(tag_id)
+        assert pending_status["accepted_samples"] == 1
+        assert pending_status["usable_accepted_samples"] == 0
+        assert pending_status["active"] is False
         with pytest.raises(finder_module.FinderUnavailable, match="usable pose"):
             service.set_review(
                 first_scan["id"],
@@ -2469,9 +2480,37 @@ async def test_finder_feedback_curated_samples_persist_and_freeze(
                 [adjacent_url],
                 require_usable=True,
             )
-        assert service.feedback_status(tag_id)["accepted_samples"] == 0
+        assert service.feedback_status(tag_id)["usable_accepted_samples"] == 0
 
         service.media_fetcher = fake_media
+        original_infer = service.pose_estimator.infer_bytes
+
+        def unreliable_pose(_: bytes) -> PoseFrame:
+            return PoseFrame(
+                keypoints=np.empty((0, 17, 2), dtype=np.float32),
+                confidences=np.empty((0, 17), dtype=np.float32),
+                boxes=np.empty((0, 4), dtype=np.float32),
+                person_scores=np.empty((0,), dtype=np.float32),
+                image_size=(12, 18),
+                model_key=service.pose_estimator.model_key,
+                provider="CPUExecutionProvider",
+            )
+
+        service.pose_estimator.infer_bytes = unreliable_pose
+        mixed = await service.set_review_ready(
+            first_scan["id"],
+            result["id"],
+            "accepted",
+            [selected_url, adjacent_url],
+        )
+        assert set(mixed["feedback_image_urls"]) == {selected_url, adjacent_url}
+        assert mixed["feedback_usable_image_urls"] == [selected_url]
+        assert mixed["feedback_pending_image_urls"] == [adjacent_url]
+        mixed_status = service.feedback_status(tag_id)
+        assert mixed_status["accepted_samples"] == 2
+        assert mixed_status["usable_accepted_samples"] == 1
+
+        service.pose_estimator.infer_bytes = original_infer
         accepted = await service.set_review_ready(
             first_scan["id"],
             result["id"],
@@ -2493,6 +2532,63 @@ async def test_finder_feedback_curated_samples_persist_and_freeze(
                 (result["id"],),
             ).fetchone()[0]
         assert saved_pose
+
+        # A durable usable pose must survive a transient cache/media outage.
+        # Re-saving the same manual choice is idempotent and adding another
+        # unavailable choice leaves only that new sample pending.
+        durable_status = service.feedback_status(tag_id)
+        adjacent_source_key = service._remote_source_key(adjacent_preview)
+        service._delete_current_descriptor(adjacent_source_key)
+        service.media_fetcher = unavailable_media
+        preserved = await service.set_review_ready(
+            first_scan["id"],
+            result["id"],
+            "accepted",
+            [adjacent_url],
+        )
+        assert preserved["feedback_usable_image_urls"] == [adjacent_url]
+        assert preserved["feedback_pending_image_urls"] == []
+        assert service.feedback_status(tag_id)["revision"] == durable_status["revision"]
+        preserved_reload, _ = service.results(
+            first_scan["id"], review="accepted", min_score=0, limit=20, offset=0
+        )
+        assert preserved_reload[0]["feedback_usable_image_urls"] == [adjacent_url]
+        assert preserved_reload[0]["feedback_pending_image_urls"] == []
+
+        unavailable_url = "https://cdni.pornpics.com/full/unavailable-feedback.png"
+        unavailable_preview = "https://cdni.pornpics.com/p/unavailable-feedback.png"
+        with database.connect() as connection:
+            connection.execute(
+                """INSERT INTO finder_corpus_images(
+                       gallery_key, source_key, image_url, preview_remote_url,
+                       ordinal, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    result["gallery_key"],
+                    service._remote_source_key(unavailable_preview),
+                    unavailable_url,
+                    unavailable_preview,
+                    100,
+                    now,
+                    now,
+                ),
+            )
+        preserved_mixed = await service.set_review_ready(
+            first_scan["id"],
+            result["id"],
+            "accepted",
+            [adjacent_url, unavailable_url],
+        )
+        assert preserved_mixed["feedback_usable_image_urls"] == [adjacent_url]
+        assert preserved_mixed["feedback_pending_image_urls"] == [unavailable_url]
+
+        service.media_fetcher = fake_media
+        await service.set_review_ready(
+            first_scan["id"],
+            result["id"],
+            "accepted",
+            [adjacent_url],
+        )
 
         # The user can curate up to three images, then remove one without the
         # deselected sample lingering in persisted feedback.
@@ -2768,6 +2864,38 @@ async def test_finder_feedback_review_is_authoritative_per_gallery_across_scans(
             for item in second_results
             if item["gallery_key"] == first["gallery_key"]
         )
+
+        first_match = next(
+            match for match in first["top_matches"] if match["image_url"] == first_url
+        )
+        service._delete_current_descriptor(
+            service._remote_source_key(first_match["preview_remote_url"])
+        )
+
+        async def unavailable_media(_: str, __: str) -> bytes:
+            raise RuntimeError("temporary image failure")
+
+        service.media_fetcher = unavailable_media
+        relocated = await service.set_review_ready(
+            second_scan["id"],
+            second["id"],
+            "accepted",
+            [first_url],
+        )
+        assert relocated["feedback_usable_image_urls"] == [first_url]
+        assert relocated["feedback_pending_image_urls"] == []
+        assert service.feedback_status(tag_id)["revision"] == first_revision
+        reloaded_second, _ = service.results(
+            second_scan["id"], review="accepted", min_score=0, limit=20, offset=0
+        )
+        assert reloaded_second[0]["feedback_usable_image_urls"] == [first_url]
+        assert reloaded_second[0]["feedback_pending_image_urls"] == []
+        superseded_first, _ = service.results(
+            first_scan["id"], review="accepted", min_score=0, limit=20, offset=0
+        )
+        assert superseded_first[0]["feedback_image_urls"] == []
+
+        service.media_fetcher = fake_media
         replacement_url = next(
             match["image_url"]
             for match in second["top_matches"]

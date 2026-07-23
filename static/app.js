@@ -1580,6 +1580,11 @@
     const activeSelection = state.galleryMode === 'feedback'
       ? state.finderFeedbackGallerySelection
       : state.galleryMode === 'pose' ? state.poseSelectedImages : state.selectedImages;
+    const pendingFeedbackUrls = new Set(
+      state.galleryMode === 'feedback'
+        ? finderFeedbackGalleryResult()?.feedbackPendingImageUrls || []
+        : []
+    );
     $('#images-empty').hidden = Boolean(images.length);
     images.forEach((image, index) => {
       const option = document.createElement('div');
@@ -1624,6 +1629,14 @@
       number.className = 'image-number';
       number.textContent = String(index + 1).padStart(2, '0');
       option.append(input, previewButton, check, number);
+      if (activeSelection.has(image.url) && pendingFeedbackUrls.has(image.url)) {
+        option.classList.add('is-feedback-manual-only');
+        const manualOnly = document.createElement('span');
+        manualOnly.className = 'finder-feedback-manual-badge';
+        manualOnly.textContent = 'Saved · pose pending';
+        manualOnly.title = 'Saved for your review; this image is not currently pose-usable and does not currently affect automatic ranking';
+        option.append(manualOnly);
+      }
       if (image.downloaded) {
         const saved = document.createElement('span');
         saved.className = 'image-saved';
@@ -1807,8 +1820,8 @@
           state.finderFeedbackGalleryDirty
             ? ' · unsaved changes'
             : pendingFeedbackCount
-              ? ` · ${formatNumber(pendingFeedbackCount)} not currently usable for pose ranking`
-              : feedbackResult?.feedbackAnalysisProvided ? ' · selection saved and usable' : ' · selection saved'
+              ? ` · selection saved · ${formatNumber(pendingFeedbackCount)} pose-pending (not currently pose-usable)`
+              : feedbackResult?.feedbackAnalysisProvided ? ' · selection saved and eligible for future ranking' : ' · selection saved'
         }`
         : state.galleryMode === 'pose'
           ? state.galleryContext?.finderFeedbackResultKey
@@ -1872,13 +1885,14 @@
         (updated?.feedbackImageUrls || feedbackImageUrls).filter(url => galleryUrls.has(url)).slice(0, 3)
       );
       const pending = updated?.feedbackPendingImageUrls?.length || 0;
+      const savedCount = state.finderFeedbackGallerySelection.size;
       toast(
-        pending ? 'Selection saved; some samples are not usable' : 'Feedback selection saved',
+        'Feedback selection saved',
         pending
-          ? `${formatNumber(pending)} selected ${pending === 1 ? 'image is' : 'images are'} not currently usable for pose ranking.`
-          : `${formatNumber(state.finderFeedbackGallerySelection.size)} ${review} pose-feedback ${state.finderFeedbackGallerySelection.size === 1 ? 'image' : 'images'} saved.`,
-        pending ? 'info' : 'success',
-        pending ? 7000 : 4500
+          ? `All ${formatNumber(savedCount)} selected ${savedCount === 1 ? 'image was' : 'images were'} saved. ${formatNumber(pending)} ${pending === 1 ? 'is' : 'are'} not currently pose-usable, so ${pending === 1 ? 'it remains' : 'they remain'} selected for review but ${pending === 1 ? 'does' : 'do'} not currently affect automatic ranking.`
+          : `${formatNumber(savedCount)} ${review} pose-feedback ${savedCount === 1 ? 'image' : 'images'} saved and eligible for future ranking.`,
+        'success',
+        pending ? 8500 : 4500
       );
       announce(`Finder feedback selection saved for ${result.title}.`);
       renderImages();
@@ -3061,9 +3075,9 @@
               ? result.feedbackSelectionDirty
                 ? `${savedFeedbackCount} selected · unsaved changes—use Save selection`
                 : pendingFeedbackCount
-                  ? `${savedFeedbackCount} selected · ${pendingFeedbackCount} not currently usable for pose ranking · ${usableFeedbackCount} usable`
+                  ? `${savedFeedbackCount} selected and saved · ${usableFeedbackCount} ranking-eligible · ${pendingFeedbackCount} pose-pending`
                   : savedFeedbackCount
-                    ? `${savedFeedbackCount} ${result.review} feedback ${savedFeedbackCount === 1 ? 'image' : 'images'} ${result.feedbackAnalysisProvided ? 'usable' : 'saved'} · edit checks or open the gallery`
+                    ? `${savedFeedbackCount} ${result.review} feedback ${savedFeedbackCount === 1 ? 'image' : 'images'} ${result.feedbackAnalysisProvided ? 'saved and ranking-eligible' : 'saved'} · edit checks or open the gallery`
                     : `Gallery ${result.review} · no image-level pose feedback saved`
               : selectedFeedback
                 ? `${selectedFeedback} of ${result.matches.length} suggested ${result.matches.length === 1 ? 'image' : 'images'} checked for pose feedback · uncheck wrong images`
@@ -3475,6 +3489,9 @@
           if (result.review === 'pending') return;
           result.feedbackMatchKeys = [];
           result.feedbackImageUrls = [];
+          result.feedbackUsableImageUrls = [];
+          result.feedbackPendingImageUrls = [];
+          result.feedbackAnalysisProvided = true;
           result.feedbackSelectionProvided = true;
           result.feedbackSelectionDirty = false;
         });

@@ -1947,14 +1947,15 @@ class FinderService:
             item["rank"] = rank
         return top
 
-    @classmethod
     def _decode_result(
-        cls,
+        self,
         row: Any,
         *,
         ranking_version: str = LEGACY_RANKING_VERSION,
+        feedback_samples: list[Any] | None = None,
     ) -> dict[str, Any]:
         item = dict(row)
+        selections = [dict(sample) for sample in feedback_samples or []][:3]
         online_state = int(item.get("online_scanned", 1))
         item["online_scanned"] = online_state > 0
         item["online_refresh_failed"] = online_state < 0
@@ -1963,7 +1964,7 @@ class FinderService:
             decoded = json.loads(str(raw_matches or "[]"))
         except (TypeError, ValueError, json.JSONDecodeError):
             decoded = []
-        matches = cls._normalized_top_matches(
+        matches = self._normalized_top_matches(
             decoded if isinstance(decoded, list) else [],
             ranking_version=ranking_version,
         )
@@ -1972,7 +1973,7 @@ class FinderService:
             and item.get("best_image_url")
             and item.get("best_preview_remote_url")
         ):
-            matches = cls._normalized_top_matches(
+            matches = self._normalized_top_matches(
                 [
                     {
                         "image_url": item["best_image_url"],
@@ -1989,28 +1990,40 @@ class FinderService:
                 ranking_version=ranking_version,
             )
         item["top_matches"] = matches
-        item["feedback_image_urls"] = []
+        item["feedback_image_urls"] = [
+            selection["image_url"] for selection in selections
+        ]
+        item["feedback_usable_image_urls"] = [
+            selection["image_url"]
+            for selection in selections
+            if self._feedback_pose(selection) is not None
+        ]
+        usable_urls = set(item["feedback_usable_image_urls"])
+        item["feedback_pending_image_urls"] = [
+            selection["image_url"]
+            for selection in selections
+            if selection["image_url"] not in usable_urls
+        ]
         return item
 
     @staticmethod
-    def _feedback_image_urls_for_results(
+    def _feedback_samples_for_results(
         db: Any, result_ids: list[str]
-    ) -> dict[str, list[str]]:
+    ) -> dict[str, list[Any]]:
         if not result_ids:
             return {}
         placeholders = ",".join("?" for _ in result_ids)
         rows = db.execute(
-            f"""SELECT origin_result_id, image_url
+            f"""SELECT origin_result_id, source_key, image_url,
+                       preview_remote_url, pose_model_key, pose_json
                 FROM finder_feedback_samples
                 WHERE origin_result_id IN ({placeholders})
                 ORDER BY origin_result_id, created_at, source_key""",
             result_ids,
         ).fetchall()
-        selected: dict[str, list[str]] = {}
+        selected: dict[str, list[Any]] = {}
         for row in rows:
-            selected.setdefault(str(row["origin_result_id"]), []).append(
-                str(row["image_url"])
-            )
+            selected.setdefault(str(row["origin_result_id"]), []).append(row)
         return selected
 
     @staticmethod
@@ -2066,7 +2079,7 @@ class FinderService:
                     ORDER BY {order_by} LIMIT ? OFFSET ?""",
                 [*params, limit, offset],
             ).fetchall()
-            selected_urls = self._feedback_image_urls_for_results(
+            feedback_samples = self._feedback_samples_for_results(
                 db, [str(row["id"]) for row in rows]
             )
             count_rows = db.execute(
@@ -2082,12 +2095,12 @@ class FinderService:
                 ranking_version=str(
                     scan.get("ranking_version") or LEGACY_RANKING_VERSION
                 ),
+                feedback_samples=feedback_samples.get(str(row["id"]), []),
             )
             for row in rows
         ]
         for item in items:
             item["above_threshold"] = item["score"] >= scan["minimum_score"]
-            item["feedback_image_urls"] = selected_urls.get(str(item["id"]), [])
         return items, total, self._review_counts_from_rows(count_rows)
 
     def results(
@@ -2277,7 +2290,7 @@ class FinderService:
         review: str,
         feedback_image_urls: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Analyze selected gallery images before persisting learning feedback."""
+        """Best-effort analyze selections, then always persist the manual review."""
 
         targets = await asyncio.to_thread(
             self._review_analysis_targets,
@@ -2287,46 +2300,40 @@ class FinderService:
             feedback_image_urls,
         )
         if targets:
-            await self._ensure_encoder_ready()
-            if self.pose_estimator is None or not self._pose_ready:
-                raise FinderUnavailable(
-                    self._pose_error
-                    or "Finder pose analysis is unavailable for feedback images"
-                )
-            for preview_remote_url, gallery_url in dict.fromkeys(targets):
-                canonical = canonicalize_url(preview_remote_url)
-                source_key = self._remote_source_key(canonical)
-                cached = self._cached_descriptor(source_key, False)
-                if cached is not None and self._descriptor_has_usable_feedback_pose(
-                    cached
-                ):
-                    continue
-                if cached is not None:
-                    await asyncio.to_thread(
-                        self._delete_current_descriptor,
-                        source_key,
-                    )
-                try:
-                    descriptor = await self._remote_descriptor(canonical, gallery_url)
-                except (FinderUnavailable, ValueError):
-                    raise
-                except Exception as exc:
-                    raise FinderUnavailable(
-                        "Finder could not load a selected feedback image for pose "
-                        "analysis"
-                    ) from exc
-                if not self._descriptor_has_usable_feedback_pose(descriptor):
-                    raise ValueError(
-                        "Finder could not detect a reliable pose in a selected "
-                        "feedback image"
-                    )
+            try:
+                await self._ensure_encoder_ready()
+            except FinderUnavailable:
+                # The user's curation is authoritative even when model
+                # preparation or media analysis is temporarily unavailable.
+                pass
+            if self.pose_estimator is not None and self._pose_ready:
+                for preview_remote_url, gallery_url in dict.fromkeys(targets):
+                    try:
+                        canonical = canonicalize_url(preview_remote_url)
+                        source_key = self._remote_source_key(canonical)
+                        cached = self._cached_descriptor(source_key, False)
+                        if (
+                            cached is not None
+                            and self._descriptor_has_usable_feedback_pose(cached)
+                        ):
+                            continue
+                        if cached is not None:
+                            await asyncio.to_thread(
+                                self._delete_current_descriptor,
+                                source_key,
+                            )
+                        await self._remote_descriptor(canonical, gallery_url)
+                    except Exception:
+                        # A failed download or unreliable pose leaves this
+                        # selection pending. It must not block saving the other
+                        # manual choices.
+                        continue
         return await asyncio.to_thread(
             self.set_review,
             scan_id,
             result_id,
             review,
             feedback_image_urls,
-            require_usable=True,
         )
 
     def set_review(
@@ -2343,45 +2350,13 @@ class FinderService:
         if not scan:
             raise FinderNotFound("Finder scan not found")
         with self._lock, self.database.connect() as db:
-            row, stored_samples, selected_urls, selected_matches = (
-                self._resolve_review_selection(
-                    db,
-                    scan_id=scan_id,
-                    result_id=result_id,
-                    review=review,
-                    feedback_image_urls=feedback_image_urls,
-                )
+            row, stored_samples, _, selected_matches = self._resolve_review_selection(
+                db,
+                scan_id=scan_id,
+                result_id=result_id,
+                review=review,
+                feedback_image_urls=feedback_image_urls,
             )
-            selected: list[tuple[dict[str, Any], str, str, str]] = []
-            for match in selected_matches:
-                try:
-                    source_key, pose_model_key, pose_json = (
-                        self._feedback_pose_snapshot(
-                            db,
-                            model_key=str(row["reference_model_key"] or ""),
-                            preview_remote_url=str(match["preview_remote_url"]),
-                        )
-                    )
-                except (TypeError, ValueError) as exc:
-                    raise ValueError(
-                        "A selected feedback image has an invalid preview URL"
-                    ) from exc
-                if (
-                    require_usable
-                    and self._feedback_pose(
-                        {
-                            "pose_model_key": pose_model_key,
-                            "pose_json": pose_json,
-                        }
-                    )
-                    is None
-                ):
-                    raise FinderUnavailable(
-                        "A selected feedback image no longer has a usable pose "
-                        "analysis; please retry"
-                    )
-                selected.append((match, source_key, pose_model_key, pose_json))
-
             previous_decisions = db.execute(
                 """SELECT * FROM finder_feedback_decisions
                    WHERE pose_tag_id = ? AND gallery_key = ?
@@ -2400,6 +2375,57 @@ class FinderService:
                 if previous_decision
                 else []
             )
+            durable_samples = [*previous_sample_rows, *stored_samples]
+            stored_by_source = {
+                str(sample["source_key"]): sample for sample in durable_samples
+            }
+            stored_by_image = {
+                str(sample["image_url"]): sample for sample in durable_samples
+            }
+            selected: list[tuple[dict[str, Any], str, str, str]] = []
+            for match in selected_matches:
+                try:
+                    source_key, pose_model_key, pose_json = (
+                        self._feedback_pose_snapshot(
+                            db,
+                            model_key=str(row["reference_model_key"] or ""),
+                            preview_remote_url=str(match["preview_remote_url"]),
+                        )
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "A selected feedback image has an invalid preview URL"
+                    ) from exc
+                fresh_sample = {
+                    "pose_model_key": pose_model_key,
+                    "pose_json": pose_json,
+                }
+                if self._feedback_pose(fresh_sample) is None:
+                    stored_sample = stored_by_source.get(
+                        source_key
+                    ) or stored_by_image.get(str(match["image_url"]))
+                    if (
+                        stored_sample is not None
+                        and self._feedback_pose(dict(stored_sample)) is not None
+                    ):
+                        pose_model_key = str(stored_sample["pose_model_key"] or "")
+                        pose_json = str(stored_sample["pose_json"] or "")
+                if (
+                    require_usable
+                    and self._feedback_pose(
+                        {
+                            "pose_model_key": pose_model_key,
+                            "pose_json": pose_json,
+                        }
+                    )
+                    is None
+                ):
+                    raise FinderUnavailable(
+                        "A selected feedback image no longer has a usable pose "
+                        "analysis; please retry"
+                    )
+                selected.append((match, source_key, pose_model_key, pose_json))
+
             previous_samples = {
                 str(item["source_key"]): (
                     str(item["image_url"]),
@@ -2491,9 +2517,18 @@ class FinderService:
         item = self._decode_result(
             row,
             ranking_version=str(scan.get("ranking_version") or LEGACY_RANKING_VERSION),
+            feedback_samples=[
+                {
+                    "source_key": source_key,
+                    "image_url": str(match["image_url"]),
+                    "preview_remote_url": str(match["preview_remote_url"]),
+                    "pose_model_key": pose_model_key,
+                    "pose_json": pose_json,
+                }
+                for match, source_key, pose_model_key, pose_json in selected
+            ],
         )
         item["above_threshold"] = item["score"] >= scan.get("minimum_score", 0)
-        item["feedback_image_urls"] = selected_urls
         return item
 
     def _publish(self, scan: dict[str, Any], *, force: bool = False) -> None:
