@@ -24,8 +24,11 @@ ROOT = "https://www.pornpics.com/"
 GALLERY_A = "https://www.pornpics.com/galleries/alpha-79186222/"
 GALLERY_B = "https://www.pornpics.com/galleries/beta-79186223/"
 GALLERY_C = "https://www.pornpics.com/galleries/broken-79186224/"
+GALLERY_D = "https://www.pornpics.com/galleries/delta-79186225/"
 PAGE_2 = "https://www.pornpics.com/?page=2"
 PAGE_3 = "https://www.pornpics.com/?page=3"
+ALTERNATE_ROOT = "https://www.pornpics.com/tags/alternate/"
+ALTERNATE_PAGE_2 = "https://www.pornpics.com/tags/alternate/?page=2"
 
 
 @pytest.fixture(autouse=True)
@@ -1480,6 +1483,319 @@ async def test_finder_extend_active_limit_race_and_paused_state(
         await service.stop()
 
 
+@pytest.mark.asyncio
+async def test_finder_continue_accumulates_new_source_deduplicates_and_restarts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(finder_module, "validate_public_media_url", lambda value: value)
+    config, database, tag_id = configured(tmp_path)
+
+    class CumulativeScraper(FakeScraper):
+        def __init__(self) -> None:
+            self.browse_calls: list[str] = []
+            self.gallery_calls: list[str] = []
+
+        async def browse(self, **kwargs: object) -> dict:
+            url = str(kwargs["url"])
+            self.browse_calls.append(url)
+            pages = {
+                ROOT: ([GALLERY_A, GALLERY_B], None),
+                ALTERNATE_ROOT: ([GALLERY_A, GALLERY_C], ALTERNATE_PAGE_2),
+                ALTERNATE_PAGE_2: ([GALLERY_B, GALLERY_D], None),
+            }
+            galleries, next_url = pages[url]
+            return {
+                "items": [
+                    {
+                        "url": gallery_url,
+                        "title": gallery_url.rstrip("/").rsplit("/", 1)[-1],
+                        "thumbnail_remote_url": (
+                            f"https://cdni.pornpics.com/t/{index}.png"
+                        ),
+                    }
+                    for index, gallery_url in enumerate(galleries)
+                ],
+                "next_url": next_url,
+            }
+
+        async def gallery(self, url: str) -> dict:
+            self.gallery_calls.append(url)
+            return await super().gallery(url)
+
+    scraper = CumulativeScraper()
+    service = FinderService(
+        config,
+        database,
+        scraper,
+        EventBroker(),
+        encoder=FakeEncoder(),
+        media_fetcher=fake_media,
+    )
+    await service.start()
+    scan = service.create_scan(
+        example_directory="pose",
+        pose_tag_id=tag_id,
+        source_url=ROOT,
+        page_limit=10,
+        minimum_score=0,
+    )
+    await asyncio.wait_for(service.queue.join(), 30)
+    exhausted = service.get_scan(scan["id"])
+    assert exhausted is not None
+    assert exhausted["status"] == "completed"
+    assert exhausted["pages_completed"] == 1
+    assert exhausted["page_limit"] == 10
+    assert exhausted["has_next_page"] is False
+    assert exhausted["continuable"] is True
+
+    initial_results, initial_total = service.results(
+        scan["id"], review="all", min_score=0, limit=20, offset=0
+    )
+    assert initial_total == 2
+    alpha = next(item for item in initial_results if item["gallery_url"] == GALLERY_A)
+    service.set_review(scan["id"], alpha["id"], "accepted")
+    accepted_id = alpha["id"]
+    with database.connect() as connection:
+        connection.execute(
+            """INSERT INTO finder_scan_feedback(
+                   scan_id, decision, gallery_key, source_key,
+                   pose_model_key, pose_json
+               ) VALUES (?, 'accepted', ?, 'snapshot-source',
+                         'snapshot-model', '{}')""",
+            (scan["id"], gallery_key(GALLERY_A)),
+        )
+        connection.execute(
+            """UPDATE finder_scans SET feedback_revision = 23 WHERE id = ?""",
+            (scan["id"],),
+        )
+    before = service.get_scan(scan["id"])
+    assert before is not None
+    with database.connect() as connection:
+        references_before = [
+            tuple(row)
+            for row in connection.execute(
+                """SELECT example_key, mirror_index, embedding, metadata_json
+                   FROM finder_scan_references
+                   WHERE scan_id = ? ORDER BY example_key, mirror_index""",
+                (scan["id"],),
+            ).fetchall()
+        ]
+        feedback_before = [
+            tuple(row)
+            for row in connection.execute(
+                """SELECT decision, gallery_key, source_key,
+                          pose_model_key, pose_json
+                   FROM finder_scan_feedback
+                   WHERE scan_id = ?
+                   ORDER BY decision, gallery_key, source_key""",
+                (scan["id"],),
+            ).fetchall()
+        ]
+    assert feedback_before
+
+    # Simulate a process stopping after the durable continuation update but
+    # before its local queue can run. A new service must recover the queued row.
+    await service.stop()
+    continued = service.continue_from(
+        scan["id"],
+        source_url=ALTERNATE_ROOT,
+        additional_pages=2,
+    )
+    assert continued["id"] == scan["id"]
+    assert continued["status"] == "queued"
+    assert continued["source_url"] == ALTERNATE_ROOT
+    assert continued["next_url"] == ALTERNATE_ROOT
+    assert continued["pages_completed"] == 1
+    assert continued["page_limit"] == 3
+    assert continued["reference_count"] == before["reference_count"]
+    assert continued["feedback_revision"] == before["feedback_revision"]
+    assert continued["accepted_count"] == 1
+    assert continued["continuable"] is False
+
+    restarted = FinderService(
+        config,
+        database,
+        scraper,
+        EventBroker(),
+        encoder=FakeEncoder(),
+        media_fetcher=fake_media,
+    )
+    await restarted.start()
+    try:
+        await asyncio.wait_for(restarted.queue.join(), 30)
+        completed = restarted.get_scan(scan["id"])
+        assert completed is not None
+        assert completed["status"] == "completed"
+        assert completed["source_url"] == ALTERNATE_ROOT
+        assert completed["pages_completed"] == 3
+        assert completed["page_limit"] == 3
+        assert completed["processed_galleries"] == 4
+        assert completed["accepted_count"] == 1
+        assert completed["reference_count"] == before["reference_count"]
+        assert completed["feedback_revision"] == before["feedback_revision"]
+        assert scraper.browse_calls == [ROOT, ALTERNATE_ROOT, ALTERNATE_PAGE_2]
+        assert scraper.gallery_calls.count(GALLERY_A) == 1
+        assert scraper.gallery_calls.count(GALLERY_B) == 1
+        assert scraper.gallery_calls.count(GALLERY_C) == 1
+        assert scraper.gallery_calls.count(GALLERY_D) == 1
+
+        results, total = restarted.results(
+            scan["id"], review="all", min_score=0, limit=20, offset=0
+        )
+        assert total == 4
+        accepted = next(item for item in results if item["gallery_url"] == GALLERY_A)
+        assert accepted["id"] == accepted_id
+        assert accepted["review"] == "accepted"
+        with database.connect() as connection:
+            references_after = [
+                tuple(row)
+                for row in connection.execute(
+                    """SELECT example_key, mirror_index, embedding, metadata_json
+                       FROM finder_scan_references
+                       WHERE scan_id = ? ORDER BY example_key, mirror_index""",
+                    (scan["id"],),
+                ).fetchall()
+            ]
+            feedback_after = [
+                tuple(row)
+                for row in connection.execute(
+                    """SELECT decision, gallery_key, source_key,
+                              pose_model_key, pose_json
+                       FROM finder_scan_feedback
+                       WHERE scan_id = ?
+                       ORDER BY decision, gallery_key, source_key""",
+                    (scan["id"],),
+                ).fetchall()
+            ]
+        assert references_after == references_before
+        assert feedback_after == feedback_before
+    finally:
+        await restarted.stop()
+
+
+def test_finder_continue_rejects_unsafe_states_and_page_allowances(
+    tmp_path: Path,
+) -> None:
+    config, database, tag_id = configured(tmp_path)
+    service = FinderService(
+        config,
+        database,
+        FakeScraper(),
+        EventBroker(),
+        encoder=FakeEncoder(),
+        media_fetcher=fake_media,
+    )
+    service.ensure_schema()
+    scan = service.create_scan(
+        example_directory="pose",
+        pose_tag_id=tag_id,
+        source_url=ROOT,
+        page_limit=1,
+        minimum_score=0,
+    )
+
+    for invalid in (False, 0, 51):
+        with pytest.raises(ValueError, match="between"):
+            service.continue_from(
+                scan["id"],
+                source_url=ALTERNATE_ROOT,
+                additional_pages=invalid,
+            )
+    with pytest.raises(ValueError, match="restricted"):
+        service.continue_from(
+            scan["id"],
+            source_url="https://example.com/not-allowed",
+            additional_pages=1,
+        )
+    with pytest.raises(finder_module.FinderNotFound):
+        service.continue_from(
+            "missing",
+            source_url=ALTERNATE_ROOT,
+            additional_pages=1,
+        )
+    with pytest.raises(finder_module.FinderConflict, match="completed"):
+        service.continue_from(
+            scan["id"],
+            source_url=ALTERNATE_ROOT,
+            additional_pages=1,
+        )
+
+    with database.connect() as connection:
+        connection.execute(
+            """UPDATE finder_scans
+               SET status = 'completed', next_url = ?, pages_completed = 1,
+                   page_limit = 1, cancel_requested = 0, pause_requested = 0
+               WHERE id = ?""",
+            (PAGE_2, scan["id"]),
+        )
+    with pytest.raises(finder_module.FinderConflict, match="Extend"):
+        service.continue_from(
+            scan["id"],
+            source_url=ALTERNATE_ROOT,
+            additional_pages=1,
+        )
+
+    with database.connect() as connection:
+        connection.execute(
+            """UPDATE finder_scans
+               SET status = 'completed', next_url = NULL,
+                   pages_completed = ?, page_limit = ? WHERE id = ?""",
+            (finder_module.MAX_SCAN_PAGES, finder_module.MAX_SCAN_PAGES, scan["id"]),
+        )
+    capped = service.get_scan(scan["id"])
+    assert capped is not None
+    assert capped["continuable"] is False
+    with pytest.raises(ValueError, match="at most 500"):
+        service.continue_from(
+            scan["id"],
+            source_url=ALTERNATE_ROOT,
+            additional_pages=1,
+        )
+
+    for status, cancel_requested, ranking_version, message in (
+        ("failed", 0, finder_module.CURRENT_RANKING_VERSION, "failed"),
+        ("canceled", 1, finder_module.CURRENT_RANKING_VERSION, "canceled"),
+        ("completed", 0, finder_module.LEGACY_RANKING_VERSION, "legacy-ranked"),
+    ):
+        with database.connect() as connection:
+            connection.execute(
+                """UPDATE finder_scans
+                   SET status = ?, next_url = NULL, pages_completed = 1,
+                       page_limit = 1, cancel_requested = ?,
+                       pause_requested = 0, ranking_version = ?
+                   WHERE id = ?""",
+                (status, cancel_requested, ranking_version, scan["id"]),
+            )
+        with pytest.raises(finder_module.FinderConflict, match=message):
+            service.continue_from(
+                scan["id"],
+                source_url=ALTERNATE_ROOT,
+                additional_pages=1,
+            )
+
+    with database.connect() as connection:
+        connection.execute(
+            """UPDATE finder_scans
+               SET status = 'completed', next_url = NULL, pages_completed = 1,
+                   page_limit = 10, cancel_requested = 0, pause_requested = 0,
+                   ranking_version = ?
+               WHERE id = ?""",
+            (finder_module.CURRENT_RANKING_VERSION, scan["id"]),
+        )
+    first = service.continue_from(
+        scan["id"],
+        source_url=ALTERNATE_ROOT,
+        additional_pages=1,
+    )
+    assert first["status"] == "queued"
+    with pytest.raises(finder_module.FinderConflict, match="completed"):
+        service.continue_from(
+            scan["id"],
+            source_url=ALTERNATE_ROOT,
+            additional_pages=1,
+        )
+
+
 def test_finder_extend_rejects_canceled_invalid_and_over_limit(
     tmp_path: Path,
 ) -> None:
@@ -2160,6 +2476,14 @@ async def test_finder_api_signs_best_preview(tmp_path: Path, monkeypatch) -> Non
                        WHERE id = ?""",
                     (PAGE_2, scan_id),
                 )
+            nonexhausted_continuation = await client.post(
+                f"/api/finder/scans/{scan_id}/continue",
+                json={
+                    "source_url": ALTERNATE_ROOT,
+                    "additional_pages": 1,
+                },
+            )
+            assert nonexhausted_continuation.status_code == 409
             accepted_extension = await client.post(
                 f"/api/finder/scans/{scan_id}/extend",
                 json={"additional_pages": 1},
@@ -2176,6 +2500,39 @@ async def test_finder_api_signs_best_preview(tmp_path: Path, monkeypatch) -> Non
                 json={"additional_pages": 1},
             )
             assert exhausted.status_code == 409
+
+            for invalid in (True, "2", 1.5, 0, 51, None):
+                invalid_continuation = await client.post(
+                    f"/api/finder/scans/{scan_id}/continue",
+                    json={
+                        "source_url": ALTERNATE_ROOT,
+                        "additional_pages": invalid,
+                    },
+                )
+                assert invalid_continuation.status_code == 422
+            unsafe_continuation = await client.post(
+                f"/api/finder/scans/{scan_id}/continue",
+                json={
+                    "source_url": "https://example.com/not-allowed",
+                    "additional_pages": 1,
+                },
+            )
+            assert unsafe_continuation.status_code == 400
+            accepted_continuation = await client.post(
+                f"/api/finder/scans/{scan_id}/continue",
+                json={
+                    "source_url": ALTERNATE_ROOT,
+                    "additional_pages": 2,
+                },
+            )
+            assert accepted_continuation.status_code == 202
+            continued_scan = accepted_continuation.json()["scan"]
+            assert continued_scan["id"] == scan_id
+            assert continued_scan["source_url"] == ALTERNATE_ROOT
+            assert continued_scan["status"] == "queued"
+            assert continued_scan["pages_completed"] == 2
+            assert continued_scan["page_limit"] == 4
+            await asyncio.wait_for(app.state.finder.queue.join(), 30)
 
             with app.state.db.connect() as connection:
                 connection.execute(
@@ -2210,6 +2567,14 @@ async def test_finder_api_signs_best_preview(tmp_path: Path, monkeypatch) -> Non
                 json={"additional_pages": 1},
             )
             assert missing_extension.status_code == 404
+            missing_continuation = await client.post(
+                "/api/finder/scans/missing/continue",
+                json={
+                    "source_url": ALTERNATE_ROOT,
+                    "additional_pages": 1,
+                },
+            )
+            assert missing_continuation.status_code == 404
             result_response = await client.get(
                 f"/api/finder/scans/{scan_id}/results",
                 params={"review": "all", "min_score": 0},

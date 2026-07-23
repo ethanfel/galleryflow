@@ -1491,6 +1491,14 @@ class FinderService:
                 "completed_with_errors",
             }
         )
+        scan["continuable"] = bool(
+            scan["ranking_current"]
+            and not scan["has_next_page"]
+            and int(scan["pages_completed"]) < MAX_SCAN_PAGES
+            and not scan["cancel_requested"]
+            and not scan["pause_requested"]
+            and scan["status"] in {"completed", "completed_with_errors"}
+        )
         if scan["status"] in {"completed", "completed_with_errors"}:
             scan["progress"] = 100.0
         else:
@@ -1784,6 +1792,93 @@ class FinderService:
 
         if enqueue:
             self.queue.put_nowait(scan_id)
+        scan = self.get_scan(scan_id) or {}
+        self._publish(scan, force=True)
+        return scan
+
+    def continue_from(
+        self,
+        scan_id: str,
+        *,
+        source_url: str,
+        additional_pages: int,
+    ) -> dict[str, Any]:
+        """Continue an exhausted scan from a new durable source cursor.
+
+        The cumulative result set and its review/reference/feedback snapshots
+        remain in place. A fresh allowance is measured from pages already
+        completed because an exhausted source may have ended well before its
+        previous page limit.
+        """
+
+        if (
+            isinstance(additional_pages, bool)
+            or not isinstance(additional_pages, int)
+            or not 1 <= additional_pages <= MAX_EXTEND_PAGES
+        ):
+            raise ValueError(
+                f"Additional pages must be between 1 and {MAX_EXTEND_PAGES}"
+            )
+        source_url = validate_source_url(source_url)
+        if not self._available:
+            raise FinderUnavailable(
+                self._prepare_error or "Finder vision support is unavailable"
+            )
+
+        with self._lock, self.database.connect() as db:
+            row = db.execute(
+                """SELECT status, pages_completed, next_url,
+                          cancel_requested, pause_requested, ranking_version
+                   FROM finder_scans WHERE id = ?""",
+                (scan_id,),
+            ).fetchone()
+            if not row:
+                raise FinderNotFound("Finder scan not found")
+            if row["ranking_version"] != CURRENT_RANKING_VERSION:
+                raise FinderConflict(
+                    "A legacy-ranked Finder scan cannot continue; start a new scan"
+                )
+
+            status = str(row["status"])
+            if bool(row["cancel_requested"]) or status in {"canceling", "canceled"}:
+                raise FinderConflict("A canceled Finder scan cannot be continued")
+            if status == "failed":
+                raise FinderConflict("A failed Finder scan cannot be continued")
+            if status not in {"completed", "completed_with_errors"}:
+                raise FinderConflict(
+                    "Only a completed, source-exhausted Finder scan can "
+                    "continue from a new source"
+                )
+            if bool(row["pause_requested"]):
+                raise FinderConflict(
+                    "A paused Finder scan must finish before changing source"
+                )
+            if row["next_url"]:
+                raise FinderConflict(
+                    "This Finder scan still has source pages; use Extend instead"
+                )
+
+            pages_completed = int(row["pages_completed"])
+            new_limit = pages_completed + additional_pages
+            if new_limit > MAX_SCAN_PAGES:
+                raise ValueError(
+                    f"A Finder scan may contain at most {MAX_SCAN_PAGES} pages"
+                )
+
+            now = utc_now()
+            db.execute(
+                """UPDATE finder_scans
+                   SET source_url = ?, next_url = ?, page_limit = ?,
+                       status = 'queued', cancel_requested = 0,
+                       pause_requested = 0, error = '', finished_at = NULL,
+                       updated_at = ?
+                   WHERE id = ?""",
+                (source_url, source_url, new_limit, now, scan_id),
+            )
+
+        # Queued state is durable. If the process stops before this in-memory
+        # enqueue is observed, start() will recover it from _queued_scan_ids().
+        self.queue.put_nowait(scan_id)
         scan = self.get_scan(scan_id) or {}
         self._publish(scan, force=True)
         return scan
@@ -2561,6 +2656,8 @@ class FinderService:
             "ranking_version",
             "ranking_current",
             "extendable",
+            "continuable",
+            "source_url",
             "progress",
             "error",
             "updated_at",

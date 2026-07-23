@@ -82,6 +82,11 @@ class FinderScanExtend(BaseModel):
     additional_pages: int = Field(ge=1, le=50, strict=True)
 
 
+class FinderScanContinue(BaseModel):
+    source_url: str = Field(min_length=1, max_length=2_000)
+    additional_pages: int = Field(ge=1, le=50, strict=True)
+
+
 class FinderReviewPatch(BaseModel):
     review: Literal["pending", "maybe", "accepted", "rejected"]
     feedback_image_urls: (

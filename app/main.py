@@ -24,6 +24,7 @@ from .finder import (
 from .models import (
     DownloadCreate,
     FinderReviewPatch,
+    FinderScanContinue,
     FinderScanCreate,
     FinderScanExtend,
     GalleryPatch,
@@ -566,6 +567,16 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
         return {
             "scan": finder.extend(
                 scan_id,
+                additional_pages=payload.additional_pages,
+            )
+        }
+
+    @app.post("/api/finder/scans/{scan_id}/continue", status_code=202)
+    async def continue_finder_scan(scan_id: str, payload: FinderScanContinue) -> dict:
+        return {
+            "scan": finder.continue_from(
+                scan_id,
+                source_url=payload.source_url,
                 additional_pages=payload.additional_pages,
             )
         }

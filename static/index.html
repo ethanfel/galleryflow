@@ -277,9 +277,16 @@
                 <label class="finder-extend-pages"><span>More pages</span><input id="finder-extend-pages" type="number" min="1" max="50" step="1" value="5" inputmode="numeric" aria-label="Additional pages to scan" aria-describedby="finder-extend-summary"></label>
                 <button class="button button-primary finder-extend-button" id="finder-extend-button" type="button" aria-describedby="finder-extend-summary"><svg><use href="#i-arrow"></use></svg><span>Extend search</span></button>
               </div>
+              <div class="finder-continuation finder-new-source" id="finder-continue" hidden>
+                <span class="finder-extend-icon" aria-hidden="true"><svg><use href="#i-link"></use></svg></span>
+                <span class="finder-extend-copy"><strong>Explore another source</strong><span id="finder-continue-summary">Keep every candidate and review in this scan</span></span>
+                <label class="finder-new-source-url"><span>New Source URL</span><input id="finder-continue-source" type="url" inputmode="url" spellcheck="false" autocomplete="off" placeholder="https://www.pornpics.com/category/another-source/" aria-describedby="finder-continue-summary"></label>
+                <label class="finder-extend-pages"><span>Pages</span><input id="finder-continue-pages" type="number" min="1" max="50" step="1" value="5" inputmode="numeric" aria-label="Pages to scan from the new source" aria-describedby="finder-continue-summary"></label>
+                <button class="button button-primary finder-extend-button" id="finder-continue-button" type="button" aria-describedby="finder-continue-summary"><svg><use href="#i-arrow"></use></svg><span>Continue same scan</span></button>
+              </div>
               <div class="finder-limit-note" id="finder-limit-note" role="status" hidden>
                 <svg aria-hidden="true"><use href="#i-info"></use></svg>
-                <span><strong>500-page limit reached</strong><span>This scan cannot be extended further.</span></span>
+                <span><strong>500-page limit reached</strong><span>This scan cannot be extended or continued from another source.</span></span>
               </div>
             </div>
 

@@ -63,6 +63,8 @@
     jobEventTimer: null,
     finderEventTimer: null,
     finderPollTimer: null,
+    finderScanRequest: 0,
+    finderScanMutationEpoch: 0,
     healthTimer: null,
     requestController: null,
     galleryObserver: null,
@@ -91,6 +93,7 @@
     finderLoading: false,
     finderBusy: false,
     finderExtendPages: 5,
+    finderContinuePages: 5,
     sortFolders: [],
     sortProfiles: [],
     sortSession: null,
@@ -2313,6 +2316,7 @@
       sourceUrl: String(scan.source_url || config.source_url || scan.url || ''),
       nextUrl,
       hasNextPage,
+      continuable: optionalBoolean(scan.continuable),
       rankingVersion,
       rankingCurrent,
       corpusProgressAvailable,
@@ -2633,8 +2637,18 @@
     return ['completed', 'completed_with_errors', 'complete', 'done', 'paused', 'running', 'scanning', 'active'].includes(scan.status);
   }
 
+  function finderScanCanContinue(scan = state.finderScan) {
+    if (!scan?.id || !scan.rankingCurrent) return false;
+    if (scan.continuable !== null && scan.continuable !== undefined) return scan.continuable;
+    return finderScanSourceExhausted(scan) && Number(scan.pagesScanned || 0) < FINDER_MAX_PAGES;
+  }
+
   function finderScanAtPageCap(scan = state.finderScan) {
-    if (!scan?.id || !scan.rankingCurrent || !scan.hasNextPage || Number(scan.pages || 0) < FINDER_MAX_PAGES) return false;
+    if (!scan?.id || !scan.rankingCurrent) return false;
+    const pagesAtCap = finderScanSourceExhausted(scan)
+      ? Number(scan.pagesScanned || 0) >= FINDER_MAX_PAGES
+      : scan.hasNextPage && Number(scan.pages || 0) >= FINDER_MAX_PAGES;
+    if (!pagesAtCap) return false;
     return ['completed', 'completed_with_errors', 'complete', 'done', 'paused', 'running', 'scanning', 'active'].includes(scan.status);
   }
 
@@ -3146,6 +3160,28 @@
     return additionalPages;
   }
 
+  function updateFinderContinueSummary({ commit = false } = {}) {
+    const input = $('#finder-continue-pages');
+    const parsed = Number.parseInt(input.value, 10);
+    const completedPages = Math.max(0, Number(state.finderScan?.pagesScanned || 0));
+    const maximumAdditional = Math.max(1, Math.min(50, FINDER_MAX_PAGES - completedPages));
+    const additionalPages = Math.max(1, Math.min(
+      maximumAdditional,
+      Number.isFinite(parsed) ? parsed : state.finderContinuePages || 5
+    ));
+    state.finderContinuePages = additionalPages;
+    input.max = String(maximumAdditional);
+    if (commit) input.value = String(additionalPages);
+    const candidateCount = Math.max(
+      Number(state.finderReviewCounts?.total || 0),
+      Number(state.finderScan?.candidateCount || 0)
+    );
+    const candidateCopy = `${formatNumber(candidateCount)} ${candidateCount === 1 ? 'candidate' : 'candidates'}`;
+    const capCopy = maximumAdditional < 50 ? ` · ${formatNumber(FINDER_MAX_PAGES)} maximum` : '';
+    $('#finder-continue-summary').textContent = `Up to ${formatNumber(additionalPages)} new ${additionalPages === 1 ? 'page' : 'pages'} · keep ${candidateCopy} and all reviews${capCopy}`;
+    return additionalPages;
+  }
+
   function renderFinderWorkspace() {
     renderFinderFolders();
     renderFinderTags();
@@ -3167,15 +3203,23 @@
     $('#finder-ranking-note').hidden = !legacyRanking;
     ['finder-pause', 'finder-resume', 'finder-cancel'].forEach(id => { $(`#${id}`).disabled = state.finderBusy; });
     const canExtend = finderScanCanExtend(scan);
+    const canContinue = finderScanCanContinue(scan);
     const atPageCap = finderScanAtPageCap(scan);
     const finderReady = Boolean(state.finderStatus?.ready);
+    const finderMutationPending = state.finderFeedbackBusy || finderFeedbackIsSaving();
     $('#finder-extend').hidden = !canExtend;
+    $('#finder-continue').hidden = !canContinue;
     $('#finder-limit-note').hidden = !atPageCap;
     $('#finder-extend').classList.toggle('is-unavailable', canExtend && !finderReady);
+    $('#finder-continue').classList.toggle('is-unavailable', canContinue && !finderReady);
     $('#finder-extend-pages').disabled = !canExtend || !finderReady || state.finderBusy;
     $('#finder-extend-button').disabled = !canExtend || !finderReady || state.finderBusy;
+    $('#finder-continue-source').disabled = !canContinue || !finderReady || state.finderBusy || finderMutationPending;
+    $('#finder-continue-pages').disabled = !canContinue || !finderReady || state.finderBusy || finderMutationPending;
+    $('#finder-continue-button').disabled = !canContinue || !finderReady || state.finderBusy || finderMutationPending;
     const unavailableTitle = finderReady ? '' : state.finderStatus?.detail || 'Finder is unavailable';
     $('#finder-extend-button').title = unavailableTitle;
+    $('#finder-continue-button').title = unavailableTitle;
     if (!hasScan) {
       $('#finder-session-label').textContent = 'Configure a scan to begin';
       $('#finder-source-progress-copy').textContent = 'Exploring the selected Source URL for new galleries';
@@ -3206,6 +3250,10 @@
     if (canExtend) {
       updateFinderExtendSummary({ commit: true });
       if (!finderReady) $('#finder-extend-summary').textContent += ' · Finder unavailable';
+    }
+    if (canContinue) {
+      updateFinderContinueSummary({ commit: true });
+      if (!finderReady) $('#finder-continue-summary').textContent += ' · Finder unavailable';
     }
     const status = scan.status.replaceAll('_', ' ');
     const sourceExhausted = finderScanSourceExhausted(scan);
@@ -3278,6 +3326,22 @@
     }
     $('#finder-pages').value = String(pageLimit);
     return { exampleDirectory, tagLabel, sourceUrl, pageLimit, minimumScore };
+  }
+
+  function readFinderContinueConfig({ validate = false } = {}) {
+    const sourceInput = $('#finder-continue-source').value.trim();
+    const sourceUrl = /^https?:\/\//i.test(sourceInput) ? safeUrl(sourceInput) : '';
+    const additionalPages = updateFinderContinueSummary({ commit: true });
+    if (validate && !sourceUrl) {
+      toast('Enter another source URL', 'Use a complete http or https gallery, category, model, search, or home URL.', 'info');
+      $('#finder-continue-source').focus();
+      return null;
+    }
+    if (validate && !state.finderStatus?.ready) {
+      toast('Finder model is not ready', state.finderStatus?.detail || 'Refresh after the model becomes available.', 'info');
+      return null;
+    }
+    return { sourceUrl, additionalPages };
   }
 
   async function ensureFinderPoseTag(label) {
@@ -3531,8 +3595,15 @@
     }
   }
 
+  function invalidateFinderScanLoads() {
+    state.finderScanMutationEpoch += 1;
+    state.finderScanRequest += 1;
+  }
+
   async function loadFinderScan({ quiet = false, applyConfig = false } = {}) {
     const scanId = state.finderScanId;
+    const mutationEpoch = state.finderScanMutationEpoch;
+    const request = ++state.finderScanRequest;
     if (!scanId) {
       state.finderScan = null;
       state.finderResults = [];
@@ -3542,7 +3613,11 @@
     }
     try {
       const data = await api(`/api/finder/scans/${encodeURIComponent(scanId)}`);
-      if (String(scanId) !== String(state.finderScanId)) return;
+      if (
+        String(scanId) !== String(state.finderScanId)
+        || mutationEpoch !== state.finderScanMutationEpoch
+        || request !== state.finderScanRequest
+      ) return;
       const scan = normalizeFinderScan(data?.scan || data);
       if (!scan?.id) throw new ApiError('The server returned an invalid Finder scan.');
       state.finderScan = scan;
@@ -3669,6 +3744,7 @@
     const additionalPages = updateFinderExtendSummary({ commit: true });
     const previousLimit = Math.max(0, Number(scan.pages || 0), Number(scan.pagesScanned || 0));
     const button = $('#finder-extend-button');
+    invalidateFinderScanLoads();
     state.finderBusy = true;
     $('#finder-extend-pages').disabled = true;
     setButtonBusy(button, true, 'Extending…');
@@ -3692,6 +3768,63 @@
     } catch (error) {
       toast('Could not extend Finder search', errorMessage(error), 'error');
     } finally {
+      invalidateFinderScanLoads();
+      state.finderBusy = false;
+      setButtonBusy(button, false);
+      renderFinderWorkspace();
+      scheduleFinderPoll(300);
+    }
+  }
+
+  async function continueFinderScan() {
+    const scan = state.finderScan;
+    if (
+      !finderScanCanContinue(scan)
+      || state.finderBusy
+      || state.finderFeedbackBusy
+      || finderFeedbackIsSaving()
+    ) return;
+    const config = readFinderContinueConfig({ validate: true });
+    if (!config) return;
+    const button = $('#finder-continue-button');
+    invalidateFinderScanLoads();
+    state.finderBusy = true;
+    $('#finder-continue-source').disabled = true;
+    $('#finder-continue-pages').disabled = true;
+    setButtonBusy(button, true, 'Continuing…');
+    try {
+      const data = await api(`/api/finder/scans/${encodeURIComponent(scan.id)}/continue`, {
+        method: 'POST',
+        body: {
+          source_url: config.sourceUrl,
+          additional_pages: config.additionalPages
+        }
+      });
+      const updated = normalizeFinderScan(data?.scan || data);
+      if (!updated?.id || String(updated.id) !== String(scan.id)) {
+        throw new ApiError('The server did not return the continued Finder scan.');
+      }
+      state.finderScan = updated;
+      const existing = state.finderScans.findIndex(item => String(item.id) === String(updated.id));
+      if (existing >= 0) state.finderScans[existing] = updated;
+      else state.finderScans.unshift(updated);
+      $('#finder-source').value = updated.sourceUrl || config.sourceUrl;
+      $('#finder-continue-source').value = '';
+      const candidateCount = Math.max(
+        Number(state.finderReviewCounts?.total || 0),
+        Number(updated.candidateCount || 0)
+      );
+      const keptCopy = `${formatNumber(candidateCount)} ${candidateCount === 1 ? 'candidate' : 'candidates'} and all reviews remain in this scan.`;
+      toast(
+        'Exploring another source',
+        `Scanning up to ${config.additionalPages} new ${config.additionalPages === 1 ? 'page' : 'pages'} from ${displayHost(config.sourceUrl)}. ${keptCopy}`,
+        'success'
+      );
+      announce(`Finder scan continued from another source for up to ${config.additionalPages} pages.`);
+    } catch (error) {
+      toast('Could not continue Finder search', errorMessage(error), 'error');
+    } finally {
+      invalidateFinderScanLoads();
       state.finderBusy = false;
       setButtonBusy(button, false);
       renderFinderWorkspace();
@@ -3702,6 +3835,7 @@
   async function performFinderScanAction(action, button) {
     const scan = state.finderScan;
     if (!scan?.id || state.finderBusy || !['pause', 'resume'].includes(action)) return;
+    invalidateFinderScanLoads();
     state.finderBusy = true;
     setButtonBusy(button, true, action === 'pause' ? 'Pausing…' : 'Resuming…');
     try {
@@ -3713,6 +3847,7 @@
     } catch (error) {
       toast(action === 'pause' ? 'Could not pause Finder' : 'Could not resume Finder', errorMessage(error), 'error');
     } finally {
+      invalidateFinderScanLoads();
       state.finderBusy = false;
       setButtonBusy(button, false);
       renderFinderWorkspace();
@@ -3725,6 +3860,7 @@
     if (!scan?.id || finderScanIsTerminal(scan) || state.finderBusy) return;
     if (!window.confirm('Cancel this Finder scan? Results already found will remain available.')) return;
     const button = $('#finder-cancel');
+    invalidateFinderScanLoads();
     state.finderBusy = true;
     button.disabled = true;
     try {
@@ -3735,6 +3871,7 @@
     } catch (error) {
       toast('Could not cancel Finder scan', errorMessage(error), 'error');
     } finally {
+      invalidateFinderScanLoads();
       state.finderBusy = false;
       renderFinderWorkspace();
       scheduleFinderPoll();
@@ -3976,6 +4113,9 @@
     ) {
       renderFinderScans();
       return;
+    }
+    if (String(scanId || '') !== String(state.finderScanId || '')) {
+      $('#finder-continue-source').value = '';
     }
     state.finderScanId = scanId;
     state.finderReviewCounts = null;
@@ -4561,6 +4701,15 @@
       if (event.key === 'Enter') extendFinderScan();
     });
     $('#finder-extend-button').addEventListener('click', extendFinderScan);
+    $('#finder-continue-pages').addEventListener('input', () => updateFinderContinueSummary());
+    $('#finder-continue-pages').addEventListener('change', () => updateFinderContinueSummary({ commit: true }));
+    $('#finder-continue-pages').addEventListener('keydown', event => {
+      if (event.key === 'Enter') continueFinderScan();
+    });
+    $('#finder-continue-source').addEventListener('keydown', event => {
+      if (event.key === 'Enter') continueFinderScan();
+    });
+    $('#finder-continue-button').addEventListener('click', continueFinderScan);
     $('#finder-pause').addEventListener('click', event => performFinderScanAction('pause', event.currentTarget));
     $('#finder-resume').addEventListener('click', event => performFinderScanAction('resume', event.currentTarget));
     $('#finder-cancel').addEventListener('click', cancelFinderScan);

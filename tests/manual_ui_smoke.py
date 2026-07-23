@@ -14,6 +14,7 @@ import urllib.request
 from pathlib import Path
 
 import uvicorn
+from fastapi import HTTPException
 from fastapi.responses import Response
 from PIL import Image
 
@@ -36,7 +37,9 @@ def build_visual_app(
     finder_race: bool = False,
     finder_unusable_save: bool = False,
     finder_exhausted: bool = False,
+    finder_continue: bool = False,
 ):
+    finder_source_exhausted = finder_exhausted or finder_continue
     finder_pose_mode = open_finder_pose_flow or finder_direct_assign
     finder_review_mode = (
         open_finder_feedback or finder_pose_mode or finder_unusable_save
@@ -161,9 +164,11 @@ def build_visual_app(
         "pose_tag_id": 1,
         "pose_tag_label": "mating press - backview",
         "source_url": "https://www.pornpics.com/",
-        "next_url": None if finder_exhausted else "https://www.pornpics.com/?page=6",
-        "page_limit": 5,
-        "pages_completed": 3 if finder_exhausted else 5,
+        "next_url": (
+            None if finder_source_exhausted else "https://www.pornpics.com/?page=6"
+        ),
+        "page_limit": 500 if finder_continue else 5,
+        "pages_completed": 3 if finder_source_exhausted else 5,
         "processed_galleries": 64,
         "processed_images": 1280,
         "corpus_search_complete": True,
@@ -173,9 +178,11 @@ def build_visual_app(
         "minimum_score": 0.65,
         "ranking_version": "pose-first-v1",
         "ranking_current": True,
+        "continuable": finder_source_exhausted,
         "progress_percent": 100,
     }
     finder_race_state = {"review": "pending", "results_calls": 0, "selected": []}
+    finder_continue_state = {"scan_calls": 0, "continue_calls": 0}
     if finder_race:
         finder_scan["status"] = "running"
 
@@ -247,7 +254,47 @@ def build_visual_app(
         return {"scans": [finder_scan]}
 
     async def fake_finder_scan(**kwargs: object) -> dict:
-        return finder_scan
+        finder_continue_state["scan_calls"] += 1
+        snapshot = dict(finder_scan)
+        if finder_continue and finder_continue_state["scan_calls"] == 2:
+            await asyncio.sleep(1.2)
+        return snapshot
+
+    async def fake_finder_continue(
+        scan_id: str, payload: object, **kwargs: object
+    ) -> dict:
+        finder_continue_state["continue_calls"] += 1
+        source_url = str(
+            payload.get("source_url")
+            if isinstance(payload, dict)
+            else getattr(payload, "source_url", "")
+        )
+        additional_pages = int(
+            payload.get("additional_pages", 5)
+            if isinstance(payload, dict)
+            else getattr(payload, "additional_pages", 5)
+        )
+        await asyncio.sleep(0.15)
+        if "blocked-source" in source_url:
+            raise HTTPException(
+                status_code=409,
+                detail="This visual smoke source is intentionally unavailable",
+            )
+        finder_scan.update(
+            {
+                "status": "running",
+                "source_url": source_url,
+                "next_url": source_url,
+                "page_limit": int(finder_scan["pages_completed"]) + additional_pages,
+                "continuable": False,
+                "progress_percent": (
+                    int(finder_scan["pages_completed"])
+                    / (int(finder_scan["pages_completed"]) + additional_pages)
+                    * 100
+                ),
+            }
+        )
+        return {"scan": finder_scan}
 
     async def fake_finder_results(**kwargs: object) -> dict:
         def media(name: str) -> str:
@@ -266,17 +313,19 @@ def build_visual_app(
         elif finder_unusable_save and finder_race_state["selected"]:
             first_review = finder_race_state["review"]
         else:
-            first_review = "accepted" if finder_review_mode else "pending"
+            first_review = (
+                "accepted" if finder_review_mode or finder_continue else "pending"
+            )
         first_image = (
             "https://cdni.pornpics.com/1280/manual/001.jpg"
-            if finder_review_mode
+            if finder_review_mode or finder_continue
             else "https://example.test/candidate-1.jpg"
         )
         feedback_urls = (
             list(finder_race_state["selected"])
             if finder_race or (finder_unusable_save and finder_race_state["selected"])
             else [first_image]
-            if finder_review_mode
+            if finder_review_mode or finder_continue
             else []
         )
         feedback_usable_urls = (
@@ -289,6 +338,7 @@ def build_visual_app(
             if finder_unusable_save and finder_race_state["selected"]
             else []
         )
+        second_review = "rejected" if finder_continue else "pending"
         results = [
             {
                 "id": "visual-result-1",
@@ -368,7 +418,7 @@ def build_visual_app(
                 "score": 1.0,
                 "ranking_tier": 3,
                 "online_scanned": True,
-                "review": "pending",
+                "review": second_review,
                 "feedback_image_urls": [],
                 "images_scored": 21,
                 "image_count": 21,
@@ -379,13 +429,12 @@ def build_visual_app(
                 "best_ordinal": 7,
             },
         ]
+        reviews = [first_review, second_review]
         counts = {
-            "pending": 1 if first_review != "pending" else 2,
-            "accepted": 1 if first_review == "accepted" else 0,
-            "maybe": 1 if first_review == "maybe" else 0,
-            "rejected": 1 if first_review == "rejected" else 0,
-            "total": 2,
+            review: reviews.count(review)
+            for review in ("pending", "accepted", "maybe", "rejected")
         }
+        counts["total"] = len(reviews)
         return {
             "counts": counts,
             "results": [
@@ -434,6 +483,8 @@ def build_visual_app(
             script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const modal=document.querySelector('#gallery-modal');const button=document.querySelector('[data-gallery-mode=pose]');const image=document.querySelector('.image-option:not(.skeleton-image)');if(modal?.open&&button&&image){button.click();clearInterval(poll)}},50)});"
         if open_finder:
             script += "localStorage.setItem('galleryflow:finder-scan', JSON.stringify('visual-finder'));window.addEventListener('load',()=>{const poll=setInterval(()=>{const button=document.querySelector('.finder-overlay-toggle:not([hidden])');if(button){button.click();clearInterval(poll)}},50)});"
+        if finder_continue:
+            script += """window.addEventListener('load',()=>{const failedUrl='https://www.pornpics.com/blocked-source/';const nextUrl='https://www.pornpics.com/new-category/';let phase='waiting';let successAt=0;const countsOk=()=>document.querySelector('#finder-accepted-count')?.textContent==='1'&&document.querySelector('#finder-rejected-count')?.textContent==='1';const cardOk=()=>document.querySelectorAll('#finder-result-grid .finder-card').length===1;const poll=setInterval(()=>{const form=document.querySelector('#finder-continue');const source=document.querySelector('#finder-continue-source');const pages=document.querySelector('#finder-continue-pages');const button=document.querySelector('#finder-continue-button');const toasts=[...document.querySelectorAll('.toast')].map(item=>item.textContent).join(' ');if(phase==='waiting'&&form&&!form.hidden&&source&&pages&&button&&!button.disabled&&countsOk()){document.querySelector('[data-finder-review=accepted]')?.click();pages.value='7';pages.dispatchEvent(new Event('input',{bubbles:true}));if(!document.querySelector('#finder-continue-summary')?.textContent.includes('Up to 7 new pages'))return;source.value=failedUrl;button.click();phase='failure-sent'}else if(phase==='failure-sent'&&form&&!form.hidden&&!button?.disabled&&source?.value===failedUrl&&countsOk()&&cardOk()&&toasts.includes('Could not continue Finder search')){document.documentElement.dataset.finderContinueFailure='pass';document.querySelector('#finder-refresh')?.click();setTimeout(()=>{source.value=nextUrl;button.click();successAt=Date.now();phase='success-sent'},180)}else if(phase==='success-sent'&&Date.now()-successAt>1800){const passed=form?.hidden&&document.querySelector('#finder-session-label')?.textContent.includes('running')&&document.querySelector('#finder-source')?.value===nextUrl&&document.querySelector('#finder-scan-select')?.value==='visual-finder'&&countsOk()&&cardOk();document.documentElement.dataset.finderContinue=passed?'pass':'fail';clearInterval(poll)}},50);setTimeout(()=>{if(!document.documentElement.dataset.finderContinue)document.documentElement.dataset.finderContinue='fail';if(!document.documentElement.dataset.finderContinueFailure)document.documentElement.dataset.finderContinueFailure='fail'},6500)});"""
         if finder_review_mode:
             script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const tab=document.querySelector('[data-finder-review=accepted]');if(tab&&document.querySelector('#finder-accepted-count')?.textContent==='1'){tab.click();requestAnimationFrame(()=>document.querySelector('.finder-open')?.click());clearInterval(poll)}},50)});"
         if finder_pose_mode:
@@ -495,6 +546,12 @@ def build_visual_app(
             route.dependant.call = fake_finder_scan
         elif (
             open_finder
+            and getattr(route, "path", None) == "/api/finder/scans/{scan_id}/continue"
+        ):
+            route.endpoint = fake_finder_continue
+            route.dependant.call = fake_finder_continue
+        elif (
+            open_finder
             and getattr(route, "path", None) == "/api/finder/scans/{scan_id}/results"
         ):
             route.endpoint = fake_finder_results
@@ -515,6 +572,15 @@ def build_visual_app(
             fake_finder_feedback,
             methods=["GET", "DELETE"],
         )
+    if open_finder and not any(
+        getattr(route, "path", None) == "/api/finder/scans/{scan_id}/continue"
+        for route in app.routes
+    ):
+        app.add_api_route(
+            "/api/finder/scans/{scan_id}/continue",
+            fake_finder_continue,
+            methods=["POST"],
+        )
     return app
 
 
@@ -533,6 +599,7 @@ def main() -> None:
     parser.add_argument("--finder-race", action="store_true")
     parser.add_argument("--finder-unusable-save", action="store_true")
     parser.add_argument("--finder-exhausted", action="store_true")
+    parser.add_argument("--finder-continue", action="store_true")
     args = parser.parse_args()
     finder_mode = (
         args.finder
@@ -542,9 +609,14 @@ def main() -> None:
         or args.finder_race
         or args.finder_unusable_save
         or args.finder_exhausted
+        or args.finder_continue
     )
     suffix = (
-        "finder-unusable-save"
+        "finder-continue-mobile"
+        if args.finder_continue and args.mobile
+        else "finder-continue"
+        if args.finder_continue
+        else "finder-unusable-save"
         if args.finder_unusable_save
         else "finder-direct-assign"
         if args.finder_direct_assign
@@ -612,6 +684,7 @@ def main() -> None:
                     finder_race=args.finder_race,
                     finder_unusable_save=args.finder_unusable_save,
                     finder_exhausted=args.finder_exhausted,
+                    finder_continue=args.finder_continue,
                 ),
                 host="127.0.0.1",
                 port=18101,
@@ -643,13 +716,18 @@ def main() -> None:
             "--disable-sync",
             "--force-prefers-reduced-motion",
             "--no-first-run",
-            f"--virtual-time-budget={7500 if args.finder_unusable_save else 6500 if args.finder_direct_assign else 4500 if args.finder_race else 4000 if args.finder_pose_flow else 3000 if args.lightbox or args.pose else 2000 if finder_mode else 1000}",
+            f"--virtual-time-budget={7500 if args.finder_unusable_save or args.finder_continue else 6500 if args.finder_direct_assign else 4500 if args.finder_race else 4000 if args.finder_pose_flow else 3000 if args.lightbox or args.pose else 2000 if finder_mode else 1000}",
             f"--user-data-dir={Path(directory) / 'chrome-profile'}",
             f"--window-size={viewport}",
             f"--screenshot={output}",
             f"http://127.0.0.1:18101/{'#finder' if finder_mode else '#sort' if args.sort else ''}",
         ]
-        if args.finder_race or args.finder_direct_assign or args.finder_unusable_save:
+        if (
+            args.finder_race
+            or args.finder_direct_assign
+            or args.finder_unusable_save
+            or args.finder_continue
+        ):
             command.insert(1, "--dump-dom")
         completed = subprocess.run(
             command,
@@ -659,11 +737,13 @@ def main() -> None:
                 args.finder_race
                 or args.finder_direct_assign
                 or args.finder_unusable_save
+                or args.finder_continue
             ),
             text=(
                 args.finder_race
                 or args.finder_direct_assign
                 or args.finder_unusable_save
+                or args.finder_continue
             ),
         )
         if args.finder_race and 'data-finder-race="pass"' not in completed.stdout:
@@ -680,6 +760,15 @@ def main() -> None:
             raise AssertionError(
                 "pose-unusable Finder selection was not retained as saved feedback"
             )
+        if args.finder_continue:
+            if 'data-finder-continue-failure="pass"' not in completed.stdout:
+                raise AssertionError(
+                    "failed Finder continuation did not retain its URL and results"
+                )
+            if 'data-finder-continue="pass"' not in completed.stdout:
+                raise AssertionError(
+                    "continued Finder scan lost its new source, results, or review counts"
+                )
         server.should_exit = True
         thread.join(timeout=5)
     print(output)

@@ -601,11 +601,16 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .finder-continuation { display: grid; min-height: 61px; margin-top: 12px; padding: 9px 10px; gap: 10px; align-items: center; border: 1px solid rgba(155,123,250,.2); border-radius: 11px; background: linear-gradient(100deg, rgba(155,123,250,.09), rgba(98,168,250,.035)); }
 .finder-continuation.is-unavailable { border-color: var(--border); background: rgba(255,255,255,.018); }
 .finder-extend { grid-template-columns: 34px minmax(130px, 1fr) auto auto; }
+.finder-new-source { grid-template-columns: 34px minmax(135px, .7fr) minmax(210px, 1.3fr) auto auto; }
 .finder-extend-icon { display: grid; width: 34px; height: 34px; place-items: center; border-radius: 9px; background: rgba(155,123,250,.13); color: #c8baff; }
 .finder-extend-icon svg { width: 15px; height: 15px; }
 .finder-extend-copy { display: flex; min-width: 0; flex-direction: column; }
 .finder-extend-copy strong { color: var(--text-soft); font-size: 10px; font-weight: 680; }
 .finder-extend-copy span { margin-top: 1px; color: var(--muted); font-size: 8px; font-variant-numeric: tabular-nums; }
+.finder-new-source-url { display: flex; min-width: 0; flex-direction: column; gap: 3px; color: var(--muted); font-size: 8px; }
+.finder-new-source-url input { width: 100%; min-width: 0; height: 34px; padding: 0 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); color: var(--text-soft); font-size: 9px; }
+.finder-new-source-url input:hover { border-color: var(--border-strong); }
+.finder-new-source-url input:focus { border-color: rgba(155,123,250,.5); }
 .finder-extend-pages { display: flex; gap: 7px; align-items: center; color: var(--muted); font-size: 8px; white-space: nowrap; }
 .finder-extend-pages input { width: 58px; height: 34px; padding: 0 6px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); color: var(--text-soft); font-size: 10px; font-variant-numeric: tabular-nums; text-align: center; }
 .finder-extend-pages input:hover { border-color: var(--border-strong); }
@@ -1099,6 +1104,10 @@ kbd { min-width: 30px; padding: 4px 8px; border: 1px solid var(--border-strong);
   .finder-session-actions .button { width: 38px; padding: 0; }
   .finder-session-actions .button span { display: none; }
   .finder-extend { grid-template-columns: 34px minmax(0, 1fr) auto; }
+  .finder-new-source { grid-template-columns: 34px minmax(0, 1fr) auto; }
+  .finder-new-source-url { grid-row: 2; grid-column: 1 / 4; }
+  .finder-new-source .finder-extend-pages { grid-row: 3; grid-column: 1 / 3; }
+  .finder-new-source .finder-extend-button { grid-row: 3; grid-column: 3; }
   .finder-extend-pages { grid-row: 2; grid-column: 1 / 3; }
   .finder-extend-button { grid-row: 2; grid-column: 3; }
   .finder-progress-copy { gap: 8px; align-items: flex-start; }
