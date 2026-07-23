@@ -189,6 +189,19 @@
             <datalist id="finder-folder-options"></datalist>
             <label class="field"><span>Pose tag</span><small>Existing tags are reused; a new tag is created when the scan starts.</small><input id="finder-pose-tag" type="text" list="finder-pose-tag-options" maxlength="80" placeholder="e.g. standing profile" autocomplete="off"></label>
             <datalist id="finder-pose-tag-options"></datalist>
+            <section class="finder-feedback-card" id="finder-feedback-card" aria-labelledby="finder-feedback-title" aria-live="polite">
+              <header class="finder-feedback-head">
+                <span class="finder-feedback-icon" aria-hidden="true"><svg><use href="#i-spark"></use></svg></span>
+                <span><small>Pose-specific refinement</small><strong id="finder-feedback-title">Select an existing pose</strong></span>
+                <i class="finder-feedback-state" id="finder-feedback-state">Waiting</i>
+              </header>
+              <div class="finder-feedback-body">
+                <span class="finder-feedback-count is-accepted"><i></i><strong id="finder-feedback-accepted">—</strong><small>accepted samples</small></span>
+                <span class="finder-feedback-count is-rejected"><i></i><strong id="finder-feedback-rejected">—</strong><small>rejected samples</small></span>
+                <button class="finder-feedback-reset" id="finder-feedback-reset" type="button" disabled><svg><use href="#i-refresh"></use></svg><span>Reset feedback</span></button>
+              </div>
+              <p id="finder-feedback-copy">Checked suggestions become pose feedback; unchecked suggestions are excluded. Reviews adjust future ranking only—the vision models are not retrained.</p>
+            </section>
             <label class="field"><span>Source URL <button class="field-inline-action" id="finder-use-current" type="button">Use current</button></span><small>A gallery, category, model, search page, or the site home page.</small><input id="finder-source" type="url" inputmode="url" spellcheck="false" placeholder="https://www.pornpics.com/"></label>
 
             <div class="finder-config-row">
@@ -606,7 +619,8 @@
       <div class="finder-match-gallery" aria-label="Top matching images"></div>
       <div class="finder-card-copy">
         <button class="finder-card-title finder-card-open" type="button"></button>
-        <p></p>
+        <p class="finder-card-meta"></p>
+        <small class="finder-feedback-selection-copy"></small>
         <div class="finder-diagnostic-toolbar" hidden>
           <div class="finder-score-breakdown" aria-label="Match score breakdown"></div>
           <span class="finder-person-count" hidden><svg><use href="#i-layers"></use></svg><b></b></span>

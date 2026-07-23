@@ -37,10 +37,16 @@ LEGACY_RANKING_VERSION = "appearance-v1"
 CURRENT_RANKING_VERSION = "pose-first-v1"
 CORPUS_BACKFILL_VERSION = "top-matches-v1"
 CORPUS_SCAN_GUARD_VERSION = "pre-corpus-scans-v1"
+FEEDBACK_BACKFILL_VERSION = "curated-top-matches-v1"
 POSE_MATCH_FLOOR = 0.55
 EXACT_HASH_MAX_DISTANCE = 8
 MAX_SCAN_PAGES = 500
 MAX_EXTEND_PAGES = 50
+MIN_FEEDBACK_GALLERIES_PER_STATE = 2
+MAX_FEEDBACK_GALLERIES_PER_STATE = 8
+MAX_FEEDBACK_SAMPLES_PER_STATE = 8
+MAX_FEEDBACK_DECISIONS_PER_POSE = 256
+MAX_FEEDBACK_ADJUSTMENT = 0.08
 
 try:
     from .vision import perceptual_hash_bytes as _perceptual_hash_bytes
@@ -75,6 +81,22 @@ MediaFetcher = Callable[[str, str], Awaitable[bytes]]
 class _ImageDescriptor:
     appearance: np.ndarray
     metadata: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _FeedbackProfile:
+    revision: int
+    accepted: tuple[tuple[str, Any], ...] = ()
+    rejected: tuple[tuple[str, Any], ...] = ()
+
+    @property
+    def active(self) -> bool:
+        accepted_galleries = len({gallery for gallery, _ in self.accepted})
+        rejected_galleries = len({gallery for gallery, _ in self.rejected})
+        return (
+            accepted_galleries >= MIN_FEEDBACK_GALLERIES_PER_STATE
+            or rejected_galleries >= MIN_FEEDBACK_GALLERIES_PER_STATE
+        )
 
 
 class FinderService:
@@ -152,6 +174,7 @@ class FinderService:
                     corpus_search_complete INTEGER NOT NULL DEFAULT 0,
                     corpus_images_scored INTEGER NOT NULL DEFAULT 0,
                     corpus_galleries_scored INTEGER NOT NULL DEFAULT 0,
+                    feedback_revision INTEGER NOT NULL DEFAULT 0,
                     cancel_requested INTEGER NOT NULL DEFAULT 0,
                     pause_requested INTEGER NOT NULL DEFAULT 0,
                     error TEXT NOT NULL DEFAULT '',
@@ -234,6 +257,47 @@ class FinderService:
                     value TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS finder_feedback_decisions (
+                    origin_result_id TEXT PRIMARY KEY,
+                    pose_tag_id INTEGER NOT NULL,
+                    gallery_key TEXT NOT NULL,
+                    decision TEXT NOT NULL
+                        CHECK (decision IN ('accepted', 'rejected')),
+                    ranking_version TEXT NOT NULL DEFAULT 'pose-first-v1',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS finder_feedback_samples (
+                    origin_result_id TEXT NOT NULL,
+                    source_key TEXT NOT NULL,
+                    image_url TEXT NOT NULL,
+                    preview_remote_url TEXT NOT NULL,
+                    pose_model_key TEXT NOT NULL DEFAULT '',
+                    pose_json TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (origin_result_id, source_key),
+                    FOREIGN KEY (origin_result_id)
+                        REFERENCES finder_feedback_decisions(origin_result_id)
+                        ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS finder_feedback_meta (
+                    pose_tag_id INTEGER PRIMARY KEY,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS finder_scan_feedback (
+                    scan_id TEXT NOT NULL,
+                    decision TEXT NOT NULL
+                        CHECK (decision IN ('accepted', 'rejected')),
+                    gallery_key TEXT NOT NULL,
+                    source_key TEXT NOT NULL,
+                    pose_model_key TEXT NOT NULL DEFAULT '',
+                    pose_json TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (scan_id, decision, gallery_key, source_key),
+                    FOREIGN KEY (scan_id) REFERENCES finder_scans(id)
+                        ON DELETE CASCADE
+                );
                 CREATE INDEX IF NOT EXISTS idx_finder_scans_updated
                     ON finder_scans(updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_finder_results_score
@@ -252,6 +316,18 @@ class FinderService:
                     );
                 CREATE INDEX IF NOT EXISTS idx_finder_corpus_galleries_state
                     ON finder_corpus_galleries(state, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_finder_feedback_decisions_pose
+                    ON finder_feedback_decisions(
+                        pose_tag_id, decision, updated_at DESC
+                    );
+                CREATE INDEX IF NOT EXISTS idx_finder_feedback_decisions_gallery
+                    ON finder_feedback_decisions(
+                        pose_tag_id, gallery_key, updated_at DESC
+                    );
+                CREATE INDEX IF NOT EXISTS idx_finder_feedback_samples_source
+                    ON finder_feedback_samples(source_key);
+                CREATE INDEX IF NOT EXISTS idx_finder_scan_feedback_scan
+                    ON finder_scan_feedback(scan_id, decision, gallery_key);
                 """
             )
             migrations = {
@@ -261,6 +337,7 @@ class FinderService:
                     "corpus_search_complete": "INTEGER NOT NULL DEFAULT 0",
                     "corpus_images_scored": "INTEGER NOT NULL DEFAULT 0",
                     "corpus_galleries_scored": "INTEGER NOT NULL DEFAULT 0",
+                    "feedback_revision": "INTEGER NOT NULL DEFAULT 0",
                 },
                 "finder_scan_references": {
                     "metadata_json": "TEXT NOT NULL DEFAULT '{}'",
@@ -335,6 +412,23 @@ class FinderService:
                            value = excluded.value,
                            updated_at = excluded.updated_at""",
                     (CORPUS_BACKFILL_VERSION, utc_now()),
+                )
+            feedback_backfill = db.execute(
+                """SELECT value FROM finder_corpus_meta
+                   WHERE key = 'feedback-backfill'"""
+            ).fetchone()
+            if (
+                not feedback_backfill
+                or feedback_backfill["value"] != FEEDBACK_BACKFILL_VERSION
+            ):
+                self._backfill_feedback(db)
+                db.execute(
+                    """INSERT INTO finder_corpus_meta(key, value, updated_at)
+                       VALUES ('feedback-backfill', ?, ?)
+                       ON CONFLICT(key) DO UPDATE SET
+                           value = excluded.value,
+                           updated_at = excluded.updated_at""",
+                    (FEEDBACK_BACKFILL_VERSION, utc_now()),
                 )
             db.execute(
                 """UPDATE finder_scans
@@ -515,6 +609,144 @@ class FinderService:
                 for source_key, (image_url, preview, ordinal) in recovered.items()
             ],
         )
+
+    @classmethod
+    def _feedback_matches(
+        cls,
+        row: Any,
+        *,
+        ranking_version: str,
+    ) -> list[dict[str, Any]]:
+        try:
+            decoded = json.loads(str(row["matches_json"] or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decoded = []
+        matches = cls._normalized_top_matches(
+            decoded if isinstance(decoded, list) else [],
+            ranking_version=ranking_version,
+        )
+        if not matches and row["best_image_url"] and row["best_preview_remote_url"]:
+            matches = cls._normalized_top_matches(
+                [
+                    {
+                        "image_url": row["best_image_url"],
+                        "preview_remote_url": row["best_preview_remote_url"],
+                        "ordinal": row["best_ordinal"] or 0,
+                        "score": row["score"] or 0,
+                        "ranking_tier": row["ranking_tier"],
+                        "appearance_score": row["score"] or 0,
+                    }
+                ],
+                ranking_version=ranking_version,
+            )
+        return matches
+
+    def _feedback_pose_snapshot(
+        self,
+        db: Any,
+        *,
+        model_key: str,
+        preview_remote_url: str,
+    ) -> tuple[str, str, str]:
+        """Return source key, pose model key and a validated pose snapshot."""
+
+        source_key = self._remote_source_key(preview_remote_url)
+        row = db.execute(
+            """SELECT metadata_json FROM finder_embedding_cache
+               WHERE model_key = ? AND source_key = ? AND include_mirror = 0
+               ORDER BY last_used_at DESC LIMIT 1""",
+            (model_key, source_key),
+        ).fetchone()
+        if not row:
+            return source_key, "", ""
+        metadata = self._decode_metadata(row["metadata_json"])
+        pose = metadata.get("pose")
+        if not isinstance(pose, dict) or self._metadata_pose(metadata) is None:
+            return source_key, "", ""
+        pose_model_key = str(pose.get("model_key") or "")
+        return (
+            source_key,
+            pose_model_key[:500],
+            json.dumps(pose, separators=(",", ":"), sort_keys=True),
+        )
+
+    def _backfill_feedback(self, db: Any) -> None:
+        """Preserve pre-upgrade accepted/rejected reviews as weak evidence."""
+
+        rows = db.execute(
+            """SELECT r.*, s.pose_tag_id, s.reference_model_key,
+                      s.ranking_version
+               FROM finder_results r
+               JOIN finder_scans s ON s.id = r.scan_id
+               WHERE r.review IN ('accepted', 'rejected')
+               ORDER BY r.updated_at, r.id"""
+        ).fetchall()
+        touched_pose_tags: set[int] = set()
+        for row in rows:
+            pose_tag_id = int(row["pose_tag_id"])
+            now = str(row["updated_at"] or utc_now())
+            created_at = str(row["created_at"] or now)
+            db.execute(
+                """INSERT INTO finder_feedback_decisions(
+                       origin_result_id, pose_tag_id, gallery_key, decision,
+                       ranking_version, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(origin_result_id) DO NOTHING""",
+                (
+                    row["id"],
+                    pose_tag_id,
+                    row["gallery_key"],
+                    row["review"],
+                    str(row["ranking_version"] or CURRENT_RANKING_VERSION),
+                    created_at,
+                    now,
+                ),
+            )
+            matches = self._feedback_matches(
+                row,
+                ranking_version=str(row["ranking_version"] or LEGACY_RANKING_VERSION),
+            )
+            for match in matches:
+                try:
+                    source_key, pose_model_key, pose_json = (
+                        self._feedback_pose_snapshot(
+                            db,
+                            model_key=str(row["reference_model_key"] or ""),
+                            preview_remote_url=str(match["preview_remote_url"]),
+                        )
+                    )
+                except (TypeError, ValueError):
+                    continue
+                db.execute(
+                    """INSERT INTO finder_feedback_samples(
+                           origin_result_id, source_key, image_url,
+                           preview_remote_url, pose_model_key, pose_json,
+                           created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(origin_result_id, source_key) DO NOTHING""",
+                    (
+                        row["id"],
+                        source_key,
+                        match["image_url"],
+                        match["preview_remote_url"],
+                        pose_model_key,
+                        pose_json,
+                        created_at,
+                        now,
+                    ),
+                )
+            touched_pose_tags.add(pose_tag_id)
+        for pose_tag_id in touched_pose_tags:
+            db.execute(
+                """INSERT INTO finder_feedback_meta(
+                       pose_tag_id, revision, updated_at
+                   ) VALUES (?, 1, ?)
+                   ON CONFLICT(pose_tag_id) DO UPDATE SET
+                       revision = MAX(finder_feedback_meta.revision, 1),
+                       updated_at = excluded.updated_at""",
+                (pose_tag_id, utc_now()),
+            )
+            self._prune_feedback_decisions(db, pose_tag_id)
 
     async def start(self) -> None:
         self._stopping = False
@@ -728,6 +960,289 @@ class FinderService:
             "max_cache_entries": int(self.config.finder_cache_max_entries),
             "max_cache_bytes": int(self.config.finder_cache_max_bytes),
         }
+
+    @staticmethod
+    def _prune_feedback_decisions(db: Any, pose_tag_id: int) -> None:
+        stale = db.execute(
+            """SELECT origin_result_id FROM finder_feedback_decisions
+               WHERE pose_tag_id = ?
+               ORDER BY updated_at DESC, origin_result_id DESC
+               LIMIT -1 OFFSET ?""",
+            (pose_tag_id, MAX_FEEDBACK_DECISIONS_PER_POSE),
+        ).fetchall()
+        if stale:
+            db.executemany(
+                """DELETE FROM finder_feedback_decisions
+                   WHERE origin_result_id = ?""",
+                [(str(row["origin_result_id"]),) for row in stale],
+            )
+
+    @staticmethod
+    def _feedback_revision(db: Any, pose_tag_id: int) -> int:
+        row = db.execute(
+            """SELECT revision FROM finder_feedback_meta
+               WHERE pose_tag_id = ?""",
+            (pose_tag_id,),
+        ).fetchone()
+        return max(0, int(row["revision"])) if row else 0
+
+    @staticmethod
+    def _increment_feedback_revision(db: Any, pose_tag_id: int, now: str) -> int:
+        db.execute(
+            """INSERT INTO finder_feedback_meta(
+                   pose_tag_id, revision, updated_at
+               ) VALUES (?, 1, ?)
+               ON CONFLICT(pose_tag_id) DO UPDATE SET
+                   revision = finder_feedback_meta.revision + 1,
+                   updated_at = excluded.updated_at""",
+            (pose_tag_id, now),
+        )
+        return FinderService._feedback_revision(db, pose_tag_id)
+
+    @staticmethod
+    def _effective_feedback_decisions(
+        db: Any,
+        pose_tag_id: int,
+    ) -> list[dict[str, Any]]:
+        """Return the newest persisted decision for each gallery."""
+
+        decision_rows = db.execute(
+            """SELECT * FROM finder_feedback_decisions
+               WHERE pose_tag_id = ?
+               ORDER BY updated_at DESC, origin_result_id DESC""",
+            (pose_tag_id,),
+        ).fetchall()
+        selected: list[dict[str, Any]] = []
+        seen_galleries: set[str] = set()
+        for row in decision_rows:
+            gallery = str(row["gallery_key"])
+            if gallery in seen_galleries:
+                continue
+            seen_galleries.add(gallery)
+            selected.append({**dict(row), "samples": []})
+        if not selected:
+            return []
+        by_result = {
+            str(decision["origin_result_id"]): decision for decision in selected
+        }
+        placeholders = ",".join("?" for _ in by_result)
+        sample_rows = db.execute(
+            f"""SELECT * FROM finder_feedback_samples
+                WHERE origin_result_id IN ({placeholders})
+                ORDER BY origin_result_id, source_key""",
+            list(by_result),
+        ).fetchall()
+        for row in sample_rows:
+            by_result[str(row["origin_result_id"])]["samples"].append(dict(row))
+        return selected
+
+    def _feedback_pose(self, sample: dict[str, Any]) -> Any | None:
+        if self.pose_estimator is None:
+            return None
+        raw = str(sample.get("pose_json") or "")
+        if not raw:
+            return None
+        try:
+            pose_value = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        frame = self._metadata_pose({"pose": pose_value})
+        if frame is None or frame.person_count < 1:
+            return None
+        expected_model_key = str(getattr(self.pose_estimator, "model_key", "") or "")
+        sample_model_key = str(sample.get("pose_model_key") or frame.model_key or "")
+        if expected_model_key and sample_model_key != expected_model_key:
+            return None
+        try:
+            from .pose_vision import pose_geometry_match
+
+            if not pose_geometry_match(frame, frame, allow_mirror=False).reliable:
+                return None
+        except (ImportError, TypeError, ValueError):
+            return None
+        return frame
+
+    def _usable_feedback_samples(
+        self,
+        decisions: list[dict[str, Any]],
+    ) -> list[tuple[str, str, dict[str, Any], Any]]:
+        """Apply the exact dedupe/caps used by every future scan snapshot."""
+
+        candidates: list[tuple[str, str, dict[str, Any], Any]] = []
+        seen_sources: set[str] = set()
+        for decision in decisions:
+            state = str(decision["decision"])
+            gallery = str(decision["gallery_key"])
+            for sample in decision["samples"]:
+                source_key = str(sample["source_key"])
+                if source_key in seen_sources:
+                    continue
+                # Reserve the source before validation: a newer explicit label
+                # must not allow an older conflicting label to resurface merely
+                # because its pose snapshot is stale or outside the cap.
+                seen_sources.add(source_key)
+                frame = self._feedback_pose(sample)
+                if frame is None:
+                    continue
+                candidates.append((state, gallery, sample, frame))
+        selected: list[tuple[str, str, dict[str, Any], Any]] = []
+        for state in ("accepted", "rejected"):
+            state_candidates = [item for item in candidates if item[0] == state]
+            selected_ids: set[int] = set()
+            galleries: set[str] = set()
+            # First pass maximizes gallery diversity, so one gallery with all
+            # three selected suggestions cannot crowd out other pose modes.
+            for index, item in enumerate(state_candidates):
+                gallery = item[1]
+                if gallery in galleries:
+                    continue
+                if len(galleries) >= MAX_FEEDBACK_GALLERIES_PER_STATE:
+                    break
+                selected.append(item)
+                selected_ids.add(index)
+                galleries.add(gallery)
+                if len(selected_ids) >= MAX_FEEDBACK_SAMPLES_PER_STATE:
+                    break
+            # Then use additional curated images only when the diverse pass did
+            # not fill the small runtime budget.
+            if len(selected_ids) < MAX_FEEDBACK_SAMPLES_PER_STATE:
+                for index, item in enumerate(state_candidates):
+                    if index in selected_ids:
+                        continue
+                    selected.append(item)
+                    selected_ids.add(index)
+                    if len(selected_ids) >= MAX_FEEDBACK_SAMPLES_PER_STATE:
+                        break
+        return selected
+
+    def feedback_status(self, pose_tag_id: int) -> dict[str, Any]:
+        if not self.database.get_pose_tag(pose_tag_id):
+            raise FinderNotFound("Pose tag not found")
+        with self._lock, self.database.connect() as db:
+            revision = self._feedback_revision(db, pose_tag_id)
+            decisions = self._effective_feedback_decisions(db, pose_tag_id)
+        accepted = [
+            decision for decision in decisions if decision["decision"] == "accepted"
+        ]
+        rejected = [
+            decision for decision in decisions if decision["decision"] == "rejected"
+        ]
+        accepted_samples = [
+            sample for decision in accepted for sample in decision["samples"]
+        ]
+        rejected_samples = [
+            sample for decision in rejected for sample in decision["samples"]
+        ]
+        usable = self._usable_feedback_samples(decisions)
+        usable_counts = {
+            state: sum(item[0] == state for item in usable)
+            for state in ("accepted", "rejected")
+        }
+        usable_galleries = {
+            state: {item[1] for item in usable if item[0] == state}
+            for state in ("accepted", "rejected")
+        }
+        active = (
+            len(usable_galleries["accepted"]) >= MIN_FEEDBACK_GALLERIES_PER_STATE
+            or len(usable_galleries["rejected"]) >= MIN_FEEDBACK_GALLERIES_PER_STATE
+        )
+        return {
+            "pose_tag_id": pose_tag_id,
+            "revision": revision,
+            "accepted_galleries": len(accepted),
+            "rejected_galleries": len(rejected),
+            "accepted_samples": len(accepted_samples),
+            "rejected_samples": len(rejected_samples),
+            "usable_accepted_samples": usable_counts["accepted"],
+            "usable_rejected_samples": usable_counts["rejected"],
+            "usable_accepted_galleries": len(usable_galleries["accepted"]),
+            "usable_rejected_galleries": len(usable_galleries["rejected"]),
+            "active": active,
+            "min_galleries_per_state": MIN_FEEDBACK_GALLERIES_PER_STATE,
+            "max_galleries_per_state": MAX_FEEDBACK_GALLERIES_PER_STATE,
+            "max_samples_per_state": MAX_FEEDBACK_SAMPLES_PER_STATE,
+            "max_adjustment": MAX_FEEDBACK_ADJUSTMENT,
+            "applies_to": "future_scans",
+        }
+
+    def reset_feedback(self, pose_tag_id: int) -> dict[str, Any]:
+        if not self.database.get_pose_tag(pose_tag_id):
+            raise FinderNotFound("Pose tag not found")
+        now = utc_now()
+        with self._lock, self.database.connect() as db:
+            deleted = db.execute(
+                """DELETE FROM finder_feedback_decisions
+                   WHERE pose_tag_id = ?""",
+                (pose_tag_id,),
+            )
+            if deleted.rowcount:
+                self._increment_feedback_revision(db, pose_tag_id, now)
+        return self.feedback_status(pose_tag_id)
+
+    def _snapshot_feedback_for_scan(
+        self,
+        db: Any,
+        scan_id: str,
+        pose_tag_id: int,
+    ) -> None:
+        revision = self._feedback_revision(db, pose_tag_id)
+        decisions = self._effective_feedback_decisions(db, pose_tag_id)
+        usable = self._usable_feedback_samples(decisions)
+        rows: list[tuple[Any, ...]] = []
+        for state, gallery, sample, _ in usable:
+            rows.append(
+                (
+                    scan_id,
+                    state,
+                    gallery,
+                    str(sample["source_key"]),
+                    str(sample.get("pose_model_key") or ""),
+                    str(sample.get("pose_json") or ""),
+                )
+            )
+        if rows:
+            db.executemany(
+                """INSERT INTO finder_scan_feedback(
+                       scan_id, decision, gallery_key, source_key,
+                       pose_model_key, pose_json
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                rows,
+            )
+        db.execute(
+            """UPDATE finder_scans SET feedback_revision = ?
+               WHERE id = ?""",
+            (revision, scan_id),
+        )
+
+    def _load_feedback_profile(self, scan_id: str) -> _FeedbackProfile:
+        with self._lock, self.database.connect() as db:
+            scan = db.execute(
+                """SELECT feedback_revision FROM finder_scans WHERE id = ?""",
+                (scan_id,),
+            ).fetchone()
+            rows = db.execute(
+                """SELECT decision, gallery_key, pose_model_key, pose_json
+                   FROM finder_scan_feedback
+                   WHERE scan_id = ?
+                   ORDER BY decision, gallery_key, source_key""",
+                (scan_id,),
+            ).fetchall()
+        accepted: list[tuple[str, Any]] = []
+        rejected: list[tuple[str, Any]] = []
+        for row in rows:
+            frame = self._feedback_pose(dict(row))
+            if frame is None:
+                continue
+            item = (str(row["gallery_key"]), frame)
+            if row["decision"] == "accepted":
+                accepted.append(item)
+            else:
+                rejected.append(item)
+        return _FeedbackProfile(
+            revision=max(0, int(scan["feedback_revision"])) if scan else 0,
+            accepted=tuple(accepted),
+            rejected=tuple(rejected),
+        )
 
     @staticmethod
     def _directory_flags() -> int:
@@ -1067,6 +1582,7 @@ class FinderService:
                     now,
                 ),
             )
+            self._snapshot_feedback_for_scan(db, scan_id, int(tag["id"]))
         self.queue.put_nowait(scan_id)
         scan = self.get_scan(scan_id) or {}
         self._publish(scan, force=True)
@@ -1281,6 +1797,9 @@ class FinderService:
                 continue
             try:
                 score = float(item.get("score", 0))
+                base_score = float(item.get("base_score", score))
+                feedback_adjustment = float(item.get("feedback_adjustment", 0))
+                feedback_revision = max(0, int(item.get("feedback_revision", 0)))
                 appearance = float(item.get("appearance_score", score))
                 exact = float(item.get("exact_score", 0))
                 ordinal = int(item.get("ordinal"))
@@ -1296,7 +1815,7 @@ class FinderService:
                 )
             except (TypeError, ValueError):
                 continue
-            numeric_scores = (score, appearance, exact)
+            numeric_scores = (score, base_score, feedback_adjustment, appearance, exact)
             if pose is not None:
                 numeric_scores = (*numeric_scores, pose)
             if not all(np.isfinite(value) for value in numeric_scores):
@@ -1337,6 +1856,13 @@ class FinderService:
                 "preview_remote_url": preview,
                 "ordinal": ordinal,
                 "score": max(0.0, min(1.0, score)),
+                "base_score": max(0.0, min(1.0, base_score)),
+                "feedback_adjustment": max(
+                    -MAX_FEEDBACK_ADJUSTMENT,
+                    min(MAX_FEEDBACK_ADJUSTMENT, feedback_adjustment),
+                ),
+                "feedback_revision": feedback_revision,
+                "feedback_applied": abs(feedback_adjustment) > 1e-9,
                 "ranking_tier": ranking_tier,
                 "appearance_score": max(0.0, min(1.0, appearance)),
                 "exact_score": max(0.0, min(1.0, exact)),
@@ -1437,7 +1963,29 @@ class FinderService:
                 ranking_version=ranking_version,
             )
         item["top_matches"] = matches
+        item["feedback_image_urls"] = []
         return item
+
+    def _feedback_image_urls_for_results(
+        self, result_ids: list[str]
+    ) -> dict[str, list[str]]:
+        if not result_ids:
+            return {}
+        placeholders = ",".join("?" for _ in result_ids)
+        with self._lock, self.database.connect() as db:
+            rows = db.execute(
+                f"""SELECT origin_result_id, image_url
+                    FROM finder_feedback_samples
+                    WHERE origin_result_id IN ({placeholders})
+                    ORDER BY origin_result_id, created_at, source_key""",
+                result_ids,
+            ).fetchall()
+        selected: dict[str, list[str]] = {}
+        for row in rows:
+            selected.setdefault(str(row["origin_result_id"]), []).append(
+                str(row["image_url"])
+            )
+        return selected
 
     def results(
         self,
@@ -1483,32 +2031,165 @@ class FinderService:
             )
             for row in rows
         ]
+        selected_urls = self._feedback_image_urls_for_results(
+            [str(item["id"]) for item in items]
+        )
         for item in items:
             item["above_threshold"] = item["score"] >= scan["minimum_score"]
+            item["feedback_image_urls"] = selected_urls.get(str(item["id"]), [])
         return items, total
 
-    def set_review(self, scan_id: str, result_id: str, review: str) -> dict[str, Any]:
+    def set_review(
+        self,
+        scan_id: str,
+        result_id: str,
+        review: str,
+        feedback_image_urls: list[str] | None = None,
+    ) -> dict[str, Any]:
         if review not in REVIEW_STATES:
             raise ValueError("Invalid Finder review state")
-        if not self.get_scan(scan_id):
+        if feedback_image_urls is not None and len(feedback_image_urls) > 3:
+            raise ValueError("At most three proposed images can train Finder feedback")
+        scan = self.get_scan(scan_id)
+        if not scan:
             raise FinderNotFound("Finder scan not found")
+        selected_urls: list[str] = []
         with self._lock, self.database.connect() as db:
-            updated = db.execute(
+            row = db.execute(
+                """SELECT r.*, s.pose_tag_id, s.reference_model_key,
+                          s.ranking_version
+                   FROM finder_results r
+                   JOIN finder_scans s ON s.id = r.scan_id
+                   WHERE r.id = ? AND r.scan_id = ?""",
+                (result_id, scan_id),
+            ).fetchone()
+            if not row:
+                raise FinderNotFound("Finder result not found")
+            matches = self._feedback_matches(
+                row,
+                ranking_version=str(row["ranking_version"] or LEGACY_RANKING_VERSION),
+            )
+            available = {str(match["image_url"]): match for match in matches}
+            if review != "pending":
+                requested = (
+                    list(available)
+                    if feedback_image_urls is None
+                    else list(dict.fromkeys(feedback_image_urls))
+                )
+                unknown = [url for url in requested if url not in available]
+                if unknown:
+                    raise ValueError(
+                        "Feedback images must be selected from this result's "
+                        "proposed matches"
+                    )
+                selected_urls = [url for url in available if url in set(requested)]
+                if review == "accepted" and not selected_urls:
+                    raise ValueError(
+                        "Accepting a gallery requires at least one selected image"
+                    )
+            selected: list[tuple[dict[str, Any], str, str, str]] = []
+            for image_url in selected_urls:
+                match = available[image_url]
+                try:
+                    source_key, pose_model_key, pose_json = (
+                        self._feedback_pose_snapshot(
+                            db,
+                            model_key=str(row["reference_model_key"] or ""),
+                            preview_remote_url=str(match["preview_remote_url"]),
+                        )
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "A selected feedback image has an invalid preview URL"
+                    ) from exc
+                selected.append((match, source_key, pose_model_key, pose_json))
+
+            previous_decision = db.execute(
+                """SELECT decision FROM finder_feedback_decisions
+                   WHERE origin_result_id = ?""",
+                (result_id,),
+            ).fetchone()
+            previous_samples = {
+                str(item["source_key"]): (
+                    str(item["pose_model_key"] or ""),
+                    str(item["pose_json"] or ""),
+                )
+                for item in db.execute(
+                    """SELECT source_key, pose_model_key, pose_json
+                       FROM finder_feedback_samples
+                       WHERE origin_result_id = ?""",
+                    (result_id,),
+                ).fetchall()
+            }
+            next_samples = {
+                source_key: (pose_model_key, pose_json)
+                for _, source_key, pose_model_key, pose_json in selected
+            }
+            next_feedback_state = (
+                review if review != "pending" and next_samples else "pending"
+            )
+            feedback_changed = (
+                str(previous_decision["decision"]) if previous_decision else "pending"
+            ) != next_feedback_state or previous_samples != next_samples
+            now = utc_now()
+            db.execute(
                 """UPDATE finder_results SET review = ?, updated_at = ?
                    WHERE id = ? AND scan_id = ?""",
-                (review, utc_now(), result_id, scan_id),
+                (review, now, result_id, scan_id),
             )
-            if not updated.rowcount:
-                raise FinderNotFound("Finder result not found")
+            if feedback_changed:
+                db.execute(
+                    """DELETE FROM finder_feedback_decisions
+                       WHERE origin_result_id = ?""",
+                    (result_id,),
+                )
+                if next_feedback_state != "pending":
+                    db.execute(
+                        """INSERT INTO finder_feedback_decisions(
+                               origin_result_id, pose_tag_id, gallery_key,
+                               decision, ranking_version, created_at, updated_at
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            result_id,
+                            int(row["pose_tag_id"]),
+                            str(row["gallery_key"]),
+                            next_feedback_state,
+                            str(row["ranking_version"] or CURRENT_RANKING_VERSION),
+                            now,
+                            now,
+                        ),
+                    )
+                    db.executemany(
+                        """INSERT INTO finder_feedback_samples(
+                               origin_result_id, source_key, image_url,
+                               preview_remote_url, pose_model_key, pose_json,
+                               created_at, updated_at
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        [
+                            (
+                                result_id,
+                                source_key,
+                                match["image_url"],
+                                match["preview_remote_url"],
+                                pose_model_key,
+                                pose_json,
+                                now,
+                                now,
+                            )
+                            for match, source_key, pose_model_key, pose_json in selected
+                        ],
+                    )
+                self._increment_feedback_revision(db, int(row["pose_tag_id"]), now)
+                self._prune_feedback_decisions(db, int(row["pose_tag_id"]))
             row = db.execute(
                 "SELECT * FROM finder_results WHERE id = ?", (result_id,)
             ).fetchone()
-        scan = self.get_scan(scan_id) or {}
         item = self._decode_result(
             row,
             ranking_version=str(scan.get("ranking_version") or LEGACY_RANKING_VERSION),
         )
         item["above_threshold"] = item["score"] >= scan.get("minimum_score", 0)
+        item["feedback_image_urls"] = selected_urls
         return item
 
     def _publish(self, scan: dict[str, Any], *, force: bool = False) -> None:
@@ -1694,6 +2375,16 @@ class FinderService:
     ) -> bool:
         key = self._cache_key(source_key, include_mirror)
         now = utc_now()
+        pose_json = ""
+        pose_model_key = ""
+        pose_value = (metadata or {}).get("pose")
+        if (
+            not include_mirror
+            and isinstance(pose_value, dict)
+            and self._metadata_pose({"pose": pose_value}) is not None
+        ):
+            pose_json = json.dumps(pose_value, separators=(",", ":"), sort_keys=True)
+            pose_model_key = str(pose_value.get("model_key") or "")[:500]
         with self._lock, self.database.connect() as db:
             db.execute(
                 """INSERT INTO finder_embedding_cache(
@@ -1720,6 +2411,39 @@ class FinderService:
                     now,
                 ),
             )
+            if pose_json:
+                affected = db.execute(
+                    """SELECT DISTINCT d.pose_tag_id
+                       FROM finder_feedback_samples f
+                       JOIN finder_feedback_decisions d
+                         ON d.origin_result_id = f.origin_result_id
+                       WHERE f.source_key = ?
+                         AND (
+                             f.pose_json != ? OR f.pose_model_key != ?
+                         )""",
+                    (source_key, pose_json, pose_model_key),
+                ).fetchall()
+                if affected:
+                    db.execute(
+                        """UPDATE finder_feedback_samples
+                           SET pose_json = ?, pose_model_key = ?, updated_at = ?
+                           WHERE source_key = ?
+                             AND (
+                                 pose_json != ? OR pose_model_key != ?
+                             )""",
+                        (
+                            pose_json,
+                            pose_model_key,
+                            now,
+                            source_key,
+                            pose_json,
+                            pose_model_key,
+                        ),
+                    )
+                    for row in affected:
+                        self._increment_feedback_revision(
+                            db, int(row["pose_tag_id"]), now
+                        )
             self._cache_writes_since_prune += 1
             prune_due = self._cache_writes_since_prune >= 500
             if prune_due:
@@ -2261,6 +2985,106 @@ class FinderService:
             return tier, normalized_pose
         return 1, appearance
 
+    @staticmethod
+    def _feedback_pose_affinity(
+        candidate: Any,
+        exemplars: tuple[tuple[str, Any], ...],
+    ) -> tuple[float | None, int]:
+        """Return a gallery-balanced affinity to curated pose exemplars."""
+
+        if not exemplars:
+            return None, 0
+        try:
+            from .pose_vision import pose_geometry_match
+        except ImportError:
+            return None, 0
+        by_gallery: dict[str, float] = {}
+        for gallery, reference in exemplars:
+            if getattr(reference, "scene_kind", "") != getattr(
+                candidate, "scene_kind", ""
+            ):
+                continue
+            try:
+                match = pose_geometry_match(reference, candidate, allow_mirror=True)
+            except (ValueError, TypeError):
+                continue
+            if not match.reliable or not np.isfinite(float(match.score)):
+                continue
+            by_gallery[gallery] = max(
+                by_gallery.get(gallery, 0.0),
+                max(0.0, min(1.0, float(match.score))),
+            )
+            strongest = sorted(by_gallery.values(), reverse=True)[:3]
+            if len(strongest) == 3 and min(strongest) >= 0.97:
+                break
+        if not by_gallery:
+            return None, 0
+        strongest = sorted(by_gallery.values(), reverse=True)[:3]
+        return float(sum(strongest) / len(strongest)), len(by_gallery)
+
+    @classmethod
+    def _feedback_adjusted_score(
+        cls,
+        *,
+        ranking_tier: int,
+        base_score: float,
+        pose: dict[str, Any],
+        candidate_metadata: dict[str, Any],
+        feedback: _FeedbackProfile,
+    ) -> tuple[float, float]:
+        """Gently rerank reliable pose lanes without changing their authority."""
+
+        base = max(0.0, min(1.0, float(base_score)))
+        if ranking_tier != 2 or not pose.get("pose_reliable") or not feedback.active:
+            return base, 0.0
+        candidate = cls._metadata_pose(candidate_metadata)
+        if candidate is None:
+            return base, 0.0
+        positive, positive_galleries = cls._feedback_pose_affinity(
+            candidate, feedback.accepted
+        )
+        negative, negative_galleries = cls._feedback_pose_affinity(
+            candidate, feedback.rejected
+        )
+        positive_active = (
+            positive is not None
+            and positive_galleries >= MIN_FEEDBACK_GALLERIES_PER_STATE
+        )
+        negative_active = (
+            negative is not None
+            and negative_galleries >= MIN_FEEDBACK_GALLERIES_PER_STATE
+        )
+        adjustment = 0.0
+        comparison = base
+        if positive_active and positive is not None:
+            confidence = min(
+                1.0,
+                positive_galleries / 6.0,
+            )
+            adjustment += 0.05 * confidence * max(0.0, float(positive) - base)
+            comparison = max(comparison, float(positive))
+        if negative_active and negative is not None:
+            confidence = min(
+                1.0,
+                negative_galleries / 6.0,
+            )
+            adjustment -= (
+                MAX_FEEDBACK_ADJUSTMENT
+                * confidence
+                * max(0.0, float(negative) - comparison)
+            )
+        adjustment = max(
+            -MAX_FEEDBACK_ADJUSTMENT,
+            min(MAX_FEEDBACK_ADJUSTMENT, adjustment),
+        )
+        adjusted = base + adjustment
+        if ranking_tier == 2:
+            adjusted = max(POSE_MATCH_FLOOR, min(1.0, adjusted))
+        else:
+            adjusted = max(0.0, min(POSE_MATCH_FLOOR - 1e-6, adjusted))
+        applied = adjusted - base
+        return adjusted, applied
+
     def _claim_scan(self, scan_id: str) -> bool:
         with self._lock, self.database.connect() as db:
             result = db.execute(
@@ -2741,6 +3565,7 @@ class FinderService:
         reference_hashes: tuple[int, ...],
         reference_poses: tuple[Any, ...],
         ranking_version: str,
+        feedback: _FeedbackProfile,
     ) -> dict[tuple[str, str], dict[str, Any]]:
         dimensions = int(references.shape[1])
         decoded: list[tuple[Any, _ImageDescriptor]] = []
@@ -2776,11 +3601,22 @@ class FinderService:
                 pose,
                 ranking_version=ranking_version,
             )
+            base_score = score
+            score, feedback_adjustment = self._feedback_adjusted_score(
+                ranking_tier=ranking_tier,
+                base_score=base_score,
+                pose=pose,
+                candidate_metadata=metadata,
+                feedback=feedback,
+            )
             scored_by_source[(str(row["gallery_key"]), str(row["source_key"]))] = {
                 "image_url": str(row["image_url"]),
                 "preview_remote_url": str(row["preview_remote_url"]),
                 "ordinal": int(row["ordinal"]),
                 "score": score,
+                "base_score": base_score,
+                "feedback_adjustment": feedback_adjustment,
+                "feedback_revision": feedback.revision,
                 "ranking_tier": ranking_tier,
                 "appearance_score": appearance_score,
                 "exact_score": exact_score,
@@ -2806,6 +3642,7 @@ class FinderService:
         references: np.ndarray,
         reference_hashes: tuple[int, ...],
         reference_poses: tuple[Any, ...],
+        feedback: _FeedbackProfile,
     ) -> None:
         """Score reusable descriptors locally before visiting source pages."""
 
@@ -2880,6 +3717,7 @@ class FinderService:
                 reference_hashes,
                 reference_poses,
                 ranking_version,
+                feedback,
             )
 
             for row in rows:
@@ -2937,6 +3775,7 @@ class FinderService:
         references: np.ndarray,
         reference_hashes: tuple[int, ...],
         reference_poses: tuple[Any, ...],
+        feedback: _FeedbackProfile,
     ) -> None:
         ranking_version = str(scan.get("ranking_version") or LEGACY_RANKING_VERSION)
         gallery_url = validate_source_url(card["url"])
@@ -2991,11 +3830,22 @@ class FinderService:
                     pose,
                     ranking_version=ranking_version,
                 )
+                base_score = score
+                score, feedback_adjustment = self._feedback_adjusted_score(
+                    ranking_tier=ranking_tier,
+                    base_score=base_score,
+                    pose=pose,
+                    candidate_metadata=candidate.metadata,
+                    feedback=feedback,
+                )
                 return {
                     "image_url": original,
                     "preview_remote_url": preview,
                     "ordinal": int(image["ordinal"]),
                     "score": score,
+                    "base_score": base_score,
+                    "feedback_adjustment": feedback_adjustment,
+                    "feedback_revision": feedback.revision,
                     "ranking_tier": ranking_tier,
                     "appearance_score": appearance_score,
                     "exact_score": exact_score,
@@ -3063,12 +3913,14 @@ class FinderService:
         references = await self._prepare_references(scan)
         reference_hashes = self._load_reference_hashes(scan["id"])
         reference_poses = self._load_reference_poses(scan["id"])
+        feedback = self._load_feedback_profile(scan["id"])
         self._check_control(scan["id"])
         await self._search_corpus(
             scan,
             references,
             reference_hashes,
             reference_poses,
+            feedback,
         )
         self._check_control(scan["id"])
         self._update_scan(scan["id"], status="scanning", error="")
@@ -3124,6 +3976,7 @@ class FinderService:
                             references,
                             reference_hashes,
                             reference_poses,
+                            feedback,
                         )
                         for index, card in enumerate(batch)
                     ),

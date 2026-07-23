@@ -134,7 +134,13 @@ def build_visual_app(
         if "overlay" in url:
             svg = b"""<svg xmlns='http://www.w3.org/2000/svg' width='800' height='1100'><g fill='none' stroke='#63f2bd' stroke-width='18' stroke-linecap='round' stroke-linejoin='round'><circle cx='400' cy='190' r='58'/><path d='m400 250-20 245m20-180-150 145m150-145 145 110M380 495 245 760m135-265 190 245'/></g><g fill='#ffcf67' stroke='#101017' stroke-width='7'><circle cx='400' cy='250' r='17'/><circle cx='400' cy='315' r='17'/><circle cx='250' cy='460' r='17'/><circle cx='545' cy='425' r='17'/><circle cx='380' cy='495' r='17'/><circle cx='245' cy='760' r='17'/><circle cx='570' cy='740' r='17'/></g></svg>"""
         else:
-            color = "#284b63" if "candidate-2" in url else "#57406e" if "candidate-3" in url else "#31295a"
+            color = (
+                "#284b63"
+                if "candidate-2" in url
+                else "#57406e"
+                if "candidate-3" in url
+                else "#31295a"
+            )
             svg = f"""<svg xmlns='http://www.w3.org/2000/svg' width='800' height='1100'><defs><linearGradient id='g' x2='1' y2='1'><stop stop-color='{color}'/><stop offset='1' stop-color='#121825'/></linearGradient></defs><rect width='800' height='1100' fill='url(#g)'/><circle cx='570' cy='310' r='190' fill='#9b7bfa' opacity='.18'/><path d='M90 860 330 540l150 170 105-125 140 275Z' fill='#ffffff' opacity='.13'/></svg>""".encode()
         return Response(svg, media_type="image/svg+xml")
 
@@ -145,9 +151,7 @@ def build_visual_app(
         "pose_tag_id": 1,
         "pose_tag_label": "mating press - backview",
         "source_url": "https://www.pornpics.com/",
-        "next_url": None
-        if finder_exhausted
-        else "https://www.pornpics.com/?page=6",
+        "next_url": None if finder_exhausted else "https://www.pornpics.com/?page=6",
         "page_limit": 5,
         "pages_completed": 3 if finder_exhausted else 5,
         "processed_galleries": 64,
@@ -163,7 +167,13 @@ def build_visual_app(
     }
 
     async def fake_finder_status(**kwargs: object) -> dict:
-        return {"available": True, "model_ready": True, "model_name": "RTMO-L + visual verifier", "device": "CUDA", "folder_root": "/library"}
+        return {
+            "available": True,
+            "model_ready": True,
+            "model_name": "RTMO-L + visual verifier",
+            "device": "CUDA",
+            "folder_root": "/library",
+        }
 
     async def fake_finder_corpus(**kwargs: object) -> dict:
         return {
@@ -178,11 +188,47 @@ def build_visual_app(
             "max_cache_bytes": 2147483648,
         }
 
+    async def fake_finder_feedback(**kwargs: object) -> dict:
+        return {
+            "pose_tag_id": 1,
+            "revision": 19,
+            "accepted_galleries": 4,
+            "rejected_galleries": 3,
+            "usable_accepted_galleries": 4,
+            "usable_rejected_galleries": 3,
+            "accepted_samples": 12,
+            "rejected_samples": 7,
+            "usable_accepted_samples": 12,
+            "usable_rejected_samples": 7,
+            "active": True,
+            "min_galleries_per_state": 2,
+            "max_galleries_per_state": 8,
+            "max_samples_per_state": 8,
+            "max_adjustment": 0.08,
+            "applies_to": "future_scans",
+        }
+
     async def fake_finder_folders(**kwargs: object) -> dict:
-        return {"folders": [{"path": "sorted_outpaint/mating press - backview/selected_target_upscaled", "image_count": 25}]}
+        return {
+            "folders": [
+                {
+                    "path": "sorted_outpaint/mating press - backview/selected_target_upscaled",
+                    "image_count": 25,
+                }
+            ]
+        }
 
     async def fake_pose_tags(**kwargs: object) -> dict:
-        return {"items": [{"id": 1, "label": "mating press - backview", "slug": "mating-press-backview", "default_role": "couple"}]}
+        return {
+            "items": [
+                {
+                    "id": 1,
+                    "label": "mating press - backview",
+                    "slug": "mating-press-backview",
+                    "default_role": "couple",
+                }
+            ]
+        }
 
     async def fake_finder_scans(**kwargs: object) -> dict:
         return {"scans": [finder_scan]}
@@ -192,7 +238,9 @@ def build_visual_app(
 
     async def fake_finder_results(**kwargs: object) -> dict:
         def media(name: str) -> str:
-            return f"/api/media?url=https%3A%2F%2Fexample.test%2F{name}.jpg&token=visual"
+            return (
+                f"/api/media?url=https%3A%2F%2Fexample.test%2F{name}.jpg&token=visual"
+            )
 
         return {
             "results": [
@@ -203,17 +251,64 @@ def build_visual_app(
                     "title": "High-confidence multi-person pose candidate",
                     "rank": 1,
                     "score": 0.96,
+                    "base_score": 0.94,
+                    "feedback_adjustment": 0.02,
+                    "feedback_applied": True,
+                    "feedback_revision": 19,
                     "ranking_tier": 2,
                     "online_scanned": False,
                     "review": "pending",
+                    "feedback_image_urls": [],
                     "images_scored": 24,
                     "image_count": 24,
                     "person_count": 2,
-                    "score_breakdown": {"exact": 0.31, "pose": 0.96, "appearance": 0.72},
+                    "score_breakdown": {
+                        "exact": 0.31,
+                        "pose": 0.96,
+                        "appearance": 0.72,
+                    },
                     "top_matches": [
-                        {"rank": 1, "image_url": "https://example.test/candidate-1.jpg", "preview_url": media("candidate-1"), "ordinal": 12, "score": 0.96, "ranking_tier": 2, "pose_score": 0.96, "pose_reliable": True, "match_type": "pose", "person_count": 2, "skeleton_overlay_url": media("overlay-1")},
-                        {"rank": 2, "image_url": "https://example.test/candidate-2.jpg", "preview_url": media("candidate-2"), "ordinal": 8, "score": 0.88, "ranking_tier": 2, "pose_score": 0.88, "pose_reliable": True, "match_type": "pose", "person_count": 2, "skeleton_overlay_url": media("overlay-2")},
-                        {"rank": 3, "image_url": "https://example.test/candidate-3.jpg", "preview_url": media("candidate-3"), "ordinal": 19, "score": 0.84, "ranking_tier": 1, "appearance_score": 0.84, "match_type": "visual_fallback", "person_count": 2},
+                        {
+                            "rank": 1,
+                            "image_url": "https://example.test/candidate-1.jpg",
+                            "preview_url": media("candidate-1"),
+                            "ordinal": 12,
+                            "score": 0.96,
+                            "base_score": 0.94,
+                            "feedback_adjustment": 0.02,
+                            "feedback_applied": True,
+                            "feedback_revision": 19,
+                            "ranking_tier": 2,
+                            "pose_score": 0.96,
+                            "pose_reliable": True,
+                            "match_type": "pose",
+                            "person_count": 2,
+                            "skeleton_overlay_url": media("overlay-1"),
+                        },
+                        {
+                            "rank": 2,
+                            "image_url": "https://example.test/candidate-2.jpg",
+                            "preview_url": media("candidate-2"),
+                            "ordinal": 8,
+                            "score": 0.88,
+                            "ranking_tier": 2,
+                            "pose_score": 0.88,
+                            "pose_reliable": True,
+                            "match_type": "pose",
+                            "person_count": 2,
+                            "skeleton_overlay_url": media("overlay-2"),
+                        },
+                        {
+                            "rank": 3,
+                            "image_url": "https://example.test/candidate-3.jpg",
+                            "preview_url": media("candidate-3"),
+                            "ordinal": 19,
+                            "score": 0.84,
+                            "ranking_tier": 1,
+                            "appearance_score": 0.84,
+                            "match_type": "visual_fallback",
+                            "person_count": 2,
+                        },
                     ],
                 },
                 {
@@ -226,6 +321,7 @@ def build_visual_app(
                     "ranking_tier": 3,
                     "online_scanned": True,
                     "review": "pending",
+                    "feedback_image_urls": [],
                     "images_scored": 21,
                     "image_count": 21,
                     "is_exact": True,
@@ -281,6 +377,12 @@ def build_visual_app(
         elif open_finder and getattr(route, "path", None) == "/api/finder/corpus":
             route.endpoint = fake_finder_corpus
             route.dependant.call = fake_finder_corpus
+        elif (
+            open_finder
+            and getattr(route, "path", None) == "/api/finder/feedback/{pose_tag_id}"
+        ):
+            route.endpoint = fake_finder_feedback
+            route.dependant.call = fake_finder_feedback
         elif open_finder and getattr(route, "path", None) == "/api/finder/folders":
             route.endpoint = fake_finder_folders
             route.dependant.call = fake_finder_folders
@@ -290,12 +392,27 @@ def build_visual_app(
         elif open_finder and getattr(route, "path", None) == "/api/finder/scans":
             route.endpoint = fake_finder_scans
             route.dependant.call = fake_finder_scans
-        elif open_finder and getattr(route, "path", None) == "/api/finder/scans/{scan_id}":
+        elif (
+            open_finder
+            and getattr(route, "path", None) == "/api/finder/scans/{scan_id}"
+        ):
             route.endpoint = fake_finder_scan
             route.dependant.call = fake_finder_scan
-        elif open_finder and getattr(route, "path", None) == "/api/finder/scans/{scan_id}/results":
+        elif (
+            open_finder
+            and getattr(route, "path", None) == "/api/finder/scans/{scan_id}/results"
+        ):
             route.endpoint = fake_finder_results
             route.dependant.call = fake_finder_results
+    if open_finder and not any(
+        getattr(route, "path", None) == "/api/finder/feedback/{pose_tag_id}"
+        for route in app.routes
+    ):
+        app.add_api_route(
+            "/api/finder/feedback/{pose_tag_id}",
+            fake_finder_feedback,
+            methods=["GET", "DELETE"],
+        )
     return app
 
 
@@ -393,7 +510,7 @@ def main() -> None:
                 "--disable-sync",
                 "--force-prefers-reduced-motion",
                 "--no-first-run",
-                f"--virtual-time-budget={3000 if args.lightbox or args.pose else 1000}",
+                f"--virtual-time-budget={3000 if args.lightbox or args.pose else 2000 if finder_mode else 1000}",
                 f"--user-data-dir={Path(directory) / 'chrome-profile'}",
                 f"--window-size={viewport}",
                 f"--screenshot={output}",

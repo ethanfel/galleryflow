@@ -2159,3 +2159,511 @@ async def test_finder_api_signs_best_preview(tmp_path: Path, monkeypatch) -> Non
                 assert match["skeleton_overlay_url"].startswith(
                     "data:image/svg+xml;base64,"
                 )
+            selected_image = result["top_matches"][0]["image_url"]
+            feedback_before = await client.get(f"/api/finder/feedback/{tag['id']}")
+            assert feedback_before.status_code == 200
+            assert feedback_before.json()["feedback"]["accepted_samples"] == 0
+
+            reviewed = await client.patch(
+                f"/api/finder/scans/{scan_id}/results/{result['id']}",
+                json={
+                    "review": "accepted",
+                    "feedback_image_urls": [selected_image],
+                },
+            )
+            assert reviewed.status_code == 200
+            reviewed_body = reviewed.json()
+            assert reviewed_body["result"]["feedback_image_urls"] == [selected_image]
+            assert reviewed_body["feedback"]["accepted_galleries"] == 1
+            assert reviewed_body["feedback"]["accepted_samples"] == 1
+            assert reviewed_body["feedback"]["applies_to"] == "future_scans"
+
+            empty_accept = await client.patch(
+                f"/api/finder/scans/{scan_id}/results/{result['id']}",
+                json={"review": "accepted", "feedback_image_urls": []},
+            )
+            assert empty_accept.status_code == 400
+            unknown_image = await client.patch(
+                f"/api/finder/scans/{scan_id}/results/{result['id']}",
+                json={
+                    "review": "rejected",
+                    "feedback_image_urls": [
+                        "https://cdni.pornpics.com/full/not-proposed.jpg"
+                    ],
+                },
+            )
+            assert unknown_image.status_code == 400
+            too_many = await client.patch(
+                f"/api/finder/scans/{scan_id}/results/{result['id']}",
+                json={
+                    "review": "rejected",
+                    "feedback_image_urls": [
+                        "https://example.com/1.jpg",
+                        "https://example.com/2.jpg",
+                        "https://example.com/3.jpg",
+                        "https://example.com/4.jpg",
+                    ],
+                },
+            )
+            assert too_many.status_code == 422
+
+            empty_reject = await client.patch(
+                f"/api/finder/scans/{scan_id}/results/{result['id']}",
+                json={"review": "rejected", "feedback_image_urls": []},
+            )
+            assert empty_reject.status_code == 200
+            assert empty_reject.json()["result"]["feedback_image_urls"] == []
+            assert empty_reject.json()["feedback"]["rejected_galleries"] == 0
+            assert empty_reject.json()["feedback"]["rejected_samples"] == 0
+
+            reset = await client.delete(f"/api/finder/feedback/{tag['id']}")
+            assert reset.status_code == 200
+            assert reset.json()["feedback"]["rejected_galleries"] == 0
+            assert (await client.get("/api/finder/feedback/999999")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_finder_feedback_curated_samples_persist_and_freeze(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(finder_module, "validate_public_media_url", lambda value: value)
+    config, database, tag_id = configured(tmp_path)
+    service = FinderService(
+        config,
+        database,
+        FakeScraper(),
+        EventBroker(),
+        encoder=SpatialFakeEncoder(),
+        pose_estimator=FakePoseEstimator(),
+        media_fetcher=fake_media,
+    )
+    await service.start()
+    try:
+        first_scan = service.create_scan(
+            example_directory="pose",
+            pose_tag_id=tag_id,
+            source_url=ROOT,
+            page_limit=1,
+            minimum_score=0,
+        )
+        await asyncio.wait_for(service.queue.join(), 30)
+        results, _ = service.results(
+            first_scan["id"], review="all", min_score=0, limit=20, offset=0
+        )
+        result = results[0]
+        selected_url = result["top_matches"][0]["image_url"]
+        review_only = results[1]
+        initial_revision = service.feedback_status(tag_id)["revision"]
+        rejected_without_samples = service.set_review(
+            first_scan["id"],
+            review_only["id"],
+            "rejected",
+            [],
+        )
+        assert rejected_without_samples["review"] == "rejected"
+        assert rejected_without_samples["feedback_image_urls"] == []
+        assert service.feedback_status(tag_id)["revision"] == initial_revision
+
+        accepted = service.set_review(
+            first_scan["id"],
+            result["id"],
+            "accepted",
+            [selected_url],
+        )
+        assert accepted["feedback_image_urls"] == [selected_url]
+        status = service.feedback_status(tag_id)
+        assert status["accepted_galleries"] == 1
+        assert status["accepted_samples"] == 1
+        assert status["usable_accepted_galleries"] == 1
+        assert status["usable_accepted_samples"] == 1
+        assert status["active"] is False
+        first_revision = status["revision"]
+
+        # Repeating an identical review is idempotent and does not create a
+        # phantom new learning revision.
+        service.set_review(
+            first_scan["id"],
+            result["id"],
+            "accepted",
+            [selected_url],
+        )
+        assert service.feedback_status(tag_id)["revision"] == first_revision
+        with pytest.raises(ValueError, match="requires at least one"):
+            service.set_review(first_scan["id"], result["id"], "accepted", [])
+        with pytest.raises(ValueError, match="proposed matches"):
+            service.set_review(
+                first_scan["id"],
+                result["id"],
+                "rejected",
+                ["https://cdni.pornpics.com/full/not-proposed.jpg"],
+            )
+
+        # A scan snapshots feedback when it is created. Later review changes
+        # cannot alter that scan, including after a pause/resume or extension.
+        frozen_scan = service.create_scan(
+            example_directory="pose",
+            pose_tag_id=tag_id,
+            source_url=ROOT,
+            page_limit=1,
+            minimum_score=0,
+        )
+        service.set_review(
+            first_scan["id"],
+            result["id"],
+            "rejected",
+            [selected_url],
+        )
+        with database.connect() as connection:
+            frozen = connection.execute(
+                """SELECT decision, source_key FROM finder_scan_feedback
+                   WHERE scan_id = ?""",
+                (frozen_scan["id"],),
+            ).fetchall()
+            frozen_revision = connection.execute(
+                """SELECT feedback_revision FROM finder_scans WHERE id = ?""",
+                (frozen_scan["id"],),
+            ).fetchone()[0]
+        assert [(row["decision"], row["source_key"]) for row in frozen] == [
+            (
+                "accepted",
+                service._remote_source_key(
+                    result["top_matches"][0]["preview_remote_url"]
+                ),
+            )
+        ]
+        assert frozen_revision == first_revision
+        assert service.feedback_status(tag_id)["revision"] == first_revision + 1
+
+        await asyncio.wait_for(service.queue.join(), 30)
+        deleted = service.delete_or_cancel(first_scan["id"])
+        assert deleted["deleted"] is True
+        persisted = service.feedback_status(tag_id)
+        assert persisted["rejected_galleries"] == 1
+        assert persisted["rejected_samples"] == 1
+
+        other_tag = database.create_pose_tag("Different pose", "solo")
+        assert service.feedback_status(int(other_tag["id"]))["accepted_samples"] == 0
+        reset = service.reset_feedback(tag_id)
+        assert reset["accepted_galleries"] == 0
+        assert reset["rejected_galleries"] == 0
+        with database.connect() as connection:
+            # Reset applies only to scans created later; frozen evidence remains.
+            assert (
+                connection.execute(
+                    """SELECT COUNT(*) FROM finder_scan_feedback
+                   WHERE scan_id = ?""",
+                    (frozen_scan["id"],),
+                ).fetchone()[0]
+                == 1
+            )
+    finally:
+        await service.stop()
+
+
+def test_finder_feedback_pose_reranker_is_bounded_and_preserves_lanes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = FakePoseEstimator().infer_bytes(b"")
+    candidate_metadata = {"pose": frame.as_dict()}
+    pose = {"pose_reliable": True}
+    accepted = finder_module._FeedbackProfile(
+        revision=3,
+        accepted=(("gallery-a", frame), ("gallery-b", frame)),
+    )
+    rejected = finder_module._FeedbackProfile(
+        revision=4,
+        rejected=(("gallery-c", frame), ("gallery-d", frame)),
+    )
+
+    def affinity(
+        _: PoseFrame, exemplars: tuple[tuple[str, PoseFrame], ...]
+    ) -> tuple[float, int]:
+        return 0.95, len({gallery for gallery, _ in exemplars})
+
+    monkeypatch.setattr(
+        FinderService,
+        "_feedback_pose_affinity",
+        staticmethod(affinity),
+    )
+    positive_score, positive_adjustment = FinderService._feedback_adjusted_score(
+        ranking_tier=2,
+        base_score=0.6,
+        pose=pose,
+        candidate_metadata=candidate_metadata,
+        feedback=accepted,
+    )
+    assert positive_score > 0.6
+    assert 0 < positive_adjustment <= finder_module.MAX_FEEDBACK_ADJUSTMENT
+
+    negative_score, negative_adjustment = FinderService._feedback_adjusted_score(
+        ranking_tier=2,
+        base_score=0.6,
+        pose=pose,
+        candidate_metadata=candidate_metadata,
+        feedback=rejected,
+    )
+    assert finder_module.POSE_MATCH_FLOOR <= negative_score < 0.6
+    assert -finder_module.MAX_FEEDBACK_ADJUSTMENT <= negative_adjustment < 0
+
+    mismatch_score, _ = FinderService._feedback_adjusted_score(
+        ranking_tier=0,
+        base_score=0.54,
+        pose=pose,
+        candidate_metadata=candidate_metadata,
+        feedback=accepted,
+    )
+    assert mismatch_score < finder_module.POSE_MATCH_FLOOR
+
+    for tier in (1, 3):
+        score, adjustment = FinderService._feedback_adjusted_score(
+            ranking_tier=tier,
+            base_score=0.8,
+            pose=pose,
+            candidate_metadata=candidate_metadata,
+            feedback=rejected,
+        )
+        assert score == 0.8
+        assert adjustment == 0
+
+    couple = PoseFrame(
+        keypoints=np.concatenate(
+            [frame.keypoints, np.clip(frame.keypoints + 0.05, 0, 1)]
+        ),
+        confidences=np.concatenate([frame.confidences, frame.confidences]),
+        boxes=np.concatenate([frame.boxes, np.clip(frame.boxes + 0.05, 0, 1)]),
+        person_scores=np.concatenate([frame.person_scores, frame.person_scores]),
+        image_size=frame.image_size,
+        model_key=frame.model_key,
+    )
+    # Cardinality buckets are independent: couple/group feedback cannot add
+    # expensive or misleading comparisons to a solo candidate.
+    monkeypatch.undo()
+    assert FinderService._feedback_pose_affinity(
+        frame,
+        (("couple-a", couple), ("couple-b", couple)),
+    ) == (None, 0)
+
+
+def test_finder_feedback_effective_samples_ignore_empty_and_dedupe_sources(
+    tmp_path: Path,
+) -> None:
+    config, database, _ = configured(tmp_path)
+    estimator = FakePoseEstimator()
+    service = FinderService(
+        config,
+        database,
+        FakeScraper(),
+        EventBroker(),
+        encoder=SpatialFakeEncoder(),
+        pose_estimator=estimator,
+    )
+    pose_json = json.dumps(estimator.infer_bytes(b"").as_dict())
+
+    # Empty gallery decisions remain useful review history but must not consume
+    # the learning cap ahead of older usable exemplars.
+    decisions = [
+        {
+            "decision": "rejected",
+            "gallery_key": f"empty-{index}",
+            "samples": [],
+        }
+        for index in range(finder_module.MAX_FEEDBACK_GALLERIES_PER_STATE + 5)
+    ]
+    decisions.extend(
+        [
+            {
+                "decision": "rejected",
+                "gallery_key": "usable-a",
+                "samples": [
+                    {
+                        "source_key": "url:https://cdn.example/a.jpg",
+                        "pose_model_key": estimator.model_key,
+                        "pose_json": pose_json,
+                    }
+                ],
+            },
+            {
+                "decision": "rejected",
+                "gallery_key": "usable-b",
+                "samples": [
+                    {
+                        "source_key": "url:https://cdn.example/b.jpg",
+                        "pose_model_key": estimator.model_key,
+                        "pose_json": pose_json,
+                    }
+                ],
+            },
+        ]
+    )
+    selected = service._usable_feedback_samples(decisions)
+    assert [(state, gallery) for state, gallery, _, _ in selected] == [
+        ("rejected", "usable-a"),
+        ("rejected", "usable-b"),
+    ]
+
+    # The newest explicit label owns a source globally, so duplicate image URLs
+    # cannot masquerade as multiple independent galleries or opposing votes.
+    duplicate = {
+        "source_key": "url:https://cdn.example/duplicate.jpg",
+        "pose_model_key": estimator.model_key,
+        "pose_json": pose_json,
+    }
+    selected = service._usable_feedback_samples(
+        [
+            {
+                "decision": "accepted",
+                "gallery_key": "newest",
+                "samples": [duplicate],
+            },
+            {
+                "decision": "rejected",
+                "gallery_key": "older",
+                "samples": [duplicate],
+            },
+        ]
+    )
+    assert [(state, gallery) for state, gallery, _, _ in selected] == [
+        ("accepted", "newest")
+    ]
+
+    many_decisions = [
+        {
+            "decision": "accepted",
+            "gallery_key": "gallery-00",
+            "samples": [
+                {
+                    "source_key": f"url:https://cdn.example/00-{index}.jpg",
+                    "pose_model_key": estimator.model_key,
+                    "pose_json": pose_json,
+                }
+                for index in range(3)
+            ],
+        }
+    ]
+    many_decisions.extend(
+        {
+            "decision": "accepted",
+            "gallery_key": f"gallery-{index:02d}",
+            "samples": [
+                {
+                    "source_key": f"url:https://cdn.example/{index:02d}.jpg",
+                    "pose_model_key": estimator.model_key,
+                    "pose_json": pose_json,
+                }
+            ],
+        }
+        for index in range(1, 12)
+    )
+    selected = service._usable_feedback_samples(many_decisions)
+    assert len(selected) == finder_module.MAX_FEEDBACK_SAMPLES_PER_STATE
+    assert {gallery for _, gallery, _, _ in selected} == {
+        f"gallery-{index:02d}"
+        for index in range(finder_module.MAX_FEEDBACK_SAMPLES_PER_STATE)
+    }
+
+
+def test_finder_feedback_upgrade_backfills_reviews_without_mutating_cache(
+    tmp_path: Path,
+) -> None:
+    config, database, tag_id = configured(tmp_path)
+    estimator = FakePoseEstimator()
+    service = FinderService(
+        config,
+        database,
+        FakeScraper(),
+        EventBroker(),
+        encoder=SpatialFakeEncoder(),
+        pose_estimator=estimator,
+    )
+    service.ensure_schema()
+    service._model_key = "feedback-migration-model"
+    scan = service.create_scan(
+        example_directory="pose",
+        pose_tag_id=tag_id,
+        source_url=ROOT,
+        page_limit=1,
+        minimum_score=0,
+    )
+    preview = "https://cdni.pornpics.com/p/migration-feedback.jpg"
+    image_url = "https://cdni.pornpics.com/full/migration-feedback.jpg"
+    pose = estimator.infer_bytes(b"")
+    service._store_embedding(
+        service._remote_source_key(preview),
+        False,
+        np.asarray([[1.0, 0.0]], dtype=np.float32),
+        metadata={
+            "analyzer_version": finder_module.ANALYZER_VERSION,
+            "descriptor_kind": "spatial",
+            "pose": pose.as_dict(),
+            "person_count": 1,
+        },
+    )
+    service._save_result(
+        scan["id"],
+        {"url": GALLERY_A, "title": "Historic accepted gallery"},
+        order=0,
+        score=0,
+        images_scored=1,
+        best=None,
+        status="completed",
+        ranking_version=finder_module.CURRENT_RANKING_VERSION,
+        top_matches=[
+            pose_first_match(
+                1,
+                appearance=0.4,
+                pose=0.9,
+                reliable=True,
+            )
+            | {
+                "image_url": image_url,
+                "preview_remote_url": preview,
+            }
+        ],
+    )
+    with database.connect() as connection:
+        connection.execute(
+            """UPDATE finder_scans
+               SET reference_model_key = ?, status = 'completed'
+               WHERE id = ?""",
+            (service._model_key, scan["id"]),
+        )
+        connection.execute(
+            """UPDATE finder_results SET review = 'accepted'
+               WHERE scan_id = ?""",
+            (scan["id"],),
+        )
+        connection.execute("""DELETE FROM finder_feedback_decisions""")
+        connection.execute(
+            """DELETE FROM finder_corpus_meta
+               WHERE key = 'feedback-backfill'"""
+        )
+        cache_before = connection.execute(
+            """SELECT cache_key, embedding, metadata_json, created_at,
+                      last_used_at
+               FROM finder_embedding_cache ORDER BY cache_key"""
+        ).fetchall()
+
+    service.ensure_schema()
+    status = service.feedback_status(tag_id)
+    assert status["accepted_galleries"] == 1
+    assert status["accepted_samples"] == 1
+    assert status["usable_accepted_samples"] == 1
+    first_revision = status["revision"]
+    with database.connect() as connection:
+        cache_after = connection.execute(
+            """SELECT cache_key, embedding, metadata_json, created_at,
+                      last_used_at
+               FROM finder_embedding_cache ORDER BY cache_key"""
+        ).fetchall()
+        marker = connection.execute(
+            """SELECT value FROM finder_corpus_meta
+               WHERE key = 'feedback-backfill'"""
+        ).fetchone()[0]
+    assert [tuple(row) for row in cache_after] == [tuple(row) for row in cache_before]
+    assert marker == finder_module.FEEDBACK_BACKFILL_VERSION
+
+    # The marker makes startup migration idempotent.
+    service.ensure_schema()
+    repeated = service.feedback_status(tag_id)
+    assert repeated["revision"] == first_revision
+    assert repeated["accepted_samples"] == 1

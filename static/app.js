@@ -68,6 +68,14 @@
     finderStatus: null,
     finderCorpus: null,
     finderCorpusSupported: null,
+    finderFeedback: null,
+    finderFeedbackSupported: null,
+    finderFeedbackLoading: false,
+    finderFeedbackBusy: false,
+    finderFeedbackMutations: 0,
+    finderFeedbackError: '',
+    finderFeedbackRequest: 0,
+    finderFeedbackTimer: null,
     finderScans: [],
     finderScan: null,
     finderScanId: storage.get('finder-scan', ''),
@@ -1861,6 +1869,67 @@
     };
   }
 
+  function normalizeFinderFeedback(item, fallbackTag = null) {
+    if (!item || typeof item !== 'object') return null;
+    const wrapped = item.feedback && typeof item.feedback === 'object'
+      ? item.feedback
+      : item.finder_feedback && typeof item.finder_feedback === 'object'
+        ? item.finder_feedback
+        : item;
+    const recognized = [
+      'accepted', 'accepted_count', 'positive_count', 'rejected',
+      'rejected_count', 'negative_count', 'accepted_samples', 'rejected_samples',
+      'accepted_galleries', 'rejected_galleries', 'enabled', 'active', 'total'
+    ].some(key => wrapped[key] !== undefined);
+    if (!recognized) return null;
+    const accepted = finderCorpusCount(
+      wrapped.accepted_samples,
+      wrapped.accepted,
+      wrapped.accepted_count,
+      wrapped.positive_count,
+      wrapped.positive_examples
+    );
+    const rejected = finderCorpusCount(
+      wrapped.rejected_samples,
+      wrapped.rejected,
+      wrapped.rejected_count,
+      wrapped.negative_count,
+      wrapped.negative_examples
+    );
+    const active = optionalBoolean(
+      wrapped.active
+      ?? wrapped.enabled
+      ?? wrapped.applied
+      ?? wrapped.ready
+    );
+    return {
+      poseTagId: wrapped.pose_tag_id ?? wrapped.tag_id ?? fallbackTag?.id,
+      poseTagLabel: String(wrapped.pose_tag_label || wrapped.tag_label || fallbackTag?.label || ''),
+      accepted,
+      rejected,
+      acceptedGalleries: finderCorpusCount(wrapped.accepted_galleries, wrapped.positive_galleries),
+      rejectedGalleries: finderCorpusCount(wrapped.rejected_galleries, wrapped.negative_galleries),
+      usableAcceptedGalleries: finderCorpusCount(wrapped.usable_accepted_galleries, wrapped.ready_accepted_galleries),
+      usableRejectedGalleries: finderCorpusCount(wrapped.usable_rejected_galleries, wrapped.ready_rejected_galleries),
+      usableAcceptedSamples: finderCorpusCount(wrapped.usable_accepted_samples, wrapped.ready_accepted_samples),
+      usableRejectedSamples: finderCorpusCount(wrapped.usable_rejected_samples, wrapped.ready_rejected_samples),
+      total: Math.max(
+        accepted + rejected,
+        finderCorpusCount(wrapped.total, wrapped.feedback_count)
+      ),
+      active: active === null ? accepted + rejected > 0 : active,
+      minimumGalleries: finderCorpusCount(
+        wrapped.min_galleries_per_state,
+        wrapped.minimum_galleries,
+        wrapped.activation_threshold
+      ),
+      maximumGalleries: finderCorpusCount(wrapped.max_galleries_per_state, wrapped.maximum_galleries),
+      maximumAdjustment: normalizeFinderScore(wrapped.max_adjustment, 0),
+      revision: finderCorpusCount(wrapped.revision),
+      updatedAt: wrapped.updated_at || ''
+    };
+  }
+
   function normalizeFinderStatus(item) {
     const data = item?.finder || item || {};
     const model = data.model && typeof data.model === 'object' ? data.model : {};
@@ -2005,6 +2074,24 @@
     return null;
   }
 
+  function normalizeFinderAdjustment(value, fallback = 0) {
+    if (value === null || value === undefined || value === '') return fallback;
+    let adjustment = Number(value);
+    if (!Number.isFinite(adjustment)) return fallback;
+    if (Math.abs(adjustment) > 1 && Math.abs(adjustment) <= 100) adjustment /= 100;
+    return Math.max(-1, Math.min(1, adjustment));
+  }
+
+  function finderFeedbackAdjustmentLabel(value) {
+    const percentage = Math.abs(normalizeFinderAdjustment(value)) * 100;
+    const sign = value < 0 ? '−' : '+';
+    if (percentage > 0 && percentage < 0.01) return `${sign}<0.01%`;
+    const formatted = new Intl.NumberFormat(undefined, {
+      maximumFractionDigits: percentage < 0.1 ? 2 : percentage < 1 ? 1 : 0
+    }).format(percentage);
+    return `${sign}${formatted}%`;
+  }
+
   function normalizeFinderTier(value, fallback = 1) {
     const tier = Number.parseInt(value, 10);
     return Number.isFinite(tier) ? Math.max(0, Math.min(3, tier)) : fallback;
@@ -2020,12 +2107,39 @@
       ? match.score_breakdown
       : match.scores && typeof match.scores === 'object' ? match.scores : {};
     const isExact = Boolean(match.is_exact ?? match.exact_match ?? (index === 0 ? fallback.isExact : false));
+    const imageUrl = String(match.image_url || match.full_url || match.url || (index === 0 ? fallback.imageUrl : '') || '');
+    const previewUrl = String(match.preview_url || match.thumbnail_url || match.preview || (index === 0 ? fallback.previewUrl : '') || '');
+    const sourceKey = String(match.source_key || match.cache_source_key || match.descriptor_key || '');
     return {
       rank: Math.max(1, Number(match.rank ?? match.match_rank ?? index + 1) || index + 1),
-      imageUrl: String(match.image_url || match.full_url || match.url || (index === 0 ? fallback.imageUrl : '') || ''),
-      previewUrl: String(match.preview_url || match.thumbnail_url || match.preview || (index === 0 ? fallback.previewUrl : '') || ''),
+      imageUrl,
+      previewUrl,
+      sourceKey,
+      feedbackKey: sourceKey || imageUrl || previewUrl || `ordinal:${Number(match.ordinal ?? match.image_ordinal ?? match.index ?? index + 1)}`,
       ordinal: Number(match.ordinal ?? match.image_ordinal ?? match.index ?? (index === 0 ? fallback.ordinal : 0) ?? 0),
       score: firstFinderScore(match.score, match.similarity, match.combined_score, index === 0 ? fallback.score : null),
+      baseScore: firstFinderScore(match.base_score, match.baseScore, index === 0 ? fallback.baseScore : null),
+      feedbackAdjustment: normalizeFinderAdjustment(
+        match.feedback_adjustment ?? match.feedbackAdjustment,
+        index === 0 ? normalizeFinderAdjustment(fallback.feedbackAdjustment) : 0
+      ),
+      feedbackApplied: optionalBoolean(
+        match.feedback_applied
+        ?? match.feedbackApplied
+        ?? (index === 0 ? fallback.feedbackApplied : null)
+      ) ?? Math.abs(normalizeFinderAdjustment(
+        match.feedback_adjustment ?? match.feedbackAdjustment,
+        index === 0 ? normalizeFinderAdjustment(fallback.feedbackAdjustment) : 0
+      )) > 1e-9,
+      feedbackRevision: Math.max(
+        0,
+        Number.parseInt(
+          match.feedback_revision
+          ?? match.feedbackRevision
+          ?? (index === 0 ? fallback.feedbackRevision : 0),
+          10
+        ) || 0
+      ),
       exactScore: firstFinderScore(match.exact_score, match.duplicate_score, match.phash_score, breakdown.exact, breakdown.exact_score, index === 0 ? fallback.exactScore : null, isExact ? 1 : null),
       poseScore: firstFinderScore(match.pose_score, match.keypoint_score, match.geometry_score, breakdown.pose, breakdown.pose_score, index === 0 ? fallback.poseScore : null),
       appearanceScore: firstFinderScore(match.appearance_score, match.visual_score, match.dino_score, breakdown.appearance, breakdown.appearance_score, index === 0 ? fallback.appearanceScore : null),
@@ -2055,6 +2169,29 @@
       previewUrl: item?.best_preview_url || best.preview_url || best.thumbnail_url || source.thumbnail_url || source.thumbnail || '',
       ordinal: Number(item?.best_ordinal ?? best.ordinal ?? best.image_ordinal ?? 0),
       score: firstFinderScore(item?.score, item?.similarity, item?.combined_score, best.score, best.similarity, best.combined_score),
+      baseScore: firstFinderScore(item?.base_score, item?.baseScore, best.base_score, best.baseScore),
+      feedbackAdjustment: normalizeFinderAdjustment(
+        item?.feedback_adjustment
+        ?? item?.feedbackAdjustment
+        ?? best.feedback_adjustment
+        ?? best.feedbackAdjustment
+      ),
+      feedbackApplied: optionalBoolean(
+        item?.feedback_applied
+        ?? item?.feedbackApplied
+        ?? best.feedback_applied
+        ?? best.feedbackApplied
+      ),
+      feedbackRevision: Math.max(
+        0,
+        Number.parseInt(
+          item?.feedback_revision
+          ?? item?.feedbackRevision
+          ?? best.feedback_revision
+          ?? best.feedbackRevision,
+          10
+        ) || 0
+      ),
       exactScore: firstFinderScore(item?.exact_score, item?.duplicate_score, item?.phash_score, breakdown.exact, breakdown.exact_score, best.exact_score, isExact ? 1 : null),
       poseScore: firstFinderScore(item?.pose_score, item?.keypoint_score, item?.geometry_score, breakdown.pose, breakdown.pose_score, best.pose_score, best.keypoint_score),
       appearanceScore: firstFinderScore(item?.appearance_score, item?.visual_score, item?.dino_score, breakdown.appearance, breakdown.appearance_score, best.appearance_score, best.visual_score),
@@ -2090,13 +2227,59 @@
     const onlineScanned = optionalBoolean(item?.online_scanned ?? item?.scanned_online ?? item?.live_scanned);
     const indexedOnly = onlineScanned === false
       || (onlineScanned !== true && ['corpus', 'index', 'indexed', 'local'].includes(origin));
+    const review = normalizeFinderReview(item?.review ?? item?.review_status);
+    const suppliedFeedback = Array.isArray(item?.feedback_matches)
+      ? item.feedback_matches
+      : Array.isArray(item?.selected_matches) ? item.selected_matches : null;
+    const suppliedFeedbackUrls = Array.isArray(item?.feedback_image_urls)
+      ? item.feedback_image_urls.map(String)
+      : Array.isArray(item?.selected_image_urls) ? item.selected_image_urls.map(String) : null;
+    const suppliedFeedbackKeys = Array.isArray(item?.feedback_source_keys)
+      ? item.feedback_source_keys.map(String)
+      : suppliedFeedback
+        ? suppliedFeedback.map(match => String(match?.source_key || match?.image_url || match?.url || '')).filter(Boolean)
+        : null;
+    const feedbackSelectionProvided = review === 'pending'
+      ? Boolean(suppliedFeedbackUrls?.length || suppliedFeedbackKeys?.length)
+      : Boolean(suppliedFeedbackUrls || suppliedFeedbackKeys);
+    const feedbackMatchKeys = feedbackSelectionProvided
+      ? matches.filter(match => (
+        suppliedFeedbackUrls?.includes(match.imageUrl)
+        || suppliedFeedbackKeys?.includes(match.sourceKey)
+        || suppliedFeedbackKeys?.includes(match.feedbackKey)
+      )).map(match => match.feedbackKey)
+      : review === 'pending' ? matches.filter(match => match.imageUrl).map(match => match.feedbackKey) : [];
     return {
       ...gallery,
       key: item?.result_id ?? item?.id ?? galleryId,
       galleryId,
       rank: Number(item?.rank ?? index + 1),
       score,
-      review: normalizeFinderReview(item?.review ?? item?.review_status),
+      baseScore: firstFinderScore(fallback.baseScore, primaryMatch.baseScore, score),
+      feedbackAdjustment: normalizeFinderAdjustment(
+        item?.feedback_adjustment
+        ?? item?.feedbackAdjustment,
+        primaryMatch.feedbackAdjustment
+      ),
+      feedbackApplied: optionalBoolean(
+        item?.feedback_applied
+        ?? item?.feedbackApplied
+        ?? primaryMatch.feedbackApplied
+      ) ?? Math.abs(normalizeFinderAdjustment(
+        item?.feedback_adjustment
+        ?? item?.feedbackAdjustment,
+        primaryMatch.feedbackAdjustment
+      )) > 1e-9,
+      feedbackRevision: Math.max(
+        0,
+        Number.parseInt(
+          item?.feedback_revision
+          ?? item?.feedbackRevision
+          ?? primaryMatch.feedbackRevision,
+          10
+        ) || 0
+      ),
+      review,
       bestImageUrl: primaryMatch.imageUrl,
       bestPreviewUrl: primaryMatch.previewUrl || gallery.thumbnailUrl,
       bestOrdinal: primaryMatch.ordinal,
@@ -2113,6 +2296,10 @@
       origin,
       onlineScanned,
       indexedOnly,
+      feedbackMatchKeys,
+      feedbackSelectionProvided,
+      feedbackSelectionDirty: false,
+      feedbackSaving: false,
       matchCount: Number(item?.images_scored ?? item?.match_count ?? item?.matching_images ?? (Array.isArray(item?.candidate_images) ? item.candidate_images.length : item?.candidate_images) ?? 1)
     };
   }
@@ -2172,6 +2359,94 @@
       option.label = `${tag.label} · ${poseRoleLabel(tag.defaultRole)} control`;
       list.append(option);
     });
+  }
+
+  function finderFeedbackTag() {
+    const label = $('#finder-pose-tag').value.trim().replace(/\s+/g, ' ');
+    const existing = finderTagForInput(label);
+    if (existing) return existing;
+    if (
+      label
+      && state.finderScan?.poseTagId !== undefined
+      && state.finderScan?.poseTagId !== null
+      && label.toLocaleLowerCase() === state.finderScan.poseTagLabel.toLocaleLowerCase()
+    ) {
+      return finderPoseTagForScan(state.finderScan);
+    }
+    return label ? { id: null, label } : null;
+  }
+
+  function finderFeedbackIsSaving() {
+    return state.finderFeedbackMutations > 0
+      || state.finderResults.some(result => Boolean(result.feedbackSaving));
+  }
+
+  function finderFeedbackSaveBlocksReset(tag = finderFeedbackTag()) {
+    return Boolean(
+      tag?.id != null
+      && String(state.finderScan?.poseTagId) === String(tag.id)
+      && finderFeedbackIsSaving()
+    );
+  }
+
+  function renderFinderFeedback() {
+    const card = $('#finder-feedback-card');
+    const tag = finderFeedbackTag();
+    const feedback = tag?.id !== undefined
+      && tag?.id !== null
+      && String(state.finderFeedback?.poseTagId) === String(tag.id)
+      ? state.finderFeedback
+      : null;
+    const accepted = feedback?.accepted ?? (tag?.id == null && tag ? 0 : null);
+    const rejected = feedback?.rejected ?? (tag?.id == null && tag ? 0 : null);
+    const total = feedback ? Math.max(feedback.total, feedback.accepted + feedback.rejected) : 0;
+    card.classList.remove('is-active', 'is-collecting', 'is-unavailable');
+    card.classList.toggle('is-active', Boolean(feedback?.active && total));
+    card.classList.toggle('is-collecting', Boolean(feedback && total && !feedback.active));
+    card.classList.toggle('is-unavailable', state.finderFeedbackSupported === false || Boolean(state.finderFeedbackError));
+    $('#finder-feedback-title').textContent = tag?.label
+      ? `${tag.label} feedback`
+      : 'Select an existing pose';
+    $('#finder-feedback-accepted').textContent = accepted === null ? '—' : formatNumber(accepted);
+    $('#finder-feedback-rejected').textContent = rejected === null ? '—' : formatNumber(rejected);
+    $('#finder-feedback-accepted').closest('.finder-feedback-count').title = feedback
+      ? `${formatNumber(feedback.usableAcceptedSamples)} of ${formatNumber(feedback.accepted)} accepted samples are currently usable`
+      : '';
+    $('#finder-feedback-rejected').closest('.finder-feedback-count').title = feedback
+      ? `${formatNumber(feedback.usableRejectedSamples)} of ${formatNumber(feedback.rejected)} rejected samples are currently usable`
+      : '';
+    const stateLabel = state.finderFeedbackLoading
+      ? 'Loading'
+      : state.finderFeedbackError
+        ? 'Retry'
+        : state.finderFeedbackSupported === false
+          ? 'Unavailable'
+          : !tag
+            ? 'Waiting'
+            : tag.id == null
+              ? 'New pose'
+              : !feedback
+                ? 'Checking'
+                : total
+                  ? feedback.active ? 'In use' : 'Collecting'
+                  : 'No feedback';
+    $('#finder-feedback-state').textContent = stateLabel;
+    const reset = $('#finder-feedback-reset');
+    const reviewSaving = finderFeedbackSaveBlocksReset(tag);
+    reset.disabled = state.finderFeedbackBusy || state.finderFeedbackLoading || reviewSaving || !feedback || !total;
+    reset.title = reviewSaving ? 'Wait for the gallery review to finish saving' : '';
+    const progress = feedback?.minimumGalleries
+      ? `Accepted ${Math.min(feedback.usableAcceptedGalleries, feedback.minimumGalleries)}/${feedback.minimumGalleries} usable galleries · rejected ${Math.min(feedback.usableRejectedGalleries, feedback.minimumGalleries)}/${feedback.minimumGalleries}. `
+      : '';
+    $('#finder-feedback-copy').textContent = state.finderFeedbackError
+      ? state.finderFeedbackError
+      : state.finderFeedbackSupported === false
+        ? 'This server does not expose pose-specific ranking feedback.'
+        : !tag
+          ? 'Choose an existing pose to see its reversible ranking feedback.'
+          : tag.id == null
+            ? 'Feedback begins after this pose is created and you review candidates. It is scoped to this pose and reversible.'
+            : `${progress}Checked suggestions become pose feedback; unchecked suggestions are excluded. Reviews adjust future ranking only—the vision models are not retrained.`;
   }
 
   function renderFinderStatus() {
@@ -2258,11 +2533,17 @@
 
   function syncFinderConfigAvailability() {
     const locked = Boolean(state.finderScan && !finderScanIsTerminal());
+    const feedbackMutationPending = state.finderFeedbackBusy || finderFeedbackIsSaving();
     ['finder-folder', 'finder-pose-tag', 'finder-source', 'finder-pages', 'finder-min-similarity'].forEach(id => { $(`#${id}`).disabled = locked || state.finderBusy; });
     $('#finder-use-current').disabled = locked || state.finderBusy;
+    $('#finder-scan-select').disabled = state.finderLoading || feedbackMutationPending;
     const hasConfig = Boolean($('#finder-folder').value.trim() && $('#finder-pose-tag').value.trim() && $('#finder-source').value.trim());
     $('#finder-start').hidden = locked;
-    $('#finder-start').disabled = state.finderLoading || state.finderBusy || !state.finderStatus?.ready || !hasConfig;
+    $('#finder-start').disabled = state.finderLoading
+      || state.finderBusy
+      || feedbackMutationPending
+      || !state.finderStatus?.ready
+      || !hasConfig;
   }
 
   function applyFinderScanConfig(scan) {
@@ -2310,8 +2591,12 @@
     }];
     container.classList.add(`has-${Math.min(3, Math.max(1, matches.length))}`);
     matches.slice(0, 3).forEach((match, matchIndex) => {
+      const item = document.createElement('div');
+      const selected = result.feedbackMatchKeys.includes(match.feedbackKey);
+      item.className = `finder-match${selected ? ' is-feedback-selected' : ''}`;
+      item.dataset.finderMatch = match.feedbackKey;
       const button = document.createElement('button');
-      button.className = 'finder-match finder-card-open';
+      button.className = 'finder-match-open-target finder-card-open';
       button.type = 'button';
       button.dataset.finderAction = 'open';
       button.dataset.finderResult = String(result.key);
@@ -2343,7 +2628,20 @@
           overlay.removeAttribute('src');
         }, { once: true });
       }
-      container.append(button);
+      const select = document.createElement('label');
+      select.className = 'finder-match-select';
+      select.title = selected ? 'Selected for pose feedback—click to exclude' : 'Excluded from pose feedback—click to include';
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.checked = selected;
+      checkbox.disabled = !match.imageUrl || result.feedbackSaving || state.finderFeedbackBusy;
+      checkbox.dataset.finderFeedbackMatch = match.feedbackKey;
+      checkbox.dataset.finderResult = String(result.key);
+      checkbox.setAttribute('aria-label', match.imageUrl ? `Use ${ordinalCopy} as pose feedback` : `${ordinalCopy} is unavailable for pose feedback`);
+      select.innerHTML = '<svg><use href="#i-check"></use></svg><span>Use</span>';
+      select.prepend(checkbox);
+      item.append(button, select);
+      container.append(item);
     });
   }
 
@@ -2367,6 +2665,19 @@
       $('b', badge).textContent = finderScoreLabel(score);
       breakdown.append(badge);
     });
+    if (Math.abs(result.feedbackAdjustment) > 1e-9) {
+      const adjustment = result.feedbackAdjustment;
+      const badge = document.createElement('span');
+      badge.className = `finder-score-chip is-feedback ${adjustment > 0 ? 'is-positive' : 'is-negative'}`;
+      const revision = result.feedbackRevision ? ` revision ${result.feedbackRevision}` : '';
+      const baseCopy = result.baseScore === null || result.baseScore === undefined
+        ? ''
+        : ` from ${finderScoreLabel(result.baseScore)} to ${finderScoreLabel(result.score)}`;
+      badge.title = `Pose-specific feedback adjusted this result${baseCopy}. This scan uses feedback${revision} captured when it began; later reviews affect future scans.`;
+      badge.innerHTML = '<i></i><span>Feedback</span><b></b>';
+      $('b', badge).textContent = finderFeedbackAdjustmentLabel(adjustment);
+      breakdown.append(badge);
+    }
     const people = $('.finder-person-count', card);
     people.hidden = !result.personCount;
     if (result.personCount) $('b', people).textContent = `${result.personCount} ${result.personCount === 1 ? 'person' : 'people'}`;
@@ -2402,6 +2713,8 @@
       const card = $('.finder-card', fragment);
       card.dataset.finderResult = String(result.key);
       card.dataset.finderRankingTier = String(result.rankingTier);
+      card.classList.toggle('is-feedback-saving', Boolean(result.feedbackSaving));
+      card.setAttribute('aria-busy', String(Boolean(result.feedbackSaving)));
       card.classList.toggle('is-high', result.score >= 0.85);
       card.classList.toggle('is-likely', result.score >= 0.70 && result.score < 0.85);
       card.classList.toggle('is-explore', result.score < 0.70);
@@ -2423,7 +2736,16 @@
           : '';
       $('.finder-card-title', card).textContent = result.title;
       const matchCopy = `${formatNumber(result.matchCount)} ${result.matchCount === 1 ? 'image' : 'images'} compared`;
-      $('.finder-card-copy p', card).textContent = `${matchCopy}${result.imageCount ? ` · ${formatNumber(result.imageCount)} total` : ''}`;
+      $('.finder-card-meta', card).textContent = `${matchCopy}${result.imageCount ? ` · ${formatNumber(result.imageCount)} total` : ''}`;
+      const selectedFeedback = result.matches.filter(match => result.feedbackMatchKeys.includes(match.feedbackKey)).length;
+      const feedbackCopy = $('.finder-feedback-selection-copy', card);
+      feedbackCopy.textContent = result.feedbackSaving
+        ? 'Saving gallery review and pose feedback…'
+        : state.finderFeedbackBusy
+          ? 'Resetting pose feedback…'
+        : selectedFeedback
+          ? `${selectedFeedback} of ${result.matches.length} suggested ${result.matches.length === 1 ? 'image' : 'images'} checked for pose feedback · uncheck wrong images`
+          : `No suggested images checked · Accept requires at least one`;
       renderFinderDiagnostics(card, result);
       $$('.finder-card-open', card).forEach(button => {
         button.dataset.finderAction = 'open';
@@ -2434,8 +2756,16 @@
       const reject = $('.finder-reject', card);
       accept.classList.toggle('is-active', result.review === 'accepted');
       reject.classList.toggle('is-active', result.review === 'rejected');
-      accept.disabled = state.finderBusy || result.review === 'accepted';
-      reject.disabled = state.finderBusy || result.review === 'rejected';
+      accept.disabled = state.finderBusy || state.finderFeedbackBusy || result.feedbackSaving || !selectedFeedback || (result.review === 'accepted' && !result.feedbackSelectionDirty);
+      reject.disabled = state.finderBusy || state.finderFeedbackBusy || result.feedbackSaving || (result.review === 'rejected' && !result.feedbackSelectionDirty);
+      accept.title = state.finderFeedbackBusy
+        ? 'Wait for pose feedback reset to finish'
+        : result.feedbackSaving
+        ? 'Saving this gallery review'
+        : !selectedFeedback ? 'Check at least one suggested image before accepting' : '';
+      reject.title = state.finderFeedbackBusy
+        ? 'Wait for pose feedback reset to finish'
+        : result.feedbackSaving ? 'Saving this gallery review' : '';
       grid.append(fragment);
     });
     const empty = $('#finder-empty');
@@ -2469,6 +2799,7 @@
     renderFinderFolders();
     renderFinderTags();
     renderFinderStatus();
+    renderFinderFeedback();
     renderFinderCorpus();
     renderFinderScans();
     const scan = state.finderScan;
@@ -2633,12 +2964,163 @@
         limit: 500
       }));
       if (String(scanId) !== String(state.finderScanId)) return;
-      state.finderResults = apiItems(data, 'results').map(normalizeFinderResult);
+      const previousResults = new Map(state.finderResults.map(result => [String(result.key), result]));
+      state.finderResults = apiItems(data, 'results').map(normalizeFinderResult).map(result => {
+        const previous = previousResults.get(String(result.key));
+        if (!previous?.feedbackSelectionDirty && !previous?.feedbackSaving) return result;
+        return {
+          ...result,
+          review: previous.feedbackSaving ? previous.review : result.review,
+          feedbackMatchKeys: [...previous.feedbackMatchKeys],
+          feedbackSelectionProvided: previous.feedbackSelectionProvided,
+          feedbackSelectionDirty: previous.feedbackSelectionDirty,
+          feedbackSaving: previous.feedbackSaving
+        };
+      });
       renderFinderWorkspace();
     } catch (error) {
       if (!quiet) toast('Could not load Finder results', errorMessage(error), 'error');
     } finally {
       $('#finder-result-grid').setAttribute('aria-busy', 'false');
+    }
+  }
+
+  async function loadFinderFeedback({ quiet = false, force = false } = {}) {
+    const tag = finderFeedbackTag();
+    window.clearTimeout(state.finderFeedbackTimer);
+    state.finderFeedbackTimer = null;
+    if (tag?.id === undefined || tag?.id === null) {
+      state.finderFeedbackRequest += 1;
+      state.finderFeedback = null;
+      state.finderFeedbackLoading = false;
+      state.finderFeedbackError = '';
+      renderFinderFeedback();
+      return;
+    }
+    if (
+      !force
+      && state.finderFeedback
+      && String(state.finderFeedback.poseTagId) === String(tag.id)
+    ) {
+      renderFinderFeedback();
+      return;
+    }
+    const request = ++state.finderFeedbackRequest;
+    state.finderFeedbackLoading = true;
+    state.finderFeedbackError = '';
+    renderFinderFeedback();
+    try {
+      const data = await api(`/api/finder/feedback/${encodeURIComponent(tag.id)}`);
+      if (request !== state.finderFeedbackRequest) return;
+      const feedback = normalizeFinderFeedback(data, tag);
+      if (!feedback) throw new ApiError('The server returned invalid pose-feedback statistics.');
+      if (
+        String(state.finderFeedback?.poseTagId) === String(feedback.poseTagId)
+        && state.finderFeedback.revision > feedback.revision
+      ) return;
+      state.finderFeedback = feedback;
+      state.finderFeedbackSupported = true;
+      state.finderFeedbackError = '';
+    } catch (error) {
+      if (request !== state.finderFeedbackRequest) return;
+      state.finderFeedback = null;
+      if (error.status === 404) state.finderFeedbackSupported = false;
+      else state.finderFeedbackError = errorMessage(error);
+      if (!quiet && error.status !== 404) toast('Could not load pose feedback', errorMessage(error), 'error');
+    } finally {
+      if (request === state.finderFeedbackRequest) {
+        state.finderFeedbackLoading = false;
+        renderFinderFeedback();
+      }
+    }
+  }
+
+  function scheduleFinderFeedbackLoad(delay = 220) {
+    window.clearTimeout(state.finderFeedbackTimer);
+    state.finderFeedbackTimer = window.setTimeout(() => loadFinderFeedback({ quiet: true, force: true }), delay);
+    renderFinderFeedback();
+  }
+
+  function applyFinderFeedbackResponse(data) {
+    const tag = finderFeedbackTag();
+    const candidate = data?.feedback
+      || data?.finder_feedback
+      || data?.result?.feedback
+      || data?.result?.finder_feedback;
+    const feedback = normalizeFinderFeedback(candidate, tag);
+    if (!feedback || tag?.id == null || String(feedback.poseTagId) !== String(tag.id)) return false;
+    state.finderFeedbackRequest += 1;
+    state.finderFeedbackLoading = false;
+    if (
+      String(state.finderFeedback?.poseTagId) === String(feedback.poseTagId)
+      && state.finderFeedback.revision > feedback.revision
+    ) {
+      renderFinderFeedback();
+      return true;
+    }
+    state.finderFeedback = feedback;
+    state.finderFeedbackSupported = true;
+    state.finderFeedbackError = '';
+    renderFinderFeedback();
+    return true;
+  }
+
+  async function resetFinderFeedback() {
+    const tag = finderFeedbackTag();
+    const feedback = state.finderFeedback;
+    if (
+      tag?.id == null
+      || !feedback
+      || String(feedback.poseTagId) !== String(tag.id)
+      || finderFeedbackSaveBlocksReset(tag)
+      || state.finderFeedbackBusy
+    ) return;
+    const total = Math.max(feedback.total, feedback.accepted + feedback.rejected);
+    if (!total) return;
+    const sampleCopy = `${formatNumber(total)} saved feedback ${total === 1 ? 'sample' : 'samples'}`;
+    if (!window.confirm(`Reset ${sampleCopy} for “${tag.label}”? This clears only this pose’s ranking feedback; galleries and cached images are not deleted.`)) return;
+    const button = $('#finder-feedback-reset');
+    state.finderFeedbackBusy = true;
+    setButtonBusy(button, true, 'Resetting…');
+    renderFinderFeedback();
+    renderFinderResults();
+    syncFinderConfigAvailability();
+    try {
+      const data = await api(`/api/finder/feedback/${encodeURIComponent(tag.id)}`, { method: 'DELETE' });
+      if (!applyFinderFeedbackResponse(data)) {
+        state.finderFeedback = {
+          ...feedback,
+          accepted: 0,
+          rejected: 0,
+          acceptedGalleries: 0,
+          rejectedGalleries: 0,
+          usableAcceptedGalleries: 0,
+          usableRejectedGalleries: 0,
+          usableAcceptedSamples: 0,
+          usableRejectedSamples: 0,
+          total: 0,
+          active: false
+        };
+      }
+      if (String(state.finderScan?.poseTagId) === String(tag.id)) {
+        state.finderResults.forEach(result => {
+          if (result.review === 'pending') return;
+          result.feedbackMatchKeys = [];
+          result.feedbackSelectionProvided = true;
+          result.feedbackSelectionDirty = false;
+        });
+        renderFinderResults();
+      }
+      toast('Pose feedback reset', `Future “${tag.label}” scans will use the original ranking until new reviews are saved.`, 'info');
+      announce(`${tag.label} ranking feedback reset.`);
+    } catch (error) {
+      toast('Could not reset pose feedback', errorMessage(error), 'error');
+    } finally {
+      state.finderFeedbackBusy = false;
+      setButtonBusy(button, false);
+      renderFinderFeedback();
+      renderFinderResults();
+      syncFinderConfigAvailability();
     }
   }
 
@@ -2682,7 +3164,8 @@
       renderFinderWorkspace();
       await Promise.all([
         loadFinderResults({ quiet: true }),
-        loadFinderCorpus({ quiet: true })
+        loadFinderCorpus({ quiet: true }),
+        loadFinderFeedback({ quiet: true })
       ]);
       scheduleFinderPoll();
     } catch (error) {
@@ -2737,13 +3220,15 @@
     state.finderLoading = false;
     syncFinderConfigAvailability();
     if (selected?.id) await loadFinderScan({ quiet: true, applyConfig: !preserveConfig });
+    else await loadFinderFeedback({ quiet: true, force: true });
     const failures = requests.slice(0, 4).filter(result => result.status === 'rejected');
     if (!quiet && failures.length) toast('Some Finder options are unavailable', errorMessage(failures[0].reason), 'error');
   }
 
   async function startFinderScan() {
+    if (state.finderBusy || state.finderFeedbackBusy || finderFeedbackIsSaving()) return;
     const config = readFinderConfig({ validate: true });
-    if (!config || state.finderBusy) return;
+    if (!config) return;
     const button = $('#finder-start');
     state.finderBusy = true;
     setButtonBusy(button, true, 'Starting…');
@@ -2868,47 +3353,117 @@
     state.finderScan.rejectedCount = state.finderResults.filter(result => result.review === 'rejected').length;
   }
 
+  function toggleFinderFeedbackMatch(input) {
+    const result = state.finderResults.find(item => String(item.key) === String(input.dataset.finderResult));
+    const matchKey = input.dataset.finderFeedbackMatch;
+    if (!result || !matchKey || result.feedbackSaving || state.finderFeedbackBusy) return;
+    const selected = new Set(result.feedbackMatchKeys);
+    if (input.checked) selected.add(matchKey);
+    else selected.delete(matchKey);
+    result.feedbackMatchKeys = result.matches
+      .map(match => match.feedbackKey)
+      .filter(key => selected.has(key));
+    result.feedbackSelectionDirty = true;
+    renderFinderResults();
+    announce(`${input.checked ? 'Included' : 'Excluded'} suggested image ${result.feedbackMatchKeys.length} of ${result.matches.length} for pose feedback.`);
+  }
+
   async function reviewFinderResult(result, review, button = null) {
-    if (!result || !['pending', 'accepted', 'rejected'].includes(review) || state.finderBusy) return;
-    const previous = result.review;
-    if (previous === review) return;
+    if (!result || !['pending', 'accepted', 'rejected'].includes(review) || state.finderBusy || state.finderFeedbackBusy || result.feedbackSaving) return;
+    const scanId = String(state.finderScan?.id || '');
+    if (!scanId) return;
+    const resultKey = String(result.key);
+    const snapshot = {
+      review: result.review,
+      feedbackMatchKeys: [...result.feedbackMatchKeys],
+      feedbackSelectionProvided: result.feedbackSelectionProvided,
+      feedbackSelectionDirty: result.feedbackSelectionDirty
+    };
+    if (snapshot.review === review && !snapshot.feedbackSelectionDirty) return;
+    const selectedMatches = result.matches.filter(match => result.feedbackMatchKeys.includes(match.feedbackKey));
+    const feedbackImageUrls = selectedMatches.map(match => match.imageUrl).filter(Boolean);
+    if (review === 'accepted' && !feedbackImageUrls.length) {
+      toast('Check a matching image', 'Accept needs at least one checked suggestion. Unchecked images are excluded from feedback.', 'info');
+      return;
+    }
+    const sameScan = () => String(state.finderScan?.id || '') === scanId;
+    state.finderFeedbackMutations += 1;
+    result.feedbackSaving = true;
     result.review = review;
     recountFinderReviews();
     renderFinderResults();
+    renderFinderFeedback();
+    syncFinderConfigAvailability();
     if (button) button.disabled = true;
     try {
-      const data = await api(`/api/finder/scans/${encodeURIComponent(state.finderScan.id)}/results/${encodeURIComponent(result.key)}`, {
+      const data = await api(`/api/finder/scans/${encodeURIComponent(scanId)}/results/${encodeURIComponent(resultKey)}`, {
         method: 'PATCH',
-        body: { review }
+        body: {
+          review,
+          feedback_image_urls: feedbackImageUrls
+        }
       });
+      if (!sameScan()) return;
+      const index = state.finderResults.findIndex(item => String(item.key) === resultKey);
+      const current = index >= 0 ? state.finderResults[index] : result;
       if (data) {
         const updated = normalizeFinderResult(data?.result || data, result.rank - 1);
-        const index = state.finderResults.findIndex(item => String(item.key) === String(result.key));
         if (index >= 0) state.finderResults[index] = {
-          ...result,
+          ...current,
           ...updated,
-          galleryId: updated.galleryId || result.galleryId,
-          url: updated.url || result.url,
-          title: updated.title === 'Untitled gallery' ? result.title : updated.title,
-          bestImageUrl: updated.bestImageUrl || result.bestImageUrl,
-          bestPreviewUrl: updated.bestPreviewUrl || result.bestPreviewUrl,
-          imageCount: updated.imageCount || result.imageCount,
-          matches: updated.matches?.length ? updated.matches : result.matches,
-          exactScore: updated.exactScore ?? result.exactScore,
-          poseScore: updated.poseScore ?? result.poseScore,
-          appearanceScore: updated.appearanceScore ?? result.appearanceScore,
-          personCount: updated.personCount || result.personCount,
-          hasOverlay: updated.hasOverlay || result.hasOverlay
+          galleryId: updated.galleryId || current.galleryId,
+          url: updated.url || current.url,
+          title: updated.title === 'Untitled gallery' ? current.title : updated.title,
+          bestImageUrl: updated.bestImageUrl || current.bestImageUrl,
+          bestPreviewUrl: updated.bestPreviewUrl || current.bestPreviewUrl,
+          imageCount: updated.imageCount || current.imageCount,
+          matches: updated.matches?.length ? updated.matches : current.matches,
+          exactScore: updated.exactScore ?? current.exactScore,
+          poseScore: updated.poseScore ?? current.poseScore,
+          appearanceScore: updated.appearanceScore ?? current.appearanceScore,
+          personCount: updated.personCount || current.personCount,
+          hasOverlay: updated.hasOverlay || current.hasOverlay,
+          feedbackMatchKeys: updated.feedbackSelectionProvided ? updated.feedbackMatchKeys : snapshot.feedbackMatchKeys,
+          feedbackSelectionProvided: updated.feedbackSelectionProvided || snapshot.feedbackSelectionProvided,
+          feedbackSelectionDirty: false,
+          feedbackSaving: false
         };
+      } else {
+        current.feedbackSelectionDirty = false;
+        current.feedbackSaving = false;
       }
       recountFinderReviews();
       renderFinderWorkspace();
+      if (!applyFinderFeedbackResponse(data)) loadFinderFeedback({ quiet: true, force: true });
       announce(`${result.title} ${review}`);
     } catch (error) {
-      result.review = previous;
-      recountFinderReviews();
-      renderFinderWorkspace();
+      if (sameScan()) {
+        const index = state.finderResults.findIndex(item => String(item.key) === resultKey);
+        if (index >= 0) {
+          state.finderResults[index] = {
+            ...state.finderResults[index],
+            review: snapshot.review,
+            feedbackMatchKeys: snapshot.feedbackMatchKeys,
+            feedbackSelectionProvided: snapshot.feedbackSelectionProvided,
+            feedbackSelectionDirty: snapshot.feedbackSelectionDirty,
+            feedbackSaving: false
+          };
+        }
+        recountFinderReviews();
+        renderFinderWorkspace();
+      }
       toast('Could not save review', errorMessage(error), 'error');
+    } finally {
+      state.finderFeedbackMutations = Math.max(0, state.finderFeedbackMutations - 1);
+      if (sameScan()) {
+        const current = state.finderResults.find(item => String(item.key) === resultKey);
+        if (current?.feedbackSaving) {
+          current.feedbackSaving = false;
+          renderFinderResults();
+        }
+        renderFinderFeedback();
+      }
+      syncFinderConfigAvailability();
     }
   }
 
@@ -2947,6 +3502,7 @@
   }
 
   async function selectFinderScan(scanId) {
+    if (state.finderFeedbackBusy || finderFeedbackIsSaving()) return;
     state.finderScanId = scanId;
     storage.set('finder-scan', scanId);
     if (!scanId) {
@@ -2954,6 +3510,7 @@
       state.finderResults = [];
       window.clearTimeout(state.finderPollTimer);
       renderFinderWorkspace();
+      await loadFinderFeedback({ quiet: true, force: true });
       return;
     }
     await loadFinderScan({ applyConfig: true });
@@ -3495,7 +4052,10 @@
       } else if (open) openGallery(open.dataset.galleryId);
     });
     $('#page-next').addEventListener('click', loadMoreGalleries);
-    $('#finder-refresh').addEventListener('click', () => loadFinderWorkspace({ preserveConfig: true }));
+    $('#finder-refresh').addEventListener('click', async () => {
+      await loadFinderWorkspace({ preserveConfig: true });
+      await loadFinderFeedback({ quiet: true, force: true });
+    });
     $('#finder-use-current').addEventListener('click', () => {
       $('#finder-source').value = finderDefaultSource();
       syncFinderConfigAvailability();
@@ -3505,6 +4065,9 @@
       $(`#${id}`).addEventListener('input', syncFinderConfigAvailability);
       $(`#${id}`).addEventListener('change', syncFinderConfigAvailability);
     });
+    $('#finder-pose-tag').addEventListener('input', () => scheduleFinderFeedbackLoad());
+    $('#finder-pose-tag').addEventListener('change', () => loadFinderFeedback({ quiet: true, force: true }));
+    $('#finder-feedback-reset').addEventListener('click', resetFinderFeedback);
     $('#finder-min-similarity').addEventListener('input', event => {
       $('#finder-min-output').textContent = Number(event.currentTarget.value).toFixed(2);
     });
@@ -3539,6 +4102,10 @@
         if (use) use.setAttribute('href', visible ? '#i-eye-off' : '#i-eye');
       } else if (button.dataset.finderAction === 'open') openFinderResult(result);
       else reviewFinderResult(result, button.dataset.finderAction, button);
+    });
+    $('#finder-result-grid').addEventListener('change', event => {
+      const input = event.target.closest('input[data-finder-feedback-match]');
+      if (input) toggleFinderFeedbackMatch(input);
     });
     $('#active-profile').addEventListener('change', event => selectProfile(event.target.value));
     $('#modal-profile-select').addEventListener('change', event => selectProfile(event.target.value, false));

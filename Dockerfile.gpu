@@ -2,7 +2,7 @@ FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
 
 LABEL org.opencontainers.image.title="GalleryFlow GPU" \
       org.opencontainers.image.description="GPU-accelerated GalleryFlow gallery downloader and multi-person pose finder" \
-      org.opencontainers.image.version="2.6.0" \
+      org.opencontainers.image.version="2.7.0" \
       org.opencontainers.image.source="https://github.com/ethanfel/galleryflow"
 
 ENV DEBIAN_FRONTEND=noninteractive \

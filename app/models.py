@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -84,6 +84,9 @@ class FinderScanExtend(BaseModel):
 
 class FinderReviewPatch(BaseModel):
     review: Literal["pending", "accepted", "rejected"]
+    feedback_image_urls: (
+        list[Annotated[str, Field(min_length=1, max_length=2_000)]] | None
+    ) = Field(default=None, max_length=3)
 
 
 class SettingsPatch(BaseModel):

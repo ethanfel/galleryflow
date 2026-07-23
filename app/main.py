@@ -191,9 +191,7 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
         for item_match in result.get("top_matches") or []:
             match = dict(item_match)
             match_preview = match.pop("preview_remote_url", "")
-            match["preview_url"] = (
-                media_url(match_preview) if match_preview else None
-            )
+            match["preview_url"] = media_url(match_preview) if match_preview else None
             top_matches.append(match)
         result["top_matches"] = top_matches
         result["best_preview_url"] = media_url(preview) if preview else None
@@ -339,7 +337,9 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
         try:
             tag = database.create_pose_tag(payload.label, payload.default_role)
         except sqlite3.IntegrityError as exc:
-            raise HTTPException(409, "A pose tag with this label already exists") from exc
+            raise HTTPException(
+                409, "A pose tag with this label already exists"
+            ) from exc
         events.publish({"type": "pose", "action": "tag", "tag": tag})
         return {"tag": tag}
 
@@ -350,7 +350,9 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
                 tag_id, label=payload.label, default_role=payload.default_role
             )
         except sqlite3.IntegrityError as exc:
-            raise HTTPException(409, "A pose tag with this label already exists") from exc
+            raise HTTPException(
+                409, "A pose tag with this label already exists"
+            ) from exc
         if not tag:
             raise HTTPException(404, "Pose tag not found")
         events.publish({"type": "pose", "action": "tag", "tag": tag})
@@ -366,9 +368,7 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
         if not database.get_profile(profile):
             raise HTTPException(404, "Profile not found")
         return {
-            "draft": decorate_pose_draft(
-                database.get_pose_draft(gallery_url, profile)
-            )
+            "draft": decorate_pose_draft(database.get_pose_draft(gallery_url, profile))
         }
 
     @app.put("/api/galleries/{gallery_id}/pose-draft")
@@ -432,7 +432,9 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
             if not draft["controls"].get(target["role"]):
                 raise HTTPException(422, f"Missing {target['role']} control")
             if not target.get("pose_slug"):
-                raise HTTPException(422, "A pose tag used by this draft no longer exists")
+                raise HTTPException(
+                    422, "A pose tag used by this draft no longer exists"
+                )
         job = downloads.enqueue_pose_export(
             gallery_url=gallery_url,
             profile=profile,
@@ -480,6 +482,16 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
     async def finder_corpus() -> dict:
         return await asyncio.to_thread(finder.corpus_status)
 
+    @app.get("/api/finder/feedback/{pose_tag_id}")
+    async def finder_feedback(pose_tag_id: int) -> dict:
+        return {
+            "feedback": await asyncio.to_thread(finder.feedback_status, pose_tag_id)
+        }
+
+    @app.delete("/api/finder/feedback/{pose_tag_id}")
+    async def reset_finder_feedback(pose_tag_id: int) -> dict:
+        return {"feedback": await asyncio.to_thread(finder.reset_feedback, pose_tag_id)}
+
     @app.post("/api/finder/scans", status_code=202)
     async def create_finder_scan(payload: FinderScanCreate) -> dict:
         scan = finder.create_scan(**payload.model_dump())
@@ -526,8 +538,18 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
     async def review_finder_result(
         scan_id: str, result_id: str, payload: FinderReviewPatch
     ) -> dict:
-        item = finder.set_review(scan_id, result_id, payload.review)
-        return {"result": decorate_finder_result(item)}
+        item = finder.set_review(
+            scan_id,
+            result_id,
+            payload.review,
+            payload.feedback_image_urls,
+        )
+        scan = finder.get_scan(scan_id) or {}
+        pose_tag_id = int((scan.get("pose_tag") or {}).get("id") or 0)
+        return {
+            "result": decorate_finder_result(item),
+            "feedback": finder.feedback_status(pose_tag_id),
+        }
 
     @app.post("/api/finder/scans/{scan_id}/pause")
     async def pause_finder_scan(scan_id: str) -> dict:
@@ -640,8 +662,7 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
     async def list_downloads(limit: int = Query(default=100, ge=1, le=500)) -> dict:
         return {
             "items": [
-                downloads.public_job(job)
-                for job in database.list_job_summaries(limit)
+                downloads.public_job(job) for job in database.list_job_summaries(limit)
             ]
         }
 
