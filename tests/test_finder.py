@@ -2415,7 +2415,11 @@ def test_finder_schema_migrates_legacy_metadata_and_matches_safely(
         }
         scan_after = connection.execute(
             """SELECT corpus_search_complete, corpus_images_scored,
-                      corpus_galleries_scored
+                      corpus_galleries_scored, joytag_required_tags_json,
+                      joytag_required_tag_indices_json,
+                      joytag_excluded_tags_json,
+                      joytag_excluded_tag_indices_json,
+                      joytag_reject_threshold
                FROM finder_scans WHERE id = 'legacy'"""
         ).fetchone()
         result_after = connection.execute(
@@ -2470,6 +2474,11 @@ def test_finder_schema_migrates_legacy_metadata_and_matches_safely(
         ).fetchall()
     assert "reference_model_key" in scan_columns
     assert "ranking_version" in scan_columns
+    assert "joytag_required_tags_json" in scan_columns
+    assert "joytag_required_tag_indices_json" in scan_columns
+    assert "joytag_excluded_tags_json" in scan_columns
+    assert "joytag_excluded_tag_indices_json" in scan_columns
+    assert "joytag_reject_threshold" in scan_columns
     assert "metadata_json" in reference_columns
     assert "metadata_json" in cache_columns
     assert "matches_json" in result_columns
@@ -2478,6 +2487,11 @@ def test_finder_schema_migrates_legacy_metadata_and_matches_safely(
     assert scan_after["corpus_search_complete"] == 1
     assert scan_after["corpus_images_scored"] == 0
     assert scan_after["corpus_galleries_scored"] == 0
+    assert json.loads(scan_after["joytag_required_tags_json"]) == []
+    assert json.loads(scan_after["joytag_required_tag_indices_json"]) == []
+    assert json.loads(scan_after["joytag_excluded_tags_json"]) == []
+    assert json.loads(scan_after["joytag_excluded_tag_indices_json"]) == []
+    assert scan_after["joytag_reject_threshold"] == pytest.approx(0.4)
     assert result_after["online_scanned"] == 1
     assert json.loads(reference_metadata) == {}
     assert json.loads(cache_metadata) == {}

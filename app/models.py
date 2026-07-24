@@ -78,6 +78,13 @@ class FinderScanCreate(BaseModel):
     minimum_score: float = Field(default=0.7, ge=0, le=1)
     mode: Literal["pose", "joytag"] = "pose"
     joytag_tag: str | None = Field(default=None, min_length=1, max_length=200)
+    joytag_required_tags: list[Annotated[str, Field(min_length=1, max_length=200)]] = (
+        Field(default_factory=list, max_length=16)
+    )
+    joytag_excluded_tags: list[Annotated[str, Field(min_length=1, max_length=200)]] = (
+        Field(default_factory=list, max_length=16)
+    )
+    joytag_reject_threshold: float = Field(default=0.4, ge=0, le=1)
     reference_fingerprint: str | None = Field(
         default=None, min_length=64, max_length=64, pattern="^[0-9a-f]{64}$"
     )

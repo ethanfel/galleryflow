@@ -229,6 +229,7 @@
                   <div class="finder-joytag-empty" id="finder-joytag-empty">
                     <svg aria-hidden="true"><use href="#i-image"></use></svg>
                     <span><strong>No analysis yet</strong><small>Choose a folder and run JoyTag to inspect its strongest tags.</small></span>
+                    <div class="finder-joytag-saved-query" id="finder-joytag-saved-query" hidden></div>
                   </div>
                   <div class="finder-joytag-results" id="finder-joytag-results" hidden>
                     <div class="finder-joytag-meta">
@@ -236,18 +237,35 @@
                       <span><strong id="finder-joytag-provider">—</strong><small>provider</small></span>
                     </div>
                     <div class="finder-joytag-section-heading">
-                      <span><strong>Choose the search tag</strong><small>Folder averages and coverage</small></span>
-                      <label><span class="sr-only">Filter JoyTag tags</span><input id="finder-joytag-tag-filter" type="search" placeholder="Filter tags…" autocomplete="off" spellcheck="false"></label>
+                      <span><strong>Build the tag query</strong><small id="finder-joytag-list-copy">Top reference signals · click a name to require it</small></span>
+                      <label><span class="sr-only">Search the JoyTag catalog</span><input id="finder-joytag-tag-filter" type="search" placeholder="Search all tags…" autocomplete="off" spellcheck="false"></label>
                     </div>
-                    <div class="finder-joytag-tags" id="finder-joytag-tags" role="radiogroup" aria-label="JoyTag search tag"></div>
+                    <div class="finder-joytag-tags" id="finder-joytag-tags" role="list" aria-label="JoyTag query choices"></div>
+                    <section class="finder-joytag-query" aria-labelledby="finder-joytag-query-title">
+                      <header><span><small>Search rule</small><strong id="finder-joytag-query-title">Match every required tag</strong></span><i id="finder-joytag-query-count">0 required</i></header>
+                      <p>Every required tag must pass. If any excluded tag reaches the reject threshold, that image is removed.</p>
+                      <div class="finder-joytag-query-groups">
+                        <div class="finder-joytag-query-group is-required">
+                          <span><b>ALL required</b><small>Every signal must match</small></span>
+                          <div id="finder-joytag-required-tags" role="list" aria-label="Required JoyTag tags"></div>
+                        </div>
+                        <div class="finder-joytag-query-group is-excluded">
+                          <span><b>ANY excluded</b><small>One signal rejects the image</small></span>
+                          <div id="finder-joytag-excluded-tags" role="list" aria-label="Excluded JoyTag tags"></div>
+                        </div>
+                      </div>
+                      <div class="finder-joytag-thresholds">
+                        <label class="finder-joytag-threshold"><span>Required confidence <output id="finder-joytag-threshold-output" for="finder-joytag-threshold">0.40</output></span><small>Minimum score for every required tag.</small><input id="finder-joytag-threshold" type="range" min="0.05" max="0.95" step="0.01" value="0.40"></label>
+                        <label class="finder-joytag-threshold is-reject"><span>Reject confidence <output id="finder-joytag-reject-output" for="finder-joytag-reject-threshold">0.40</output></span><small>Any excluded tag at this score removes the image.</small><input id="finder-joytag-reject-threshold" type="range" min="0.05" max="0.95" step="0.01" value="0.40"></label>
+                      </div>
+                    </section>
                     <section class="finder-joytag-signal" aria-labelledby="finder-joytag-selected-tag">
-                      <header><span><small>Selected signal</small><strong id="finder-joytag-selected-tag">Choose a tag</strong></span><i id="finder-joytag-reference-coverage">0 / 0 pass</i></header>
+                      <header><span><small>Inspected signal</small><strong id="finder-joytag-selected-tag">Choose a tag</strong></span><i id="finder-joytag-reference-coverage">No signal</i></header>
                       <div class="finder-joytag-score-stats">
                         <span><small>Average</small><strong id="finder-joytag-average">—</strong></span>
                         <span><small>Minimum</small><strong id="finder-joytag-minimum">—</strong></span>
                         <span><small>Maximum</small><strong id="finder-joytag-maximum">—</strong></span>
                       </div>
-                      <label class="finder-joytag-threshold"><span>Candidate confidence <output id="finder-joytag-threshold-output" for="finder-joytag-threshold">0.40</output></span><small>Only images meeting this tag confidence become gallery suggestions.</small><input id="finder-joytag-threshold" type="range" min="0.05" max="0.95" step="0.01" value="0.40"></label>
                     </section>
                     <div class="finder-joytag-reference-heading"><strong>Reference images</strong><small id="finder-joytag-reference-copy">Scores update with the selected tag.</small></div>
                     <div class="finder-joytag-reference-grid" id="finder-joytag-reference-grid" aria-live="polite"></div>

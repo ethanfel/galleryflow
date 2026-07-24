@@ -58,6 +58,33 @@ class FakeJoyTag:
         return np.asarray(results, dtype=np.float32)
 
 
+class MultiTagJoyTag(FakeJoyTag):
+    tags = ("target_tag", "pose_tag", "blocked_tag")
+
+    def classify_many_bytes(self, payloads: list[bytes]) -> np.ndarray:
+        self.batch_calls.append(len(payloads))
+        results = []
+        for data in payloads:
+            with Image.open(io.BytesIO(data)) as image:
+                red, green, blue = image.convert("RGB").getpixel((0, 0))
+            if red > 200 and green > 200:
+                # Has the primary tag but misses the second required tag.
+                results.append((0.95, 0.60, 0.10))
+            elif blue > red and blue > green:
+                # Qualifies and remains just below the exclusion threshold.
+                results.append((0.90, 0.80, 0.39))
+            elif green > red and green > blue:
+                # Both positives qualify, but equality at the exclusion
+                # threshold must veto this image.
+                results.append((0.92, 0.82, 0.40))
+            elif red > green and red > blue:
+                # Reference image.
+                results.append((0.95, 0.85, 0.10))
+            else:
+                results.append((0.10, 0.10, 0.10))
+        return np.asarray(results, dtype=np.float32)
+
+
 class FakeEncoder:
     model_key = "unused-encoder"
 
@@ -143,8 +170,26 @@ class PagingScraper(FakeScraper):
         return await super().gallery(url)
 
 
+class MultiTagScraper(FakeScraper):
+    async def gallery(self, url: str) -> dict:
+        colors = ("blue", "green") if url == GALLERY else ("yellow",)
+        return {
+            "url": url,
+            "images": [
+                {
+                    "url": f"https://cdni.pornpics.com/full/{color}.png",
+                    "preview_remote_url": (
+                        f"https://cdni.pornpics.com/preview/{color}.png"
+                    ),
+                    "ordinal": index,
+                }
+                for index, color in enumerate(colors, 1)
+            ],
+        }
+
+
 async def fake_media(url: str, _: str) -> bytes:
-    for color in ("red", "blue", "green", "black"):
+    for color in ("red", "blue", "green", "yellow", "black"):
         if f"/{color}.png" in url:
             return image_bytes(color)
     raise AssertionError(f"Unexpected image URL: {url}")
@@ -594,5 +639,339 @@ async def test_joytag_scan_rechecks_reference_manifest_after_inference(
         failed = service.get_scan(scan["id"])
         assert failed["status"] == "failed"
         assert "changed while preparing" in failed["error"].lower()
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_joytag_multitag_and_negative_veto_share_cached_vectors(
+    tmp_path: Path,
+) -> None:
+    config, database, pose_tag_id = configured(tmp_path)
+    joytag = MultiTagJoyTag()
+    service = FinderService(
+        config,
+        database,
+        MultiTagScraper(),
+        EventBroker(),
+        encoder=FakeEncoder(),
+        joytagger=joytag,
+        media_fetcher=fake_media,
+    )
+    await service.start()
+    try:
+        analysis = await service.analyze_reference_directory("one-reference")
+        assert analysis["tag_catalog"] == [
+            "target_tag",
+            "pose_tag",
+            "blocked_tag",
+        ]
+        scan = service.create_scan(
+            example_directory="one-reference",
+            pose_tag_id=pose_tag_id,
+            source_url=ROOT,
+            page_limit=1,
+            minimum_score=0.7,
+            mode="joytag",
+            joytag_required_tags=["target_tag", "pose_tag"],
+            joytag_excluded_tags=["blocked_tag"],
+            joytag_reject_threshold=0.4,
+            reference_fingerprint=analysis["fingerprint"],
+        )
+        assert scan["joytag_tag"] == "target_tag"
+        assert scan["joytag_required_tags"] == ["target_tag", "pose_tag"]
+        assert scan["joytag_excluded_tags"] == ["blocked_tag"]
+        assert scan["joytag_reject_threshold"] == pytest.approx(0.4)
+
+        await asyncio.wait_for(service.queue.join(), 10)
+        completed = service.get_scan(scan["id"])
+        assert completed["joytag_required_tag_indices"] == [0, 1]
+        assert completed["joytag_excluded_tag_indices"] == [2]
+        results, total = service.results(
+            scan["id"],
+            review="pending",
+            min_score=None,
+            limit=20,
+            offset=0,
+        )
+        assert total == 1
+        assert results[0]["gallery_url"] == GALLERY
+        # Blue passes both positives and the exclusion. Green has stronger
+        # positive scores but is vetoed at blocked_tag == 0.40, and the result
+        # is not padded with either that image or the yellow positive-only miss.
+        assert len(results[0]["top_matches"]) == 1
+        match = results[0]["top_matches"][0]
+        assert match["image_url"].endswith("/blue.png")
+        assert match["score"] == pytest.approx(0.8)
+        assert match["tag"] == "target_tag"
+        assert match["tag_score"] == pytest.approx(0.8)
+        assert match["required_score"] == pytest.approx(0.8)
+        assert match["tag_scores"] == pytest.approx(
+            {
+                "target_tag": 230 / 255,
+                "pose_tag": 204 / 255,
+                "blocked_tag": 99 / 255,
+            }
+        )
+        assert match["required_tag_scores"] == pytest.approx(
+            {"target_tag": 230 / 255, "pose_tag": 204 / 255}
+        )
+        assert match["excluded_tag_scores"] == pytest.approx(
+            {"blocked_tag": 99 / 255}
+        )
+        assert match["max_excluded_score"] == pytest.approx(99 / 255)
+
+        calls_after_first = list(joytag.batch_calls)
+        # A different logical query uses the same complete cached vectors.
+        second = service.create_scan(
+            example_directory="one-reference",
+            pose_tag_id=pose_tag_id,
+            source_url=ROOT,
+            page_limit=1,
+            minimum_score=0.7,
+            mode="joytag",
+            joytag_required_tags=["target_tag"],
+            joytag_excluded_tags=["blocked_tag"],
+            joytag_reject_threshold=0.4,
+            reference_fingerprint=analysis["fingerprint"],
+        )
+        await asyncio.wait_for(service.queue.join(), 10)
+        assert service.get_scan(second["id"])["status"] == "completed"
+        assert joytag.batch_calls == calls_after_first
+
+        missing_reference = service.create_scan(
+            example_directory="one-reference",
+            pose_tag_id=pose_tag_id,
+            source_url=ROOT,
+            page_limit=1,
+            minimum_score=0.7,
+            mode="joytag",
+            joytag_required_tags=["target_tag", "blocked_tag"],
+            reference_fingerprint=analysis["fingerprint"],
+        )
+        await asyncio.wait_for(service.queue.join(), 10)
+        failed = service.get_scan(missing_reference["id"])
+        assert failed["status"] == "failed"
+        assert "blocked_tag" in failed["error"]
+        assert joytag.batch_calls == calls_after_first
+
+        with database.connect() as db:
+            cached = db.execute(
+                """SELECT COUNT(*) AS count, MIN(dimensions) AS minimum,
+                          MAX(dimensions) AS maximum
+                   FROM finder_joytag_cache"""
+            ).fetchone()
+        assert cached["count"] == 4
+        assert cached["minimum"] == cached["maximum"] == 3
+
+        with pytest.raises(ValueError, match="unique"):
+            service.create_scan(
+                example_directory="one-reference",
+                pose_tag_id=pose_tag_id,
+                source_url=ROOT,
+                page_limit=1,
+                minimum_score=0.7,
+                mode="joytag",
+                joytag_required_tags=["target_tag", "target_tag"],
+                reference_fingerprint=analysis["fingerprint"],
+            )
+        with pytest.raises(ValueError, match="disjoint"):
+            service.create_scan(
+                example_directory="one-reference",
+                pose_tag_id=pose_tag_id,
+                source_url=ROOT,
+                page_limit=1,
+                minimum_score=0.7,
+                mode="joytag",
+                joytag_required_tags=["target_tag"],
+                joytag_excluded_tags=["target_tag"],
+                reference_fingerprint=analysis["fingerprint"],
+            )
+        with pytest.raises(ValueError, match="at most 16"):
+            service.create_scan(
+                example_directory="one-reference",
+                pose_tag_id=pose_tag_id,
+                source_url=ROOT,
+                page_limit=1,
+                minimum_score=0.7,
+                mode="joytag",
+                joytag_required_tags=[f"tag-{index}" for index in range(17)],
+                reference_fingerprint=analysis["fingerprint"],
+            )
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_joytag_multitag_query_survives_pause_and_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, database, pose_tag_id = configured(tmp_path)
+    service = FinderService(
+        config,
+        database,
+        MultiTagScraper(),
+        EventBroker(),
+        encoder=FakeEncoder(),
+        joytagger=MultiTagJoyTag(),
+        media_fetcher=fake_media,
+    )
+    await service.start()
+    try:
+        analysis = await service.analyze_reference_directory("one-reference")
+        original_corpus_search = service._search_joytag_corpus
+        paused_once = False
+
+        async def pause_after_references(scan, query):
+            nonlocal paused_once
+            if not paused_once:
+                paused_once = True
+                service.pause(scan["id"])
+            await original_corpus_search(scan, query)
+
+        monkeypatch.setattr(
+            service,
+            "_search_joytag_corpus",
+            pause_after_references,
+        )
+        scan = service.create_scan(
+            example_directory="one-reference",
+            pose_tag_id=pose_tag_id,
+            source_url=ROOT,
+            page_limit=1,
+            minimum_score=0.7,
+            mode="joytag",
+            joytag_required_tags=["target_tag", "pose_tag"],
+            joytag_excluded_tags=["blocked_tag"],
+            joytag_reject_threshold=0.4,
+            reference_fingerprint=analysis["fingerprint"],
+        )
+        await asyncio.wait_for(service.queue.join(), 10)
+        paused = service.get_scan(scan["id"])
+        assert paused["status"] == "paused"
+        assert paused["reference_ready"] is True
+        assert paused["joytag_required_tags"] == ["target_tag", "pose_tag"]
+        assert paused["joytag_required_tag_indices"] == [0, 1]
+        assert paused["joytag_excluded_tags"] == ["blocked_tag"]
+        assert paused["joytag_excluded_tag_indices"] == [2]
+
+        monkeypatch.setattr(
+            service,
+            "_search_joytag_corpus",
+            original_corpus_search,
+        )
+        service.resume(scan["id"])
+        await asyncio.wait_for(service.queue.join(), 10)
+        completed = service.get_scan(scan["id"])
+        assert completed["status"] == "completed"
+        assert completed["joytag_required_tags"] == ["target_tag", "pose_tag"]
+        assert completed["joytag_excluded_tags"] == ["blocked_tag"]
+        results, total = service.results(
+            scan["id"],
+            review="pending",
+            min_score=None,
+            limit=20,
+            offset=0,
+        )
+        assert total == 1
+        assert [
+            match["image_url"].rsplit("/", 1)[-1]
+            for match in results[0]["top_matches"]
+        ] == ["blue.png"]
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_v212_joytag_scan_and_match_decode_and_extend(
+    tmp_path: Path,
+) -> None:
+    config, database, pose_tag_id = configured(tmp_path)
+    service = FinderService(
+        config,
+        database,
+        FakeScraper(),
+        EventBroker(),
+        encoder=FakeEncoder(),
+        joytagger=FakeJoyTag(),
+        media_fetcher=fake_media,
+    )
+    service.ensure_schema()
+    now = "2026-01-01T00:00:00+00:00"
+    scan_id = "v212-single-tag"
+    with database.connect() as db:
+        db.execute(
+            """INSERT INTO finder_scans(
+                   id, example_directory, reference_fingerprint,
+                   reference_model_key, reference_ready, reference_count,
+                   pose_tag_id, pose_tag_label, pose_tag_slug, pose_default_role,
+                   source_url, next_url, page_limit, pages_completed, minimum_score,
+                   ranking_version, search_mode, joytag_tag, joytag_tag_index,
+                   status, created_at, updated_at, finished_at
+               ) VALUES (?, 'one-reference', ?, 'fake-joytag-v1', 1, 1,
+                         ?, 'Target tag', 'target-tag', 'solo', ?, ?, 1, 1, 0.7,
+                         'joytag-v1', 'joytag', 'target_tag', 0,
+                         'completed', ?, ?, ?)""",
+            (scan_id, "a" * 64, pose_tag_id, ROOT, ROOT, now, now, now),
+        )
+        db.execute(
+            """INSERT INTO finder_results(
+                   id, scan_id, gallery_key, gallery_url, title,
+                   best_image_url, best_preview_remote_url, best_ordinal,
+                   score, ranking_tier, matches_json, images_scored, status,
+                   discovered_order, created_at, updated_at
+               ) VALUES (
+                   'v212-result', ?, 'v212-gallery', ?, 'Legacy tag result',
+                   'https://cdni.pornpics.com/full/blue.png',
+                   'https://cdni.pornpics.com/preview/blue.png', 1, 0.8, 1,
+                   ?, 1, 'completed', 1, ?, ?
+               )""",
+            (
+                scan_id,
+                GALLERY,
+                (
+                    '[{"image_url":"https://cdni.pornpics.com/full/blue.png",'
+                    '"preview_remote_url":'
+                    '"https://cdni.pornpics.com/preview/blue.png",'
+                    '"ordinal":1,"score":0.8,"tag":"target_tag",'
+                    '"tag_score":0.8,"ranking_tier":1}]'
+                ),
+                now,
+                now,
+            ),
+        )
+
+    scan = service.get_scan(scan_id)
+    assert scan["joytag_tag"] == "target_tag"
+    assert scan["joytag_required_tags"] == ["target_tag"]
+    assert scan["joytag_excluded_tags"] == []
+    assert scan["joytag_reject_threshold"] == pytest.approx(0.4)
+    assert scan["joytag_required_tag_indices"] == []
+
+    results, total = service.results(
+        scan_id,
+        review="pending",
+        min_score=None,
+        limit=20,
+        offset=0,
+    )
+    assert total == 1
+    match = results[0]["top_matches"][0]
+    assert match["tag"] == "target_tag"
+    assert match["tag_score"] == pytest.approx(0.8)
+    assert match["tag_scores"] == pytest.approx({"target_tag": 0.8})
+    assert match["required_tag_scores"] == pytest.approx({"target_tag": 0.8})
+
+    await service.start()
+    try:
+        service.extend(scan_id, additional_pages=1)
+        await asyncio.wait_for(service.queue.join(), 10)
+        extended = service.get_scan(scan_id)
+        assert extended["status"] == "completed"
+        assert extended["pages_completed"] == 2
+        assert extended["joytag_required_tags"] == ["target_tag"]
+        assert extended["joytag_required_tag_indices"] == [0]
+        assert extended["joytag_excluded_tag_indices"] == []
     finally:
         await service.stop()

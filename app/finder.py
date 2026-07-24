@@ -58,6 +58,8 @@ MAX_FEEDBACK_DECISIONS_PER_POSE = 256
 MAX_FEEDBACK_ADJUSTMENT = 0.08
 HARD_NEGATIVE_MIN_AFFINITY = 0.82
 HARD_NEGATIVE_MARGIN = 0.04
+MAX_JOYTAG_QUERY_TAGS = 16
+DEFAULT_JOYTAG_REJECT_THRESHOLD = 0.4
 
 try:
     from .vision import perceptual_hash_bytes as _perceptual_hash_bytes
@@ -108,6 +110,20 @@ class _FeedbackProfile:
             accepted_galleries >= MIN_FEEDBACK_GALLERIES_PER_STATE
             or rejected_galleries >= MIN_FEEDBACK_GALLERIES_PER_STATE
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _JoyTagQuery:
+    required_tags: tuple[str, ...]
+    required_indices: tuple[int, ...]
+    excluded_tags: tuple[str, ...]
+    excluded_indices: tuple[int, ...]
+    minimum_score: float
+    reject_threshold: float
+
+    @property
+    def primary_tag(self) -> str:
+        return self.required_tags[0]
 
 
 class FinderService:
@@ -195,6 +211,11 @@ class FinderService:
                     search_mode TEXT NOT NULL DEFAULT 'pose',
                     joytag_tag TEXT NOT NULL DEFAULT '',
                     joytag_tag_index INTEGER,
+                    joytag_required_tags_json TEXT NOT NULL DEFAULT '[]',
+                    joytag_required_tag_indices_json TEXT NOT NULL DEFAULT '[]',
+                    joytag_excluded_tags_json TEXT NOT NULL DEFAULT '[]',
+                    joytag_excluded_tag_indices_json TEXT NOT NULL DEFAULT '[]',
+                    joytag_reject_threshold REAL NOT NULL DEFAULT 0.4,
                     status TEXT NOT NULL,
                     total_galleries INTEGER NOT NULL DEFAULT 0,
                     processed_galleries INTEGER NOT NULL DEFAULT 0,
@@ -382,6 +403,15 @@ class FinderService:
                     "search_mode": "TEXT NOT NULL DEFAULT 'pose'",
                     "joytag_tag": "TEXT NOT NULL DEFAULT ''",
                     "joytag_tag_index": "INTEGER",
+                    "joytag_required_tags_json": "TEXT NOT NULL DEFAULT '[]'",
+                    "joytag_required_tag_indices_json": (
+                        "TEXT NOT NULL DEFAULT '[]'"
+                    ),
+                    "joytag_excluded_tags_json": "TEXT NOT NULL DEFAULT '[]'",
+                    "joytag_excluded_tag_indices_json": (
+                        "TEXT NOT NULL DEFAULT '[]'"
+                    ),
+                    "joytag_reject_threshold": "REAL NOT NULL DEFAULT 0.4",
                 },
                 "finder_scan_references": {
                     "metadata_json": "TEXT NOT NULL DEFAULT '{}'",
@@ -525,6 +555,224 @@ class FinderService:
     @staticmethod
     def _joytag_threshold(value: float) -> float:
         return float(np.rint(max(0.0, min(1.0, float(value))) * 255.0) / 255.0)
+
+    @staticmethod
+    def _decode_json_strings(value: Any) -> tuple[str, ...]:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return ()
+        if not isinstance(value, (list, tuple)):
+            return ()
+        result: list[str] = []
+        seen: set[str] = set()
+        for raw in value:
+            if not isinstance(raw, str):
+                continue
+            item = raw.strip()
+            if not item or len(item) > 200 or item in seen:
+                continue
+            result.append(item)
+            seen.add(item)
+            if len(result) >= MAX_JOYTAG_QUERY_TAGS:
+                break
+        return tuple(result)
+
+    @staticmethod
+    def _decode_json_indices(value: Any) -> tuple[int, ...]:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return ()
+        if not isinstance(value, (list, tuple)):
+            return ()
+        result: list[int] = []
+        for raw in value[:MAX_JOYTAG_QUERY_TAGS]:
+            try:
+                index = int(raw)
+            except (TypeError, ValueError):
+                return ()
+            if index < 0:
+                return ()
+            result.append(index)
+        return tuple(result)
+
+    @staticmethod
+    def _validate_joytag_names(
+        values: list[str] | tuple[str, ...] | None,
+        *,
+        label: str,
+    ) -> tuple[str, ...]:
+        if values is None:
+            return ()
+        if not isinstance(values, (list, tuple)):
+            raise ValueError(f"{label} must be a list of JoyTag tags")
+        if len(values) > MAX_JOYTAG_QUERY_TAGS:
+            raise ValueError(
+                f"{label} may contain at most {MAX_JOYTAG_QUERY_TAGS} tags"
+            )
+        result: list[str] = []
+        seen: set[str] = set()
+        for raw in values:
+            if not isinstance(raw, str):
+                raise ValueError(f"{label} must contain only tag names")
+            item = raw.strip()
+            if not item:
+                raise ValueError(f"{label} cannot contain an empty tag")
+            if len(item) > 200:
+                raise ValueError(f"{label} tags may contain at most 200 characters")
+            if item in seen:
+                raise ValueError(f"{label} must contain unique tags")
+            result.append(item)
+            seen.add(item)
+        return tuple(result)
+
+    @classmethod
+    def _canonical_joytag_tags(
+        cls,
+        joytag_tag: str | None,
+        required: list[str] | tuple[str, ...] | None,
+        excluded: list[str] | tuple[str, ...] | None,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        required_tags = cls._validate_joytag_names(
+            required,
+            label="Required JoyTag tags",
+        )
+        legacy = (joytag_tag or "").strip()
+        if len(legacy) > 200:
+            raise ValueError("The selected JoyTag tag is too long")
+        if not required_tags and legacy:
+            required_tags = (legacy,)
+        if not required_tags:
+            raise ValueError(
+                "Choose at least one required JoyTag tag before starting a tag search"
+            )
+        excluded_tags = cls._validate_joytag_names(
+            excluded,
+            label="Excluded JoyTag tags",
+        )
+        overlap = set(required_tags).intersection(excluded_tags)
+        if overlap:
+            raise ValueError(
+                "Required and excluded JoyTag tags must be disjoint: "
+                + ", ".join(sorted(overlap))
+            )
+        return required_tags, excluded_tags
+
+    @classmethod
+    def _joytag_query_from_scan(
+        cls,
+        scan: dict[str, Any],
+        vocabulary: tuple[str, ...],
+    ) -> _JoyTagQuery:
+        required = cls._decode_json_strings(scan.get("joytag_required_tags"))
+        if not required:
+            required = cls._decode_json_strings(
+                scan.get("joytag_required_tags_json")
+            )
+        legacy = str(scan.get("joytag_tag") or "").strip()
+        if not required and legacy:
+            # v2.12 stored only the singular field. Keep those queued, paused,
+            # completed, and extendable scans usable after the schema upgrade.
+            required = (legacy,)
+        excluded = cls._decode_json_strings(scan.get("joytag_excluded_tags"))
+        if not excluded:
+            excluded = cls._decode_json_strings(
+                scan.get("joytag_excluded_tags_json")
+            )
+        overlap = set(required).intersection(excluded)
+        if not required or overlap:
+            raise FinderConflict("The saved JoyTag query is inconsistent")
+        index_by_tag = {tag: index for index, tag in enumerate(vocabulary)}
+        missing = [tag for tag in (*required, *excluded) if tag not in index_by_tag]
+        if missing:
+            raise FinderConflict(
+                "The selected JoyTag tag is not available: " + ", ".join(missing)
+            )
+        return _JoyTagQuery(
+            required_tags=required,
+            required_indices=tuple(index_by_tag[tag] for tag in required),
+            excluded_tags=excluded,
+            excluded_indices=tuple(index_by_tag[tag] for tag in excluded),
+            minimum_score=cls._joytag_threshold(float(scan["minimum_score"])),
+            reject_threshold=cls._joytag_threshold(
+                float(
+                    scan.get(
+                        "joytag_reject_threshold",
+                        DEFAULT_JOYTAG_REJECT_THRESHOLD,
+                    )
+                )
+            ),
+        )
+
+    @staticmethod
+    def _joytag_match(
+        scores: np.ndarray,
+        query: _JoyTagQuery,
+    ) -> dict[str, Any] | None:
+        required_scores = {
+            tag: float(scores[index])
+            for tag, index in zip(
+                query.required_tags,
+                query.required_indices,
+                strict=True,
+            )
+        }
+        if any(
+            score + 1e-9 < query.minimum_score
+            for score in required_scores.values()
+        ):
+            return None
+        excluded_scores = {
+            tag: float(scores[index])
+            for tag, index in zip(
+                query.excluded_tags,
+                query.excluded_indices,
+                strict=True,
+            )
+        }
+        if any(
+            score + 1e-9 >= query.reject_threshold
+            for score in excluded_scores.values()
+        ):
+            return None
+        required_score = min(required_scores.values())
+        tag_scores = {**required_scores, **excluded_scores}
+        return {
+            "score": required_score,
+            "base_score": required_score,
+            "appearance_score": required_score,
+            "tag_score": required_score,
+            "tag": query.primary_tag,
+            "tag_scores": tag_scores,
+            "required_tag_scores": required_scores,
+            "excluded_tag_scores": excluded_scores,
+            "required_score": required_score,
+            "max_excluded_score": (
+                max(excluded_scores.values()) if excluded_scores else None
+            ),
+            "ranking_tier": 1,
+        }
+
+    @staticmethod
+    def _normalized_tag_score_map(value: Any) -> dict[str, float]:
+        if not isinstance(value, dict):
+            return {}
+        normalized: dict[str, float] = {}
+        for raw_tag, raw_score in value.items():
+            if len(normalized) >= MAX_JOYTAG_QUERY_TAGS * 2:
+                break
+            tag = str(raw_tag).strip()
+            try:
+                score = float(raw_score)
+            except (TypeError, ValueError):
+                continue
+            if not tag or len(tag) > 200 or not np.isfinite(score):
+                continue
+            normalized[tag] = max(0.0, min(1.0, score))
+        return normalized
 
     def _backfill_corpus_associations(self, db: Any) -> None:
         """Recover partial gallery membership from durable historical top matches.
@@ -1855,12 +2103,13 @@ class FinderService:
             "provider": provider_status.get("active") or "",
             "quantization": "uint8",
             "bytes_per_cached_image": len(tags),
+            "tag_catalog": list(tags),
             "tags": tag_items,
             "images": images,
         }
 
-    @staticmethod
-    def _decode_scan(row: Any) -> dict[str, Any]:
+    @classmethod
+    def _decode_scan(cls, row: Any) -> dict[str, Any]:
         scan = dict(row)
         scan["cancel_requested"] = bool(scan["cancel_requested"])
         scan["pause_requested"] = bool(scan["pause_requested"])
@@ -1873,7 +2122,40 @@ class FinderService:
             or scan.get("ranking_version") == JOYTAG_RANKING_VERSION
             else "pose"
         )
-        scan["joytag_tag"] = str(scan.get("joytag_tag") or "")
+        legacy_tag = str(scan.get("joytag_tag") or "").strip()
+        required_tags = cls._decode_json_strings(
+            scan.pop("joytag_required_tags_json", "[]")
+        )
+        if scan["search_mode"] == "joytag" and not required_tags and legacy_tag:
+            required_tags = (legacy_tag,)
+        excluded_tags = cls._decode_json_strings(
+            scan.pop("joytag_excluded_tags_json", "[]")
+        )
+        scan["joytag_required_tags"] = list(required_tags)
+        scan["joytag_excluded_tags"] = list(excluded_tags)
+        scan["joytag_tag"] = required_tags[0] if required_tags else legacy_tag
+        scan["joytag_required_tag_indices"] = list(
+            cls._decode_json_indices(
+                scan.pop("joytag_required_tag_indices_json", "[]")
+            )
+        )
+        scan["joytag_excluded_tag_indices"] = list(
+            cls._decode_json_indices(
+                scan.pop("joytag_excluded_tag_indices_json", "[]")
+            )
+        )
+        try:
+            reject_threshold = float(
+                scan.get(
+                    "joytag_reject_threshold",
+                    DEFAULT_JOYTAG_REJECT_THRESHOLD,
+                )
+            )
+        except (TypeError, ValueError):
+            reject_threshold = DEFAULT_JOYTAG_REJECT_THRESHOLD
+        scan["joytag_reject_threshold"] = cls._joytag_threshold(
+            reject_threshold
+        )
         scan["ranking_current"] = (
             scan.get("ranking_version") in CURRENT_RANKING_VERSIONS
         )
@@ -1990,6 +2272,9 @@ class FinderService:
         minimum_score: float,
         mode: str = "pose",
         joytag_tag: str | None = None,
+        joytag_required_tags: list[str] | tuple[str, ...] | None = None,
+        joytag_excluded_tags: list[str] | tuple[str, ...] | None = None,
+        joytag_reject_threshold: float = DEFAULT_JOYTAG_REJECT_THRESHOLD,
         reference_fingerprint: str | None = None,
     ) -> dict[str, Any]:
         if mode not in {"pose", "joytag"}:
@@ -2007,21 +2292,37 @@ class FinderService:
         tag = self.database.get_pose_tag(pose_tag_id)
         if not tag:
             raise FinderNotFound("Pose tag not found")
-        selected_tag = (joytag_tag or "").strip()
+        selected_tag = ""
+        required_tags: tuple[str, ...] = ()
+        excluded_tags: tuple[str, ...] = ()
         if mode == "joytag":
-            if not selected_tag:
-                raise ValueError("Choose a JoyTag tag before starting a tag search")
+            required_tags, excluded_tags = self._canonical_joytag_tags(
+                joytag_tag,
+                joytag_required_tags,
+                joytag_excluded_tags,
+            )
+            selected_tag = required_tags[0]
             if not reference_fingerprint:
                 raise ValueError(
                     "Analyze the reference folder before starting a tag search"
                 )
-            if self._joytag_ready and selected_tag not in tuple(
-                str(value) for value in getattr(self.joytagger, "tags", ())
-            ):
-                raise ValueError("The selected JoyTag tag is not available")
+            if self._joytag_ready:
+                vocabulary = {
+                    str(value) for value in getattr(self.joytagger, "tags", ())
+                }
+                missing = [
+                    tag
+                    for tag in (*required_tags, *excluded_tags)
+                    if tag not in vocabulary
+                ]
+                if missing:
+                    raise ValueError(
+                        "The selected JoyTag tag is not available: "
+                        + ", ".join(missing)
+                    )
         else:
-            selected_tag = ""
             reference_fingerprint = None
+            joytag_reject_threshold = DEFAULT_JOYTAG_REJECT_THRESHOLD
         ranking_version = (
             JOYTAG_RANKING_VERSION
             if mode == "joytag"
@@ -2029,6 +2330,9 @@ class FinderService:
         )
         if mode == "joytag":
             minimum_score = self._joytag_threshold(minimum_score)
+            joytag_reject_threshold = self._joytag_threshold(
+                joytag_reject_threshold
+            )
         scan_id = uuid.uuid4().hex
         now = utc_now()
         with self._lock, self.database.connect() as db:
@@ -2037,10 +2341,13 @@ class FinderService:
                        id, example_directory, pose_tag_id, pose_tag_label,
                        pose_tag_slug, pose_default_role, source_url, next_url,
                        page_limit, minimum_score, ranking_version, search_mode,
-                       joytag_tag, reference_fingerprint, status,
+                       joytag_tag, joytag_required_tags_json,
+                       joytag_excluded_tags_json, joytag_reject_threshold,
+                       reference_fingerprint, status,
                        created_at, updated_at
                    ) VALUES (
-                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       'queued', ?, ?
                    )""",
                 (
                     scan_id,
@@ -2056,6 +2363,15 @@ class FinderService:
                     ranking_version,
                     mode,
                     selected_tag,
+                    json.dumps(
+                        required_tags,
+                        separators=(",", ":"),
+                    ),
+                    json.dumps(
+                        excluded_tags,
+                        separators=(",", ":"),
+                    ),
+                    joytag_reject_threshold,
                     reference_fingerprint or "",
                     now,
                     now,
@@ -2076,6 +2392,8 @@ class FinderService:
             "reference_count",
             "ranking_version",
             "joytag_tag_index",
+            "joytag_required_tag_indices_json",
+            "joytag_excluded_tag_indices_json",
             "next_url",
             "pages_completed",
             "status",
@@ -2427,6 +2745,38 @@ class FinderService:
                 numeric_scores = (*numeric_scores, pose)
             if not all(np.isfinite(value) for value in numeric_scores):
                 continue
+            tag_scores = cls._normalized_tag_score_map(item.get("tag_scores"))
+            required_tag_scores = cls._normalized_tag_score_map(
+                item.get("required_tag_scores")
+            )
+            excluded_tag_scores = cls._normalized_tag_score_map(
+                item.get("excluded_tag_scores")
+            )
+            tag_name = str(item.get("tag") or "").strip()
+            if (
+                ranking_version == JOYTAG_RANKING_VERSION
+                and not required_tag_scores
+                and tag_name
+            ):
+                # v2.12 matches stored only the selected tag and its scalar
+                # score. Synthesize the richer diagnostic without rewriting
+                # historical matches_json rows.
+                required_tag_scores = {tag_name: max(0.0, min(1.0, tag_score))}
+            tag_scores = {
+                **tag_scores,
+                **required_tag_scores,
+                **excluded_tag_scores,
+            }
+            required_score = (
+                min(required_tag_scores.values())
+                if required_tag_scores
+                else tag_score
+            )
+            max_excluded_score = (
+                max(excluded_tag_scores.values())
+                if excluded_tag_scores
+                else None
+            )
             image_url = str(item.get("image_url") or item.get("url") or "")
             preview = str(
                 item.get("preview_remote_url") or item.get("preview_url") or ""
@@ -2488,8 +2838,13 @@ class FinderService:
                 "feedback_applied": abs(feedback_adjustment) > 1e-9,
                 "ranking_tier": ranking_tier,
                 "appearance_score": max(0.0, min(1.0, appearance)),
-                "tag": str(item.get("tag") or ""),
+                "tag": tag_name,
                 "tag_score": max(0.0, min(1.0, tag_score)),
+                "tag_scores": tag_scores,
+                "required_tag_scores": required_tag_scores,
+                "excluded_tag_scores": excluded_tag_scores,
+                "required_score": max(0.0, min(1.0, required_score)),
+                "max_excluded_score": max_excluded_score,
                 "exact_score": max(0.0, min(1.0, exact)),
                 "pose_score": None if pose is None else max(0.0, min(1.0, pose)),
                 "person_count": (
@@ -3267,6 +3622,9 @@ class FinderService:
             "ranking_current",
             "search_mode",
             "joytag_tag",
+            "joytag_required_tags",
+            "joytag_excluded_tags",
+            "joytag_reject_threshold",
             "extendable",
             "continuable",
             "source_url",
@@ -4176,25 +4534,53 @@ class FinderService:
         )
         return references
 
-    async def _prepare_joytag_scan(self, scan: dict[str, Any]) -> int:
+    async def _prepare_joytag_scan(self, scan: dict[str, Any]) -> _JoyTagQuery:
         await self._ensure_joytag_ready()
         tags = tuple(str(tag) for tag in getattr(self.joytagger, "tags", ()))
-        selected_tag = str(scan.get("joytag_tag") or "")
-        try:
-            tag_index = tags.index(selected_tag)
-        except ValueError as exc:
-            raise FinderConflict(
-                f"The selected JoyTag tag is not available: {selected_tag}"
-            ) from exc
+        query = self._joytag_query_from_scan(scan, tags)
         if scan.get("reference_ready"):
             if scan.get("reference_model_key") != self._joytag_model_key:
                 raise FinderConflict(
                     "The JoyTag model changed; start a new tag search"
                 )
             stored_index = scan.get("joytag_tag_index")
-            if stored_index is not None and int(stored_index) != tag_index:
+            if (
+                stored_index is not None
+                and int(stored_index) != query.required_indices[0]
+            ):
                 raise FinderConflict("The saved JoyTag selection is inconsistent")
-            return tag_index
+            stored_required = self._decode_json_indices(
+                scan.get("joytag_required_tag_indices")
+            )
+            stored_excluded = self._decode_json_indices(
+                scan.get("joytag_excluded_tag_indices")
+            )
+            if stored_required:
+                if (
+                    stored_required != query.required_indices
+                    or stored_excluded != query.excluded_indices
+                ):
+                    raise FinderConflict("The saved JoyTag selection is inconsistent")
+            else:
+                if len(query.required_indices) != 1 or query.excluded_indices:
+                    # Only v2.12 singular queries can legitimately be
+                    # reference-ready without the list-based frozen mapping.
+                    raise FinderConflict("The saved JoyTag selection is inconsistent")
+                # A reference-ready v2.12 scan has only joytag_tag_index.
+                # Persist the equivalent list lazily when it is resumed or
+                # extended, without rebuilding references or cached vectors.
+                self._update_scan(
+                    scan["id"],
+                    joytag_required_tag_indices_json=json.dumps(
+                        query.required_indices,
+                        separators=(",", ":"),
+                    ),
+                    joytag_excluded_tag_indices_json=json.dumps(
+                        query.excluded_indices,
+                        separators=(",", ":"),
+                    ),
+                )
+            return query
 
         directory, _ = self._resolve_example_directory(scan["example_directory"])
         files = self._example_files(directory)
@@ -4216,7 +4602,7 @@ class FinderService:
             raise FinderConflict(
                 "Reference images changed after analysis; analyze the folder again"
             )
-        scores: list[float] = []
+        scores: list[np.ndarray] = []
         batch_size = self.config.finder_inference_batch_size
         for start in range(0, len(manifest), batch_size):
             prepared: list[tuple[bytes, str]] = []
@@ -4235,7 +4621,7 @@ class FinderService:
             for outcome in outcomes:
                 if isinstance(outcome, BaseException):
                     raise outcome
-                scores.append(float(outcome[tag_index]))
+                scores.append(np.asarray(outcome, dtype=np.float32))
         if not scores:
             raise FinderConflict("The tag search has no reference images")
         # Re-read the complete manifest after inference.  Per-batch digest
@@ -4257,19 +4643,38 @@ class FinderService:
             raise FinderConflict(
                 "Reference images changed while preparing the tag search"
             )
-        if max(scores) + 1e-9 < float(scan["minimum_score"]):
+        missing_required = [
+            tag
+            for tag, index in zip(
+                query.required_tags,
+                query.required_indices,
+                strict=True,
+            )
+            if max(float(values[index]) for values in scores) + 1e-9
+            < query.minimum_score
+        ]
+        if missing_required:
             raise FinderConflict(
-                "No reference image reaches the selected JoyTag threshold"
+                "No reference image reaches the selected JoyTag threshold for: "
+                + ", ".join(missing_required)
             )
         self._update_scan(
             scan["id"],
             reference_ready=1,
             reference_count=len(scores),
             reference_model_key=self._joytag_model_key,
-            joytag_tag_index=tag_index,
+            joytag_tag_index=query.required_indices[0],
+            joytag_required_tag_indices_json=json.dumps(
+                query.required_indices,
+                separators=(",", ":"),
+            ),
+            joytag_excluded_tag_indices_json=json.dumps(
+                query.excluded_indices,
+                separators=(",", ":"),
+            ),
             status="scanning",
         )
-        return tag_index
+        return query
 
     def _load_scan_references(self, scan_id: str) -> np.ndarray:
         with self._lock, self.database.connect() as db:
@@ -5249,7 +5654,7 @@ class FinderService:
     async def _search_joytag_corpus(
         self,
         scan: dict[str, Any],
-        tag_index: int,
+        query: _JoyTagQuery,
     ) -> None:
         current = self.get_scan(scan["id"])
         if not current or current["corpus_search_complete"]:
@@ -5260,8 +5665,7 @@ class FinderService:
             corpus_images_scored=0,
             corpus_galleries_scored=0,
         )
-        minimum_score = float(current["minimum_score"])
-        selected_tag = str(current["joytag_tag"])
+        minimum_score = query.minimum_score
         after: tuple[str, int, str] | None = None
         active_key = ""
         active_card: dict[str, Any] | None = None
@@ -5337,20 +5741,15 @@ class FinderService:
                     continue
                 active_images += 1
                 images_scored += 1
-                score = float(outcome[tag_index])
-                if score + 1e-9 < minimum_score:
+                match = self._joytag_match(outcome, query)
+                if match is None:
                     continue
                 active_matches.append(
                     {
                         "image_url": str(row["image_url"]),
                         "preview_remote_url": str(row["preview_remote_url"]),
                         "ordinal": int(row["ordinal"]),
-                        "score": score,
-                        "base_score": score,
-                        "appearance_score": score,
-                        "tag_score": score,
-                        "tag": selected_tag,
-                        "ranking_tier": 1,
+                        **match,
                     }
                 )
             final_row = rows[-1]
@@ -5804,7 +6203,7 @@ class FinderService:
         scan: dict[str, Any],
         card: dict,
         order: int,
-        tag_index: int,
+        query: _JoyTagQuery,
     ) -> None:
         gallery_url = validate_source_url(card["url"])
         if self._result_complete(scan["id"], gallery_url):
@@ -5828,8 +6227,6 @@ class FinderService:
                 images,
             )
 
-            minimum_score = float(scan["minimum_score"])
-            selected_tag = str(scan["joytag_tag"])
             scored = 0
             qualified: list[dict[str, Any]] = []
             batch_size = self.config.finder_inference_batch_size
@@ -5861,8 +6258,8 @@ class FinderService:
                     if isinstance(outcome, BaseException):
                         continue
                     scored += 1
-                    score = float(outcome[tag_index])
-                    if score + 1e-9 < minimum_score:
+                    match = self._joytag_match(outcome, query)
+                    if match is None:
                         continue
                     qualified.append(
                         {
@@ -5871,12 +6268,7 @@ class FinderService:
                                 image.get("preview_remote_url") or ""
                             ),
                             "ordinal": int(image["ordinal"]),
-                            "score": score,
-                            "base_score": score,
-                            "appearance_score": score,
-                            "tag_score": score,
-                            "tag": selected_tag,
-                            "ranking_tier": 1,
+                            **match,
                         }
                     )
             if not scored:
@@ -5884,7 +6276,7 @@ class FinderService:
             matches = self._normalized_top_matches(
                 qualified,
                 ranking_version=JOYTAG_RANKING_VERSION,
-                minimum_score=minimum_score,
+                minimum_score=query.minimum_score,
             )
             self._save_result(
                 scan["id"],
@@ -5921,9 +6313,9 @@ class FinderService:
     async def _run_joytag_scan(self, scan: dict[str, Any]) -> None:
         if scan.get("ranking_version") != JOYTAG_RANKING_VERSION:
             raise FinderConflict("This is not a current JoyTag Finder scan")
-        tag_index = await self._prepare_joytag_scan(scan)
+        query = await self._prepare_joytag_scan(scan)
         self._check_control(scan["id"])
-        await self._search_joytag_corpus(scan, tag_index)
+        await self._search_joytag_corpus(scan, query)
         self._check_control(scan["id"])
         self._update_scan(scan["id"], status="scanning", error="")
         while True:
@@ -5975,7 +6367,7 @@ class FinderService:
                             current,
                             card,
                             order_base + start + index,
-                            tag_index,
+                            query,
                         )
                         for index, card in enumerate(batch)
                     ),

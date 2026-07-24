@@ -103,8 +103,11 @@
     finderReferenceAnalysisError: '',
     finderReferenceAnalysisRequest: 0,
     finderJoytagSelectedTag: '',
+    finderJoytagRequiredTags: [],
+    finderJoytagExcludedTags: [],
     finderJoytagTagFilter: '',
     finderJoytagThreshold: Math.max(0.05, Math.min(0.95, Number(storage.get('finder-joytag-threshold', 0.4)) || 0.4)),
+    finderJoytagRejectThreshold: Math.max(0.05, Math.min(0.95, Number(storage.get('finder-joytag-reject-threshold', 0.4)) || 0.4)),
     finderJoytagAutoPoseLabel: '',
     finderLoaded: false,
     finderLoading: false,
@@ -124,6 +127,8 @@
   const FINDER_TERMINAL_STATES = ['completed', 'completed_with_errors', 'complete', 'done', 'failed', 'cancelled', 'canceled'];
   const FINDER_MAX_PAGES = 500;
   const FINDER_RESULTS_PAGE_SIZE = 24;
+  const FINDER_JOYTAG_QUERY_LIMIT = 16;
+  const FINDER_JOYTAG_CATALOG_RENDER_LIMIT = 80;
   const FINDER_RANKING_VERSION = 'pose-precision-v2';
   const FINDER_JOYTAG_RANKING_VERSION = 'joytag-v1';
   const poseRoleLabel = role => ({ solo: 'Solo', couple: 'Couple', group: 'Group' }[role] || 'Solo');
@@ -2288,6 +2293,20 @@
     };
   }
 
+  function normalizeFinderTagList(value, { limit = FINDER_JOYTAG_QUERY_LIMIT } = {}) {
+    if (!Array.isArray(value)) return [];
+    const seen = new Set();
+    const tags = [];
+    for (const raw of value) {
+      const tag = String(raw || '').trim();
+      if (!tag || seen.has(tag)) continue;
+      seen.add(tag);
+      tags.push(tag);
+      if (tags.length >= limit) break;
+    }
+    return tags;
+  }
+
   function normalizeFinderReferenceAnalysis(item) {
     const analysis = item?.analysis && typeof item.analysis === 'object' ? item.analysis : item;
     if (!analysis || typeof analysis !== 'object' || Array.isArray(analysis)) return null;
@@ -2311,7 +2330,14 @@
       };
     }).filter(Boolean);
     if (!tags.length) return null;
-    const knownTags = new Set(tags.map(item => item.tag));
+    const tagCatalog = normalizeFinderTagList(
+      [
+        ...(Array.isArray(analysis.tag_catalog) ? analysis.tag_catalog : []),
+        ...tags.map(item => item.tag)
+      ],
+      { limit: Number.MAX_SAFE_INTEGER }
+    );
+    const knownTags = new Set(tagCatalog);
     const images = rawImages.map(item => {
       const scores = {};
       if (item?.scores && typeof item.scores === 'object' && !Array.isArray(item.scores)) {
@@ -2336,6 +2362,7 @@
       quantization: String(analysis.quantization || ''),
       bytesPerCachedImage: Math.max(0, Number(analysis.bytes_per_cached_image || 0)),
       tags,
+      tagCatalog,
       images
     };
   }
@@ -2403,6 +2430,19 @@
     if (!Number.isFinite(percentage)) percentage = pagesTotal ? (pagesScanned / pagesTotal) * 100 : 0;
     if (percentage > 0 && percentage <= 1) percentage *= 100;
     const poseTag = scan.pose_tag && typeof scan.pose_tag === 'object' ? scan.pose_tag : {};
+    const joytagTag = String(scan.joytag_tag || config.joytag_tag || '').trim();
+    const joytagRequiredTags = normalizeFinderTagList(
+      scan.joytag_required_tags ?? config.joytag_required_tags
+    );
+    if (!joytagRequiredTags.length && joytagTag) joytagRequiredTags.push(joytagTag);
+    const requiredSet = new Set(joytagRequiredTags);
+    const joytagExcludedTags = normalizeFinderTagList(
+      scan.joytag_excluded_tags ?? config.joytag_excluded_tags
+    ).filter(tag => !requiredSet.has(tag));
+    const joytagRejectThreshold = normalizeFinderScore(
+      scan.joytag_reject_threshold ?? config.joytag_reject_threshold,
+      0.4
+    );
     return {
       ...scan,
       id: scan.id ?? scan.scan_id,
@@ -2413,7 +2453,10 @@
       poseTagSlug: String(scan.pose_tag_slug || poseTag.slug || ''),
       poseDefaultRole: POSE_ROLES.includes(scan.pose_default_role || poseTag.default_role) ? (scan.pose_default_role || poseTag.default_role) : 'solo',
       searchMode,
-      joytagTag: String(scan.joytag_tag || config.joytag_tag || ''),
+      joytagTag: joytagRequiredTags[0] || joytagTag,
+      joytagRequiredTags,
+      joytagExcludedTags,
+      joytagRejectThreshold,
       referenceFingerprint: String(scan.reference_fingerprint || config.reference_fingerprint || ''),
       sourceUrl: String(scan.source_url || config.source_url || scan.url || ''),
       nextUrl,
@@ -2467,6 +2510,26 @@
       if (score !== null) return score;
     }
     return null;
+  }
+
+  function normalizeFinderTagScores(value, fallback = {}) {
+    const source = value && typeof value === 'object' && !Array.isArray(value)
+      ? value
+      : {};
+    const scores = {};
+    Object.entries(source).forEach(([rawTag, rawScore]) => {
+      const tag = String(rawTag || '').trim();
+      const score = normalizeFinderScore(rawScore);
+      if (tag && score !== null) scores[tag] = score;
+    });
+    if (!Object.keys(scores).length && fallback && typeof fallback === 'object') {
+      Object.entries(fallback).forEach(([rawTag, rawScore]) => {
+        const tag = String(rawTag || '').trim();
+        const score = normalizeFinderScore(rawScore);
+        if (tag && score !== null) scores[tag] = score;
+      });
+    }
+    return scores;
   }
 
   function normalizeFinderAdjustment(value, fallback = 0) {
@@ -2540,6 +2603,10 @@
       appearanceScore: firstFinderScore(match.appearance_score, match.visual_score, match.dino_score, breakdown.appearance, breakdown.appearance_score, index === 0 ? fallback.appearanceScore : null),
       tag: String(match.tag || (index === 0 ? fallback.tag : '') || ''),
       tagScore: firstFinderScore(match.tag_score, index === 0 ? fallback.tagScore : null, match.match_type === 'tag' ? match.score : null),
+      tagScores: normalizeFinderTagScores(
+        match.tag_scores,
+        index === 0 ? fallback.tagScores : {}
+      ),
       personCount: Math.max(0, Number(match.person_count ?? match.people_count ?? match.persons_detected ?? (index === 0 ? fallback.personCount : 0) ?? 0) || 0),
       overlayUrl: String(match.skeleton_overlay_url || match.pose_overlay_url || match.overlay_url || (index === 0 ? fallback.overlayUrl : '') || ''),
       poseReliable: Boolean(match.pose_reliable ?? match.poseReliable ?? (index === 0 ? fallback.poseReliable : false)),
@@ -2594,6 +2661,7 @@
       appearanceScore: firstFinderScore(item?.appearance_score, item?.visual_score, item?.dino_score, breakdown.appearance, breakdown.appearance_score, best.appearance_score, best.visual_score),
       tag: String(item?.tag || best.tag || ''),
       tagScore: firstFinderScore(item?.tag_score, best.tag_score, item?.match_type === 'tag' ? item?.score : null),
+      tagScores: normalizeFinderTagScores(item?.tag_scores, best.tag_scores),
       personCount: Math.max(0, Number(item?.person_count ?? item?.people_count ?? item?.persons_detected ?? best.person_count ?? best.people_count ?? 0) || 0),
       overlayUrl: item?.skeleton_overlay_url || item?.pose_overlay_url || item?.overlay_url || best.skeleton_overlay_url || best.pose_overlay_url || best.overlay_url || '',
       poseReliable: Boolean(item?.pose_reliable ?? item?.poseReliable ?? best.pose_reliable ?? best.poseReliable),
@@ -2715,6 +2783,9 @@
       appearanceScore: firstFinderScore(fallback.appearanceScore, primaryMatch.appearanceScore),
       tag: primaryMatch.tag || fallback.tag,
       tagScore: firstFinderScore(primaryMatch.tagScore, fallback.tagScore, matchType === 'tag' ? score : null),
+      tagScores: Object.keys(primaryMatch.tagScores || {}).length
+        ? primaryMatch.tagScores
+        : fallback.tagScores,
       personCount: fallback.personCount || primaryMatch.personCount,
       hasOverlay: matches.some(match => Boolean(match.overlayUrl)),
       origin,
@@ -2840,7 +2911,7 @@
   }
 
   function syncFinderJoytagDatasetFromSelection() {
-    const proposed = humanizeJoytagTag(state.finderJoytagSelectedTag);
+    const proposed = humanizeJoytagTag(state.finderJoytagRequiredTags[0]);
     if (!proposed) return;
     const current = $('#finder-joytag-dataset-label').value.trim().replace(/\s+/g, ' ');
     if (!current || current === state.finderJoytagAutoPoseLabel) {
@@ -2864,17 +2935,17 @@
     $('#finder-min-similarity').disabled = joytag;
     poseThresholdField.closest('.finder-config-row').style.gridTemplateColumns = joytag ? '1fr' : '';
     $('#finder-mode-copy').textContent = joytag
-      ? 'Analyze the reference folder, choose one JoyTag signal, then rank every matching image by tag confidence.'
+      ? 'Require every positive JoyTag signal and optionally reject images that contain any excluded signal.'
       : 'Compare body geometry and use visual similarity only as fallback evidence.';
     $('#finder-title').textContent = joytag ? 'Tag Finder' : 'Pose Finder';
     $('#finder-title').nextElementSibling.textContent = joytag
-      ? 'Choose a tag detected in your reference images, then review galleries ranked by that exact JoyTag confidence.'
+      ? 'Build a precise JoyTag rule from required and excluded signals, then review only galleries with qualifying images.'
       : 'Teach GalleryFlow from a folder of examples, then review galleries ranked by pose evidence, with visual layout used only as a fallback.';
     $('#finder-start').querySelector('span').textContent = joytag ? 'Start tag scan' : 'Start scan';
     const welcome = $('#finder-welcome');
     $('h3', welcome).textContent = joytag ? 'Find galleries with matching tags' : 'Find galleries with matching poses';
     $('p', welcome).textContent = joytag
-      ? 'Analyze a reference folder, select the interaction or pose tag you want, and choose its confidence threshold.'
+      ? 'Analyze a reference folder, require one or more signals, and optionally exclude common false-positive tags.'
       : 'Select an examples folder and pose tag. High-precision pose matches rank ahead of visual fallbacks, and every review decision is remembered.';
   }
 
@@ -2906,6 +2977,8 @@
     state.finderReferenceAnalysisError = '';
     if (clearSelection) {
       state.finderJoytagSelectedTag = '';
+      state.finderJoytagRequiredTags = [];
+      state.finderJoytagExcludedTags = [];
       const datasetLabel = $('#finder-joytag-dataset-label').value.trim();
       if (datasetLabel && datasetLabel === state.finderJoytagAutoPoseLabel) {
         setFinderJoytagDatasetLabel('');
@@ -2916,6 +2989,105 @@
     syncFinderConfigAvailability();
   }
 
+  function finderJoytagQueryRole(tag) {
+    if (state.finderJoytagRequiredTags.includes(tag)) return 'required';
+    if (state.finderJoytagExcludedTags.includes(tag)) return 'excluded';
+    return '';
+  }
+
+  function finderJoytagCatalogHas(tag) {
+    return Boolean(
+      tag
+      && state.finderReferenceAnalysis?.tagCatalog.includes(tag)
+    );
+  }
+
+  function finderJoytagQueryChip(tag, role, { removable = true } = {}) {
+    const chip = document.createElement('span');
+    chip.className = `finder-joytag-query-chip is-${role}`;
+    chip.setAttribute('role', 'listitem');
+    const label = document.createElement('span');
+    label.textContent = humanizeJoytagTag(tag);
+    chip.append(label);
+    if (removable) {
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.dataset.finderJoytagRemoveRole = role;
+      remove.dataset.finderJoytagTag = tag;
+      remove.title = `Remove ${humanizeJoytagTag(tag)} from ${role} tags`;
+      remove.setAttribute('aria-label', remove.title);
+      remove.innerHTML = '<svg aria-hidden="true"><use href="#i-close"></use></svg>';
+      chip.append(remove);
+    }
+    return chip;
+  }
+
+  function renderFinderJoytagQueryList(container, tags, role) {
+    container.replaceChildren();
+    if (!tags.length) {
+      const empty = document.createElement('span');
+      empty.className = 'finder-joytag-query-empty';
+      empty.textContent = role === 'required'
+        ? 'Choose at least one tag'
+        : 'No exclusions';
+      container.append(empty);
+      return;
+    }
+    tags.forEach(tag => container.append(finderJoytagQueryChip(tag, role)));
+  }
+
+  function setFinderJoytagTagRole(tag, role, { toggle = true, announceChange = true } = {}) {
+    if (!finderJoytagCatalogHas(tag) || !['required', 'excluded', ''].includes(role)) return;
+    const previousRole = finderJoytagQueryRole(tag);
+    const nextRole = toggle && previousRole === role ? '' : role;
+    if (
+      nextRole
+      && previousRole !== nextRole
+      && (nextRole === 'required' ? state.finderJoytagRequiredTags : state.finderJoytagExcludedTags).length
+        >= FINDER_JOYTAG_QUERY_LIMIT
+    ) {
+      toast(
+        `Maximum ${nextRole} tags reached`,
+        `A Tag Search can use up to ${FINDER_JOYTAG_QUERY_LIMIT} ${nextRole} tags.`,
+        'info'
+      );
+      return;
+    }
+    const previousPrimary = state.finderJoytagRequiredTags[0] || '';
+    state.finderJoytagRequiredTags = state.finderJoytagRequiredTags.filter(item => item !== tag);
+    state.finderJoytagExcludedTags = state.finderJoytagExcludedTags.filter(item => item !== tag);
+    if (nextRole === 'required') state.finderJoytagRequiredTags.push(tag);
+    if (nextRole === 'excluded') state.finderJoytagExcludedTags.push(tag);
+    state.finderJoytagSelectedTag = tag;
+    if (state.finderJoytagRequiredTags.length) {
+      syncFinderJoytagDatasetFromSelection();
+    } else if (
+      previousPrimary
+      && $('#finder-joytag-dataset-label').value.trim() === state.finderJoytagAutoPoseLabel
+    ) {
+      setFinderJoytagDatasetLabel('');
+    }
+    renderFinderReferenceAnalysis();
+    syncFinderConfigAvailability();
+    if (announceChange) {
+      const action = nextRole === 'required'
+        ? 'required'
+        : nextRole === 'excluded' ? 'excluded' : 'removed from the query';
+      announce(`${humanizeJoytagTag(tag)} ${action}.`);
+    }
+  }
+
+  function inspectFinderJoytagTag(tag) {
+    if (!finderJoytagCatalogHas(tag)) return;
+    if (!finderJoytagQueryRole(tag)) {
+      setFinderJoytagTagRole(tag, 'required');
+      return;
+    }
+    state.finderJoytagSelectedTag = tag;
+    renderFinderReferenceAnalysis();
+    announce(`${humanizeJoytagTag(tag)} reference scores shown.`);
+  }
+
   function renderFinderReferenceAnalysis() {
     const card = $('#finder-joytag-analysis');
     const analysis = state.finderReferenceAnalysis;
@@ -2923,36 +3095,56 @@
     const error = state.finderReferenceAnalysisError;
     const selectedTag = state.finderJoytagSelectedTag;
     const threshold = Math.max(0.05, Math.min(0.95, Number(state.finderJoytagThreshold || 0.4)));
+    const rejectThreshold = Math.max(
+      0.05,
+      Math.min(0.95, Number(state.finderJoytagRejectThreshold || 0.4))
+    );
     state.finderJoytagThreshold = threshold;
+    state.finderJoytagRejectThreshold = rejectThreshold;
     card.classList.toggle('is-loading', loading);
     card.classList.toggle('is-ready', Boolean(analysis && !error));
     card.classList.toggle('is-error', Boolean(error));
     $('#finder-joytag-state').textContent = loading ? 'Analyzing' : error ? 'Retry' : analysis ? 'Ready' : 'Waiting';
+    const requiredCount = state.finderJoytagRequiredTags.length;
+    const excludedCount = state.finderJoytagExcludedTags.length;
     $('#finder-joytag-summary').textContent = loading
       ? 'Tagging every reference image in batches…'
       : error
         ? 'Reference analysis failed—review the message below.'
         : analysis
-          ? `${formatNumber(analysis.imageCount)} references · ${analysis.quantization || 'cached'} scores`
-          : state.finderScan?.searchMode === 'joytag' && state.finderScan.joytagTag
-            ? `Saved scan used “${humanizeJoytagTag(state.finderScan.joytagTag)}”; analyze before starting another.`
-            : 'Analyze the examples folder to choose a tag.';
+          ? `${formatNumber(analysis.imageCount)} references · ${requiredCount} required · ${excludedCount} excluded`
+          : finderScanUsesJoyTag() && requiredCount
+            ? `Saved query has ${requiredCount} required and ${excludedCount} excluded; analyze before starting another.`
+            : 'Analyze the examples folder to build a tag query.';
     const errorElement = $('#finder-joytag-error');
     errorElement.hidden = !error;
     errorElement.textContent = error;
     const empty = $('#finder-joytag-empty');
     empty.hidden = Boolean(analysis) || loading;
+    const savedQuery = $('#finder-joytag-saved-query');
+    savedQuery.replaceChildren();
+    if (!analysis && !loading && requiredCount) {
+      state.finderJoytagRequiredTags.forEach(tag => (
+        savedQuery.append(finderJoytagQueryChip(tag, 'required', { removable: false }))
+      ));
+      state.finderJoytagExcludedTags.forEach(tag => (
+        savedQuery.append(finderJoytagQueryChip(tag, 'excluded', { removable: false }))
+      ));
+    }
+    savedQuery.hidden = Boolean(analysis || loading || !requiredCount);
     if (!analysis && !loading) {
       $('strong', empty).textContent = error ? 'Analysis unavailable' : 'No analysis yet';
       $('small', empty).textContent = error
         ? 'Correct the folder or retry the analysis.'
-        : state.finderScan?.searchMode === 'joytag' && state.finderScan.joytagTag
-          ? `This saved scan used ${humanizeJoytagTag(state.finderScan.joytagTag)}. Run Analyze to create a new tag scan.`
+        : finderScanUsesJoyTag() && requiredCount
+          ? 'This saved scan query is restored below. Run Analyze to edit it or start a new tag scan.'
           : 'Choose a folder and run JoyTag to inspect its strongest tags.';
     }
     $('#finder-joytag-results').hidden = !analysis;
     $('#finder-joytag-threshold').value = threshold.toFixed(2);
     $('#finder-joytag-threshold-output').textContent = threshold.toFixed(2);
+    $('#finder-joytag-reject-threshold').value = rejectThreshold.toFixed(2);
+    $('#finder-joytag-reject-output').textContent = rejectThreshold.toFixed(2);
     if (!analysis) return;
 
     $('#finder-joytag-image-count').textContent = formatNumber(analysis.imageCount);
@@ -2964,45 +3156,98 @@
     ].filter(Boolean).join(' · ');
 
     const filter = state.finderJoytagTagFilter.trim().toLocaleLowerCase();
-    const tags = analysis.tags.filter(item => (
-      !filter
-      || item.tag.toLocaleLowerCase().includes(filter)
-      || humanizeJoytagTag(item.tag).toLocaleLowerCase().includes(filter)
-    ));
+    const topByTag = new Map(analysis.tags.map(item => [item.tag, item]));
+    const selectedCatalogTags = [
+      ...state.finderJoytagRequiredTags,
+      ...state.finderJoytagExcludedTags
+    ].filter(tag => analysis.tagCatalog.includes(tag));
+    const sourceTags = filter
+      ? analysis.tagCatalog.filter(tag => (
+          tag.toLocaleLowerCase().includes(filter)
+          || humanizeJoytagTag(tag).toLocaleLowerCase().includes(filter)
+        ))
+      : [...new Set([...selectedCatalogTags, ...analysis.tags.map(item => item.tag)])];
+    const totalMatches = sourceTags.length;
+    const tags = sourceTags.slice(0, FINDER_JOYTAG_CATALOG_RENDER_LIMIT);
+    $('#finder-joytag-list-copy').textContent = filter
+      ? `${formatNumber(Math.min(totalMatches, tags.length))} of ${formatNumber(totalMatches)} catalog matches`
+      : `${formatNumber(analysis.tags.length)} top reference signals${selectedCatalogTags.some(tag => !topByTag.has(tag)) ? ' · selected catalog tags included' : ''}`;
     const tagList = $('#finder-joytag-tags');
     tagList.replaceChildren();
-    tags.forEach(item => {
-      const values = analysis.images
-        .map(image => normalizeFinderScore(image.scores[item.tag]))
-        .filter(score => score !== null);
-      const passing = values.filter(score => score >= threshold).length;
-      const label = document.createElement('label');
-      label.className = 'finder-joytag-tag';
-      label.title = `${item.tag}: average ${item.average.toFixed(3)}, median ${item.median.toFixed(3)}`;
-      const input = document.createElement('input');
-      input.type = 'radio';
-      input.name = 'finder-joytag-search-tag';
-      input.value = item.tag;
-      input.checked = item.tag === selectedTag;
-      input.dataset.finderJoytagTag = item.tag;
+    tags.forEach(tag => {
+      const item = topByTag.get(tag) || null;
+      const role = finderJoytagQueryRole(tag);
+      const comparisonThreshold = role === 'excluded' ? rejectThreshold : threshold;
+      const values = item
+        ? analysis.images
+          .map(image => normalizeFinderScore(image.scores[tag]))
+          .filter(score => score !== null)
+        : [];
+      const passing = values.filter(score => score >= comparisonThreshold).length;
+      const row = document.createElement('article');
+      row.className = `finder-joytag-tag${role ? ` is-${role}` : ''}`;
+      row.setAttribute('role', 'listitem');
+      row.title = item
+        ? `${tag}: average ${item.average.toFixed(3)}, median ${item.median.toFixed(3)}`
+        : `${tag}: catalog tag without reference statistics`;
+      const choice = document.createElement('button');
+      choice.type = 'button';
+      choice.className = 'finder-joytag-tag-choice';
+      choice.dataset.finderJoytagInspect = tag;
+      choice.title = role
+        ? `Inspect ${humanizeJoytagTag(tag)} reference scores`
+        : `Require ${humanizeJoytagTag(tag)} and inspect its reference scores`;
       const name = document.createElement('span');
-      name.textContent = humanizeJoytagTag(item.tag);
+      name.textContent = humanizeJoytagTag(tag);
       const average = document.createElement('b');
-      average.textContent = finderScoreLabel(item.average);
+      average.textContent = item ? finderScoreLabel(item.average) : 'Catalog';
       const coverage = document.createElement('small');
-      coverage.textContent = `${passing}/${analysis.imageCount}`;
-      label.append(input, name, average, coverage);
-      tagList.append(label);
+      coverage.textContent = item
+        ? `${passing}/${analysis.imageCount} ${role === 'excluded' ? 'would reject' : 'meet threshold'}`
+        : 'No reference scores · usable in the query';
+      choice.append(name, average, coverage);
+      const actions = document.createElement('div');
+      actions.className = 'finder-joytag-tag-actions';
+      actions.setAttribute('role', 'group');
+      actions.setAttribute('aria-label', `${humanizeJoytagTag(tag)} query role`);
+      ['required', 'excluded'].forEach(queryRole => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.dataset.finderJoytagRole = queryRole;
+        button.dataset.finderJoytagTag = tag;
+        button.setAttribute('aria-pressed', String(role === queryRole));
+        button.textContent = queryRole === 'required' ? 'Require' : 'Exclude';
+        actions.append(button);
+      });
+      row.append(choice, actions);
+      tagList.append(row);
     });
     if (!tags.length) {
       const message = document.createElement('small');
-      message.textContent = 'No analyzed tags match this filter.';
+      message.textContent = 'No JoyTag catalog tags match this search.';
       tagList.append(message);
     }
 
+    renderFinderJoytagQueryList(
+      $('#finder-joytag-required-tags'),
+      state.finderJoytagRequiredTags,
+      'required'
+    );
+    renderFinderJoytagQueryList(
+      $('#finder-joytag-excluded-tags'),
+      state.finderJoytagExcludedTags,
+      'excluded'
+    );
+    $('#finder-joytag-query-title').textContent = requiredCount
+      ? `Match all ${requiredCount} required ${requiredCount === 1 ? 'tag' : 'tags'}`
+      : 'Choose at least one required tag';
+    $('#finder-joytag-query-count').textContent = `${requiredCount} required · ${excludedCount} excluded`;
+
     const selected = finderJoytagData();
-    $('#finder-joytag-selected-tag').textContent = selected
-      ? humanizeJoytagTag(selected.tag)
+    const selectedInCatalog = analysis.tagCatalog.includes(selectedTag);
+    const selectedRole = finderJoytagQueryRole(selectedTag);
+    $('#finder-joytag-selected-tag').textContent = selectedInCatalog
+      ? `${humanizeJoytagTag(selectedTag)}${selectedRole ? ` · ${selectedRole}` : ''}`
       : 'Choose a tag';
     $('#finder-joytag-average').textContent = selected ? selected.average.toFixed(3) : '—';
     $('#finder-joytag-minimum').textContent = selected ? selected.minimum.toFixed(3) : '—';
@@ -3010,8 +3255,22 @@
     const selectedScores = selected
       ? analysis.images.map(image => normalizeFinderScore(image.scores[selected.tag])).filter(score => score !== null)
       : [];
-    const passing = selectedScores.filter(score => score >= threshold).length;
-    $('#finder-joytag-reference-coverage').textContent = `${passing} / ${analysis.imageCount} pass`;
+    const selectedThreshold = selectedRole === 'excluded' ? rejectThreshold : threshold;
+    const passing = selectedScores.filter(score => score >= selectedThreshold).length;
+    $('#finder-joytag-reference-coverage').textContent = !selectedInCatalog
+      ? 'No signal'
+      : !selected
+        ? 'Catalog only'
+        : selectedRole === 'excluded'
+          ? `${passing} / ${analysis.imageCount} would reject`
+          : `${passing} / ${analysis.imageCount} pass`;
+    $('#finder-joytag-reference-copy').textContent = selected
+      ? selectedRole === 'excluded'
+        ? `Scores at or above ${rejectThreshold.toFixed(2)} would reject the image.`
+        : `Scores at or above ${threshold.toFixed(2)} pass this required signal.`
+      : selectedInCatalog
+        ? 'This catalog-only tag has no scores in the compact reference analysis.'
+        : 'Choose any tag to inspect its reference scores.';
 
     const grid = $('#finder-joytag-reference-grid');
     grid.replaceChildren();
@@ -3019,7 +3278,15 @@
       const score = selected ? normalizeFinderScore(image.scores[selected.tag]) : null;
       const reference = document.createElement('article');
       reference.className = 'finder-joytag-reference';
-      reference.classList.toggle('is-passing', score === null || score >= threshold);
+      const meetsThreshold = score !== null && score >= selectedThreshold;
+      reference.classList.toggle(
+        'is-passing',
+        score === null || selectedRole === 'excluded' ? !meetsThreshold : meetsThreshold
+      );
+      reference.classList.toggle(
+        'is-rejecting',
+        selectedRole === 'excluded' && meetsThreshold
+      );
       reference.title = selected && score !== null
         ? `${image.name} · ${selected.tag} ${score.toFixed(3)}`
         : image.name;
@@ -3038,15 +3305,6 @@
     });
   }
 
-  function selectFinderJoytagTag(tag) {
-    if (!state.finderReferenceAnalysis?.tags.some(item => item.tag === tag)) return;
-    state.finderJoytagSelectedTag = tag;
-    syncFinderJoytagDatasetFromSelection();
-    renderFinderReferenceAnalysis();
-    syncFinderConfigAvailability();
-    announce(`${humanizeJoytagTag(tag)} selected for JoyTag search.`);
-  }
-
   async function analyzeFinderReferences() {
     if (state.finderReferenceAnalysisLoading || state.finderBusy) return;
     const exampleDirectory = $('#finder-folder').value.trim();
@@ -3056,6 +3314,8 @@
       return;
     }
     const previousTag = state.finderJoytagSelectedTag;
+    const previousRequired = [...state.finderJoytagRequiredTags];
+    const previousExcluded = [...state.finderJoytagExcludedTags];
     const sourceKey = finderFolderKey(exampleDirectory);
     const request = ++state.finderReferenceAnalysisRequest;
     state.finderReferenceAnalysis = null;
@@ -3079,12 +3339,20 @@
       if (!analysis) throw new ApiError('The server returned an invalid JoyTag reference analysis.');
       state.finderReferenceAnalysis = analysis;
       state.finderReferenceAnalysisSource = exampleDirectory;
-      state.finderJoytagSelectedTag = analysis.tags.some(item => item.tag === previousTag)
+      const catalog = new Set(analysis.tagCatalog);
+      state.finderJoytagRequiredTags = previousRequired
+        .filter(tag => catalog.has(tag))
+        .slice(0, FINDER_JOYTAG_QUERY_LIMIT);
+      const required = new Set(state.finderJoytagRequiredTags);
+      state.finderJoytagExcludedTags = previousExcluded
+        .filter(tag => catalog.has(tag) && !required.has(tag))
+        .slice(0, FINDER_JOYTAG_QUERY_LIMIT);
+      state.finderJoytagSelectedTag = catalog.has(previousTag)
         ? previousTag
-        : '';
+        : state.finderJoytagRequiredTags[0] || '';
       state.finderReferenceAnalysisError = '';
-      if (state.finderJoytagSelectedTag) syncFinderJoytagDatasetFromSelection();
-      toast('Reference analysis ready', `${formatNumber(analysis.imageCount)} images tagged. Choose the signal you want to search.`, 'success');
+      if (state.finderJoytagRequiredTags.length) syncFinderJoytagDatasetFromSelection();
+      toast('Reference analysis ready', `${formatNumber(analysis.imageCount)} images tagged. Build the required and excluded query.`, 'success');
       announce(`JoyTag analysis complete for ${analysis.imageCount} reference images.`);
     } catch (error) {
       if (request !== state.finderReferenceAnalysisRequest) return;
@@ -3305,7 +3573,7 @@
     scans.forEach(scan => {
       const date = scan.createdAt ? relativeTime(scan.createdAt) : '';
       const searchLabel = finderScanUsesJoyTag(scan)
-        ? humanizeJoytagTag(scan.joytagTag) || scan.poseTagLabel || 'Tag scan'
+        ? finderJoytagScanLabel(scan)
         : scan.poseTagLabel || 'Pose scan';
       const modeLabel = finderScanUsesJoyTag(scan) ? 'JoyTag' : 'Pose';
       const label = `${searchLabel} · ${modeLabel} · ${scan.status.replaceAll('_', ' ')}${date ? ` · ${date}` : ''}`;
@@ -3322,7 +3590,11 @@
     $('#finder-min-similarity').disabled = locked || state.finderBusy || joytag;
     $('#finder-joytag-dataset-label').disabled = locked || state.finderBusy;
     $('#finder-joytag-threshold').disabled = locked || state.finderBusy || state.finderReferenceAnalysisLoading;
+    $('#finder-joytag-reject-threshold').disabled = locked || state.finderBusy || state.finderReferenceAnalysisLoading;
     $('#finder-joytag-tag-filter').disabled = state.finderReferenceAnalysisLoading || !state.finderReferenceAnalysis;
+    $$('[data-finder-joytag-role], [data-finder-joytag-remove-role], [data-finder-joytag-inspect]').forEach(button => {
+      button.disabled = locked || state.finderBusy || state.finderReferenceAnalysisLoading;
+    });
     $$('[data-finder-mode]').forEach(button => { button.disabled = locked || state.finderBusy; });
     $('#finder-use-current').disabled = locked || state.finderBusy;
     $('#finder-scan-select').disabled = state.finderLoading || feedbackMutationPending;
@@ -3334,7 +3606,7 @@
       $('#finder-folder').value.trim()
       && $('#finder-pose-tag').value.trim()
       && $('#finder-source').value.trim()
-      && (!joytag || (analysisCurrent && state.finderJoytagSelectedTag))
+      && (!joytag || (analysisCurrent && state.finderJoytagRequiredTags.length))
     );
     const analyze = $('#finder-analyze-references');
     analyze.disabled = locked
@@ -3353,8 +3625,8 @@
       || !hasConfig;
     $('#finder-start').title = joytag && !analysisCurrent
       ? 'Analyze the current examples folder before starting a tag scan'
-      : joytag && !state.finderJoytagSelectedTag
-        ? 'Choose one JoyTag signal before starting'
+      : joytag && !state.finderJoytagRequiredTags.length
+        ? 'Choose at least one required JoyTag signal before starting'
         : !modelReady ? (joytag ? state.finderStatus?.joytagError : state.finderStatus?.detail) || 'Finder model unavailable' : '';
   }
 
@@ -3367,13 +3639,25 @@
     $('#finder-pose-tag').value = scan.poseTagLabel;
     $('#finder-joytag-dataset-label').value = scan.poseTagLabel;
     state.finderJoytagAutoPoseLabel = '';
-    state.finderJoytagSelectedTag = scanMode === 'joytag' ? scan.joytagTag : '';
+    state.finderJoytagRequiredTags = scanMode === 'joytag'
+      ? [...scan.joytagRequiredTags]
+      : [];
+    state.finderJoytagExcludedTags = scanMode === 'joytag'
+      ? [...scan.joytagExcludedTags]
+      : [];
+    state.finderJoytagSelectedTag = state.finderJoytagRequiredTags[0] || '';
     $('#finder-source').value = scan.sourceUrl || finderDefaultSource();
     $('#finder-pages').value = Math.max(1, Math.min(50, scan.pages || 5));
     $('#finder-min-similarity').value = scan.minSimilarity.toFixed(2);
     state.finderJoytagThreshold = Math.max(0.05, Math.min(0.95, scan.minSimilarity));
     $('#finder-joytag-threshold').value = state.finderJoytagThreshold.toFixed(2);
     $('#finder-joytag-threshold-output').textContent = state.finderJoytagThreshold.toFixed(2);
+    state.finderJoytagRejectThreshold = Math.max(
+      0.05,
+      Math.min(0.95, scan.joytagRejectThreshold)
+    );
+    $('#finder-joytag-reject-threshold').value = state.finderJoytagRejectThreshold.toFixed(2);
+    $('#finder-joytag-reject-output').textContent = state.finderJoytagRejectThreshold.toFixed(2);
     $('#finder-result-threshold').min = scanMode === 'joytag' ? '0.05' : '0.40';
     $('#finder-result-threshold').value = scan.minSimilarity.toFixed(2);
     $('#finder-min-output').textContent = scan.minSimilarity.toFixed(2);
@@ -3394,10 +3678,38 @@
     return `${Math.round((normalizeFinderScore(score, 0) || 0) * 100)}%`;
   }
 
+  function finderJoytagQueryForScan(scan = state.finderScan) {
+    const required = normalizeFinderTagList(
+      scan?.joytagRequiredTags?.length
+        ? scan.joytagRequiredTags
+        : scan?.joytagTag ? [scan.joytagTag] : []
+    );
+    const requiredSet = new Set(required);
+    const excluded = normalizeFinderTagList(scan?.joytagExcludedTags || [])
+      .filter(tag => !requiredSet.has(tag));
+    return { required, excluded };
+  }
+
+  function finderJoytagScanLabel(scan = state.finderScan) {
+    const { required, excluded } = finderJoytagQueryForScan(scan);
+    const primary = humanizeJoytagTag(required[0])
+      || scan?.poseTagLabel
+      || 'Tag scan';
+    const requiredSuffix = required.length > 1 ? ` +${required.length - 1}` : '';
+    const excludedSuffix = excluded.length ? ` · −${excluded.length}` : '';
+    return `${primary}${requiredSuffix}${excludedSuffix}`;
+  }
+
   function finderEvidenceLabel(item, { short = false } = {}) {
     if (finderScanUsesJoyTag() || item?.matchType === 'tag') {
       const score = finderScoreLabel(firstFinderScore(item?.tagScore, item?.score));
-      const tag = humanizeJoytagTag(item?.tag || state.finderScan?.joytagTag);
+      const { required } = finderJoytagQueryForScan();
+      if (required.length > 1) {
+        return short
+          ? `ALL ${required.length} · weakest ${score}`
+          : `ALL ${required.length} required · weakest JoyTag confidence ${score}`;
+      }
+      const tag = humanizeJoytagTag(item?.tag || required[0] || state.finderScan?.joytagTag);
       return short
         ? `JoyTag confidence ${score}`
         : `${tag || 'Selected tag'} · JoyTag confidence ${score}`;
@@ -3411,7 +3723,12 @@
   }
 
   function finderEvidenceKind(item) {
-    if (finderScanUsesJoyTag() || item?.matchType === 'tag') return 'JoyTag tag';
+    if (finderScanUsesJoyTag() || item?.matchType === 'tag') {
+      const query = finderJoytagQueryForScan();
+      return query.required.length > 1 || query.excluded.length
+        ? 'JoyTag query'
+        : 'JoyTag tag';
+    }
     const tier = normalizeFinderTier(item?.rankingTier);
     if (tier === 3) return 'Exact image';
     if (tier === 2) return 'Pose match';
@@ -3496,18 +3813,47 @@
   function renderFinderDiagnostics(card, result) {
     const breakdown = $('.finder-score-breakdown', card);
     if (finderScanUsesJoyTag() || result.matchType === 'tag') {
-      const badge = document.createElement('span');
-      const score = firstFinderScore(result.tagScore, result.score) ?? 0;
-      const tag = humanizeJoytagTag(result.tag || state.finderScan?.joytagTag) || 'JoyTag';
-      badge.className = 'finder-score-chip is-appearance';
-      badge.title = `${tag} JoyTag confidence ${finderScoreLabel(score)}`;
-      badge.innerHTML = '<i></i><span></span><b></b>';
-      $('span', badge).textContent = `${tag} · JoyTag`;
-      $('b', badge).textContent = finderScoreLabel(score);
-      breakdown.append(badge);
+      const query = finderJoytagQueryForScan();
+      const tagScores = normalizeFinderTagScores(result.tagScores);
+      const required = query.required.length
+        ? query.required
+        : normalizeFinderTagList([result.tag || state.finderScan?.joytagTag]);
+      required.forEach((tag, index) => {
+        const score = firstFinderScore(
+          tagScores[tag],
+          index === 0 ? result.tagScore : null,
+          index === 0 ? result.score : null
+        );
+        const badge = document.createElement('span');
+        const label = humanizeJoytagTag(tag) || 'JoyTag';
+        badge.className = 'finder-score-chip is-required';
+        badge.title = score === null
+          ? `${label} is required; this saved result has no per-tag diagnostic`
+          : `${label} required confidence ${finderScoreLabel(score)}; must be at least ${finderScoreLabel(state.finderScan?.minSimilarity)}`;
+        badge.innerHTML = '<i></i><span></span><b></b>';
+        $('span', badge).textContent = required.length === 1
+          ? `${label} · JoyTag`
+          : `${label} · required`;
+        $('b', badge).textContent = score === null ? '—' : finderScoreLabel(score);
+        breakdown.append(badge);
+      });
+      query.excluded.forEach(tag => {
+        const score = firstFinderScore(tagScores[tag]);
+        const rejectThreshold = state.finderScan?.joytagRejectThreshold ?? 0.4;
+        const badge = document.createElement('span');
+        const label = humanizeJoytagTag(tag) || 'JoyTag';
+        badge.className = 'finder-score-chip is-excluded';
+        badge.title = score === null
+          ? `${label} is excluded; this saved result has no per-tag diagnostic`
+          : `${label} excluded confidence ${finderScoreLabel(score)}; the image is rejected at ${finderScoreLabel(rejectThreshold)} or higher`;
+        badge.innerHTML = '<i></i><span></span><b></b>';
+        $('span', badge).textContent = `${label} · excluded`;
+        $('b', badge).textContent = score === null ? '—' : finderScoreLabel(score);
+        breakdown.append(badge);
+      });
       $('.finder-person-count', card).hidden = true;
       $('.finder-overlay-toggle', card).hidden = true;
-      $('.finder-diagnostic-toolbar', card).hidden = false;
+      $('.finder-diagnostic-toolbar', card).hidden = !breakdown.children.length;
       return;
     }
     const scores = [
@@ -3609,8 +3955,10 @@
     const threshold = Number(resultThreshold.value || resultThresholdMinimum);
     const thresholdControl = resultThreshold.closest('.finder-threshold');
     const thresholdCopy = $('span', thresholdControl);
-    if (thresholdCopy?.firstChild) thresholdCopy.firstChild.textContent = joytagScan ? 'JoyTag ≥ ' : 'Score ≥ ';
-    thresholdControl.title = joytagScan ? 'Filter galleries by selected JoyTag confidence' : 'Applied within each evidence tier';
+    if (thresholdCopy?.firstChild) thresholdCopy.firstChild.textContent = joytagScan ? 'Weakest required ≥ ' : 'Score ≥ ';
+    thresholdControl.title = joytagScan
+      ? 'Filter galleries by the weakest required JoyTag confidence'
+      : 'Applied within each evidence tier';
     $('#finder-filter-output').textContent = threshold.toFixed(2);
     const results = ranked.filter(result => result.review === state.finderReview && result.score >= threshold);
     const grid = $('#finder-result-grid');
@@ -3639,7 +3987,9 @@
       matchKind.hidden = !kindCopy;
       matchKind.textContent = kindCopy;
       matchKind.title = joytagScan
-        ? `${humanizeJoytagTag(result.tag || state.finderScan?.joytagTag) || 'Selected tag'} confidence from JoyTag`
+        ? finderJoytagQueryForScan().required.length > 1
+          ? 'Every required JoyTag signal passed; the card score is the weakest required confidence.'
+          : `${humanizeJoytagTag(result.tag || state.finderScan?.joytagTag) || 'Selected tag'} confidence from JoyTag`
         : result.rankingTier === 1
           ? 'RTMO could not confirm matching person counts and enough body-and-limb evidence, so this candidate is ranked by visual layout below high-precision pose matches.'
           : result.rankingTier === 0
@@ -3873,7 +4223,7 @@
         ? 'The selected Source URL has no more pages'
         : `Exploring ${displayHost(scan.sourceUrl)} for new galleries`;
     const sessionName = finderScanUsesJoyTag(scan)
-      ? humanizeJoytagTag(scan.joytagTag) || scan.poseTagLabel || 'Tag scan'
+      ? finderJoytagScanLabel(scan)
       : scan.poseTagLabel || 'Pose scan';
     $('#finder-session-label').textContent = `${sessionName} · ${finderScanUsesJoyTag(scan) ? 'JoyTag' : 'Pose'} · ${status}`;
     $('#finder-pages-scanned').textContent = formatNumber(scan.pagesScanned);
@@ -3916,6 +4266,20 @@
     const minimumScore = joytag
       ? Math.max(0.05, Math.min(0.95, Number(state.finderJoytagThreshold || 0.4)))
       : Math.max(0.4, Math.min(0.95, Number($('#finder-min-similarity').value || 0.68)));
+    const joytagRequiredTags = joytag
+      ? normalizeFinderTagList(state.finderJoytagRequiredTags)
+      : [];
+    const requiredSet = new Set(joytagRequiredTags);
+    const joytagExcludedTags = joytag
+      ? normalizeFinderTagList(state.finderJoytagExcludedTags)
+        .filter(tag => !requiredSet.has(tag))
+      : [];
+    const joytagRejectThreshold = joytag
+      ? Math.max(0.05, Math.min(0.95, Number(state.finderJoytagRejectThreshold || 0.4)))
+      : 0.4;
+    state.finderJoytagRequiredTags = joytagRequiredTags;
+    state.finderJoytagExcludedTags = joytagExcludedTags;
+    state.finderJoytagRejectThreshold = joytagRejectThreshold;
     if (validate && !exampleDirectory) {
       const root = state.finderStatus?.folderRoot || 'the library root';
       toast('Enter an examples folder', `Use any folder inside ${root}, as a relative path or full container path.`, 'info');
@@ -3927,10 +4291,24 @@
       $('#finder-analyze-references').focus();
       return null;
     }
-    if (validate && joytag && !state.finderJoytagSelectedTag) {
-      toast('Choose a JoyTag signal', 'Select the interaction or pose tag you want to find.', 'info');
+    if (validate && joytag && !joytagRequiredTags.length) {
+      toast('Choose a required JoyTag signal', 'Tag search needs at least one tag that every matching image must contain.', 'info');
       $('#finder-joytag-tags').scrollIntoView({ block: 'nearest' });
       return null;
+    }
+    if (validate && joytag) {
+      const catalog = new Set(state.finderReferenceAnalysis?.tagCatalog || []);
+      const unavailable = [...joytagRequiredTags, ...joytagExcludedTags]
+        .filter(tag => !catalog.has(tag));
+      if (unavailable.length) {
+        toast(
+          'Analyze the tag query again',
+          `${humanizeJoytagTag(unavailable[0])} is not available in the current JoyTag catalog.`,
+          'info'
+        );
+        $('#finder-joytag-tags').scrollIntoView({ block: 'nearest' });
+        return null;
+      }
     }
     if (validate && !tagLabel) {
       toast(
@@ -3967,8 +4345,11 @@
       sourceUrl,
       pageLimit,
       minimumScore,
-      joytagTag: joytag ? state.finderJoytagSelectedTag : null,
-      referenceFingerprint: joytag ? state.finderReferenceAnalysis.fingerprint : null
+      joytagTag: joytag ? joytagRequiredTags[0] || null : null,
+      joytagRequiredTags,
+      joytagExcludedTags,
+      joytagRejectThreshold,
+      referenceFingerprint: joytag ? state.finderReferenceAnalysis?.fingerprint || null : null
     };
   }
 
@@ -4425,6 +4806,9 @@
           minimum_score: config.minimumScore,
           mode: config.mode,
           joytag_tag: config.joytagTag,
+          joytag_required_tags: config.joytagRequiredTags,
+          joytag_excluded_tags: config.joytagExcludedTags,
+          joytag_reject_threshold: config.joytagRejectThreshold,
           reference_fingerprint: config.referenceFingerprint
         }
       });
@@ -4435,6 +4819,9 @@
       scan.poseDefaultRole = tag.defaultRole;
       scan.searchMode = config.mode;
       scan.joytagTag = config.joytagTag || '';
+      scan.joytagRequiredTags = [...config.joytagRequiredTags];
+      scan.joytagExcludedTags = [...config.joytagExcludedTags];
+      scan.joytagRejectThreshold = config.joytagRejectThreshold;
       scan.referenceFingerprint = config.referenceFingerprint || '';
       state.finderScan = scan;
       state.finderScanId = scan.id;
@@ -4450,7 +4837,11 @@
       toast(
         config.mode === 'joytag' ? 'JoyTag scan started' : 'Finder scan started',
         config.mode === 'joytag'
-          ? `Searching up to ${config.pageLimit} pages for “${humanizeJoytagTag(config.joytagTag)}” at ${config.minimumScore.toFixed(2)} confidence.`
+          ? `Searching up to ${config.pageLimit} pages for ${config.joytagRequiredTags.length === 1
+            ? `“${humanizeJoytagTag(config.joytagTag)}”`
+            : `all ${config.joytagRequiredTags.length} required tags`}${config.joytagExcludedTags.length
+            ? `, excluding ${config.joytagExcludedTags.length} ${config.joytagExcludedTags.length === 1 ? 'tag' : 'tags'}`
+            : ''}, at ${config.minimumScore.toFixed(2)} required confidence.`
           : `Scanning up to ${config.pageLimit} pages for “${tag.label}”.`,
         'success'
       );
@@ -5457,13 +5848,39 @@
       state.finderJoytagTagFilter = event.currentTarget.value;
       renderFinderReferenceAnalysis();
     });
-    $('#finder-joytag-tags').addEventListener('change', event => {
-      const input = event.target.closest('input[data-finder-joytag-tag]');
-      if (input?.checked) selectFinderJoytagTag(input.dataset.finderJoytagTag);
+    $('#finder-joytag-results').addEventListener('click', event => {
+      const roleButton = event.target.closest('[data-finder-joytag-role]');
+      if (roleButton) {
+        setFinderJoytagTagRole(
+          roleButton.dataset.finderJoytagTag,
+          roleButton.dataset.finderJoytagRole
+        );
+        return;
+      }
+      const removeButton = event.target.closest('[data-finder-joytag-remove-role]');
+      if (removeButton) {
+        setFinderJoytagTagRole(
+          removeButton.dataset.finderJoytagTag,
+          '',
+          { toggle: false }
+        );
+        return;
+      }
+      const inspectButton = event.target.closest('[data-finder-joytag-inspect]');
+      if (inspectButton) inspectFinderJoytagTag(inspectButton.dataset.finderJoytagInspect);
     });
     $('#finder-joytag-threshold').addEventListener('input', event => {
       state.finderJoytagThreshold = Math.max(0.05, Math.min(0.95, Number(event.currentTarget.value || 0.4)));
       storage.set('finder-joytag-threshold', state.finderJoytagThreshold);
+      renderFinderReferenceAnalysis();
+      syncFinderConfigAvailability();
+    });
+    $('#finder-joytag-reject-threshold').addEventListener('input', event => {
+      state.finderJoytagRejectThreshold = Math.max(
+        0.05,
+        Math.min(0.95, Number(event.currentTarget.value || 0.4))
+      );
+      storage.set('finder-joytag-reject-threshold', state.finderJoytagRejectThreshold);
       renderFinderReferenceAnalysis();
       syncFinderConfigAvailability();
     });
