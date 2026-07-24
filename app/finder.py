@@ -32,6 +32,7 @@ from .security import (
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"}
 ACTIVE_STATUSES = {"queued", "preparing", "scanning", "pausing", "canceling"}
 TERMINAL_STATUSES = {"completed", "completed_with_errors", "failed", "canceled"}
+SOURCE_SWITCH_STATUSES = TERMINAL_STATUSES | {"paused"}
 REVIEW_STATES = {"pending", "maybe", "accepted", "rejected"}
 ANALYZER_VERSION = "hybrid-spatial-pyramid-v1+rtmo-l-geometry-v1+phash64-gate-v1"
 LEGACY_RANKING_VERSION = "appearance-v1"
@@ -2736,13 +2737,31 @@ class FinderService:
         return (True, False) if not row else (bool(row[0]), bool(row[1]))
 
     def pause(self, scan_id: str) -> dict[str, Any]:
-        scan = self.get_scan(scan_id)
-        if not scan:
+        if not self.get_scan(scan_id):
             raise FinderNotFound("Finder scan not found")
-        if scan["status"] in TERMINAL_STATUSES:
-            raise FinderConflict("A finished scan cannot be paused")
-        status = "paused" if scan["status"] in {"queued", "paused"} else "pausing"
-        self._update_scan(scan_id, pause_requested=1, status=status)
+        with self._lock, self.database.connect() as db:
+            updated = db.execute(
+                """UPDATE finder_scans
+                   SET pause_requested = 1,
+                       status = CASE
+                           WHEN status IN ('queued', 'paused') THEN 'paused'
+                           ELSE 'pausing'
+                       END,
+                       updated_at = ?
+                   WHERE id = ?
+                     AND status NOT IN (
+                         'completed', 'completed_with_errors', 'failed', 'canceled'
+                     )""",
+                (utc_now(), scan_id),
+            )
+            if not updated.rowcount:
+                row = db.execute(
+                    "SELECT status FROM finder_scans WHERE id = ?",
+                    (scan_id,),
+                ).fetchone()
+                if not row:
+                    raise FinderNotFound("Finder scan not found")
+                raise FinderConflict("A finished scan cannot be paused")
         scan = self.get_scan(scan_id) or {}
         self._publish(scan, force=True)
         return scan
@@ -2946,12 +2965,14 @@ class FinderService:
         source_url: str,
         additional_pages: int,
     ) -> dict[str, Any]:
-        """Continue an exhausted scan from a new durable source cursor.
+        """Switch an inactive scan to a new durable source cursor.
 
         The cumulative result set and its review/reference/feedback snapshots
-        remain in place. A fresh allowance is measured from pages already
-        completed because an exhausted source may have ended well before its
-        previous page limit.
+        remain in place. Completed exhausted scans retain their original
+        continuation behavior; paused, canceled, failed, and completed scans
+        with a remaining cursor may intentionally abandon that cursor. A fresh
+        allowance is measured from pages already completed because a source
+        may have ended, failed, or been stopped well before its previous limit.
         """
 
         if (
@@ -2965,8 +2986,7 @@ class FinderService:
         source_url = validate_source_url(source_url)
         with self._lock, self.database.connect() as db:
             row = db.execute(
-                """SELECT status, pages_completed, next_url,
-                          cancel_requested, pause_requested, ranking_version
+                """SELECT status, pages_completed, ranking_version
                    FROM finder_scans WHERE id = ?""",
                 (scan_id,),
             ).fetchone()
@@ -2993,22 +3013,13 @@ class FinderService:
                 )
 
             status = str(row["status"])
-            if bool(row["cancel_requested"]) or status in {"canceling", "canceled"}:
-                raise FinderConflict("A canceled Finder scan cannot be continued")
-            if status == "failed":
-                raise FinderConflict("A failed Finder scan cannot be continued")
-            if status not in {"completed", "completed_with_errors"}:
+            if status in ACTIVE_STATUSES:
                 raise FinderConflict(
-                    "Only a completed, source-exhausted Finder scan can "
-                    "continue from a new source"
+                    "Pause or cancel the active Finder scan before changing source"
                 )
-            if bool(row["pause_requested"]):
+            if status not in SOURCE_SWITCH_STATUSES:
                 raise FinderConflict(
-                    "A paused Finder scan must finish before changing source"
-                )
-            if row["next_url"]:
-                raise FinderConflict(
-                    "This Finder scan still has source pages; use Extend instead"
+                    f"A Finder scan in the '{status}' state cannot change source"
                 )
 
             pages_completed = int(row["pages_completed"])
@@ -3019,15 +3030,19 @@ class FinderService:
                 )
 
             now = utc_now()
-            db.execute(
+            updated = db.execute(
                 """UPDATE finder_scans
                    SET source_url = ?, next_url = ?, page_limit = ?,
                        status = 'queued', cancel_requested = 0,
                        pause_requested = 0, error = '', finished_at = NULL,
                        updated_at = ?
-                   WHERE id = ?""",
-                (source_url, source_url, new_limit, now, scan_id),
+                   WHERE id = ? AND status = ?""",
+                (source_url, source_url, new_limit, now, scan_id, status),
             )
+            if not updated.rowcount:
+                raise FinderConflict(
+                    "This Finder scan changed before its source could be switched"
+                )
 
         # Queued state is durable. If the process stops before this in-memory
         # enqueue is observed, start() will recover it from _queued_scan_ids().
@@ -3040,20 +3055,55 @@ class FinderService:
         scan = self.get_scan(scan_id)
         if not scan:
             raise FinderNotFound("Finder scan not found")
-        if scan["status"] in TERMINAL_STATUSES:
-            with self._lock, self.database.connect() as db:
-                db.execute("DELETE FROM finder_scans WHERE id = ?", (scan_id,))
+        deleted = False
+        with self._lock, self.database.connect() as db:
+            deleted = bool(
+                db.execute(
+                    """DELETE FROM finder_scans
+                       WHERE id = ?
+                         AND status IN (
+                             'completed', 'completed_with_errors',
+                             'failed', 'canceled'
+                         )""",
+                    (scan_id,),
+                ).rowcount
+            )
+            if not deleted:
+                now = utc_now()
+                updated = db.execute(
+                    """UPDATE finder_scans
+                       SET cancel_requested = 1, pause_requested = 0,
+                           status = CASE
+                               WHEN status IN ('queued', 'paused')
+                                   THEN 'canceled'
+                               ELSE 'canceling'
+                           END,
+                           finished_at = CASE
+                               WHEN status IN ('queued', 'paused') THEN ?
+                               ELSE NULL
+                           END,
+                           updated_at = ?
+                       WHERE id = ?
+                         AND status NOT IN (
+                             'completed', 'completed_with_errors',
+                             'failed', 'canceled'
+                         )""",
+                    (now, now, scan_id),
+                )
+                if not updated.rowcount:
+                    row = db.execute(
+                        "SELECT status FROM finder_scans WHERE id = ?",
+                        (scan_id,),
+                    ).fetchone()
+                    if not row:
+                        raise FinderNotFound("Finder scan not found")
+                    raise FinderConflict(
+                        "Finder scan changed before it could be canceled"
+                    )
+        if deleted:
             event = {**scan, "deleted": True}
             self._publish(event, force=True)
             return event
-        status = "canceled" if scan["status"] in {"queued", "paused"} else "canceling"
-        self._update_scan(
-            scan_id,
-            cancel_requested=1,
-            pause_requested=0,
-            status=status,
-            finished_at=utc_now() if status == "canceled" else None,
-        )
         scan = self.get_scan(scan_id) or {}
         self._publish(scan, force=True)
         return scan

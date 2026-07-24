@@ -1557,6 +1557,91 @@ async def test_finder_pause_resume_and_restart_recovery(
         await restarted.stop()
 
 
+@pytest.mark.parametrize(
+    ("control_method", "transition_status", "inactive_status"),
+    (
+        ("pause", "pausing", "paused"),
+        ("delete_or_cancel", "canceling", "canceled"),
+    ),
+)
+def test_finder_control_transition_is_atomic_with_worker_claim(
+    tmp_path: Path,
+    monkeypatch,
+    control_method: str,
+    transition_status: str,
+    inactive_status: str,
+) -> None:
+    config, database, tag_id = configured(tmp_path)
+    service = FinderService(
+        config,
+        database,
+        FakeScraper(),
+        EventBroker(),
+        encoder=FakeEncoder(),
+        media_fetcher=fake_media,
+    )
+    service.ensure_schema()
+    scan = service.create_scan(
+        example_directory="pose",
+        pose_tag_id=tag_id,
+        source_url=ROOT,
+        page_limit=3,
+        minimum_score=0,
+    )
+
+    original_get_scan = service.get_scan
+    claim_injected = False
+
+    def get_scan_with_claim(scan_id: str) -> dict | None:
+        nonlocal claim_injected
+        current = original_get_scan(scan_id)
+        if not claim_injected:
+            claim_injected = True
+            assert current is not None
+            assert current["status"] == "queued"
+            assert service._claim_scan(scan_id) is True
+        return current
+
+    # Force the worker claim into the exact gap that used to exist between the
+    # control method's status read and its unconditional status write.
+    monkeypatch.setattr(service, "get_scan", get_scan_with_claim)
+    controlled = getattr(service, control_method)(scan["id"])
+    assert claim_injected is True
+    assert controlled["status"] == transition_status
+
+    monkeypatch.setattr(service, "get_scan", original_get_scan)
+    with pytest.raises(finder_module.FinderConflict, match="Pause or cancel"):
+        service.continue_from(
+            scan["id"],
+            source_url=ALTERNATE_ROOT,
+            additional_pages=1,
+        )
+
+    if inactive_status == "paused":
+        service._update_scan(
+            scan["id"],
+            status="paused",
+            pause_requested=1,
+            cancel_requested=0,
+        )
+    else:
+        service._update_scan(
+            scan["id"],
+            status="canceled",
+            pause_requested=0,
+            cancel_requested=1,
+            finished_at=finder_module.utc_now(),
+        )
+    switched = service.continue_from(
+        scan["id"],
+        source_url=ALTERNATE_ROOT,
+        additional_pages=1,
+    )
+    assert switched["status"] == "queued"
+    assert switched["source_url"] == ALTERNATE_ROOT
+    assert switched["next_url"] == ALTERNATE_ROOT
+
+
 @pytest.mark.asyncio
 async def test_finder_extend_continues_from_cursor_and_preserves_scan_state(
     tmp_path: Path, monkeypatch
@@ -1796,8 +1881,26 @@ async def test_finder_continue_accumulates_new_source_deduplicates_and_restarts(
         ]
     assert feedback_before
 
-    # Simulate a process stopping after the durable continuation update but
-    # before its local queue can run. A new service must recover the queued row.
+    # A canceled scan may abandon its remaining durable cursor without losing
+    # any accumulated candidate, review, reference, or feedback state.
+    with database.connect() as connection:
+        connection.execute(
+            """UPDATE finder_scans
+               SET status = 'canceled', next_url = ?, cancel_requested = 1,
+                   pause_requested = 1, error = 'Canceled by user',
+                   finished_at = updated_at
+               WHERE id = ?""",
+            (PAGE_2, scan["id"]),
+        )
+    canceled = service.get_scan(scan["id"])
+    assert canceled is not None
+    assert canceled["status"] == "canceled"
+    assert canceled["next_url"] == PAGE_2
+    assert canceled["candidate_count"] == initial_total
+    assert canceled["accepted_count"] == 1
+
+    # Simulate a process stopping after the durable source switch but before
+    # its local queue can run. A new service must recover the queued row.
     await service.stop()
     continued = service.continue_from(
         scan["id"],
@@ -1814,6 +1917,16 @@ async def test_finder_continue_accumulates_new_source_deduplicates_and_restarts(
     assert continued["feedback_revision"] == before["feedback_revision"]
     assert continued["accepted_count"] == 1
     assert continued["continuable"] is False
+    assert continued["cancel_requested"] is False
+    assert continued["pause_requested"] is False
+    assert continued["error"] == ""
+    assert continued["finished_at"] is None
+    with pytest.raises(finder_module.FinderConflict, match="Pause or cancel"):
+        service.continue_from(
+            scan["id"],
+            source_url=ALTERNATE_ROOT,
+            additional_pages=2,
+        )
 
     restarted = FinderService(
         config,
@@ -1876,7 +1989,7 @@ async def test_finder_continue_accumulates_new_source_deduplicates_and_restarts(
         await restarted.stop()
 
 
-def test_finder_continue_rejects_unsafe_states_and_page_allowances(
+def test_finder_continue_validates_states_and_page_allowances(
     tmp_path: Path,
 ) -> None:
     config, database, tag_id = configured(tmp_path)
@@ -1916,27 +2029,20 @@ def test_finder_continue_rejects_unsafe_states_and_page_allowances(
             source_url=ALTERNATE_ROOT,
             additional_pages=1,
         )
-    with pytest.raises(finder_module.FinderConflict, match="completed"):
-        service.continue_from(
-            scan["id"],
-            source_url=ALTERNATE_ROOT,
-            additional_pages=1,
-        )
-
-    with database.connect() as connection:
-        connection.execute(
-            """UPDATE finder_scans
-               SET status = 'completed', next_url = ?, pages_completed = 1,
-                   page_limit = 1, cancel_requested = 0, pause_requested = 0
-               WHERE id = ?""",
-            (PAGE_2, scan["id"]),
-        )
-    with pytest.raises(finder_module.FinderConflict, match="Extend"):
-        service.continue_from(
-            scan["id"],
-            source_url=ALTERNATE_ROOT,
-            additional_pages=1,
-        )
+    for active_status in sorted(finder_module.ACTIVE_STATUSES):
+        with database.connect() as connection:
+            connection.execute(
+                """UPDATE finder_scans
+                   SET status = ?, cancel_requested = 0, pause_requested = 0
+                   WHERE id = ?""",
+                (active_status, scan["id"]),
+            )
+        with pytest.raises(finder_module.FinderConflict, match="Pause or cancel"):
+            service.continue_from(
+                scan["id"],
+                source_url=ALTERNATE_ROOT,
+                additional_pages=1,
+            )
 
     with database.connect() as connection:
         connection.execute(
@@ -1955,43 +2061,66 @@ def test_finder_continue_rejects_unsafe_states_and_page_allowances(
             additional_pages=1,
         )
 
-    for status, cancel_requested, ranking_version, message in (
-        ("failed", 0, finder_module.CURRENT_RANKING_VERSION, "failed"),
-        ("canceled", 1, finder_module.CURRENT_RANKING_VERSION, "canceled"),
-        ("completed", 0, finder_module.LEGACY_RANKING_VERSION, "legacy-ranked"),
-    ):
-        with database.connect() as connection:
-            connection.execute(
-                """UPDATE finder_scans
-                   SET status = ?, next_url = NULL, pages_completed = 1,
-                       page_limit = 1, cancel_requested = ?,
-                       pause_requested = 0, ranking_version = ?
-                   WHERE id = ?""",
-                (status, cancel_requested, ranking_version, scan["id"]),
-            )
-        with pytest.raises(finder_module.FinderConflict, match=message):
-            service.continue_from(
-                scan["id"],
-                source_url=ALTERNATE_ROOT,
-                additional_pages=1,
-            )
-
     with database.connect() as connection:
         connection.execute(
             """UPDATE finder_scans
                SET status = 'completed', next_url = NULL, pages_completed = 1,
-                   page_limit = 10, cancel_requested = 0, pause_requested = 0,
+                   page_limit = 1, cancel_requested = 0, pause_requested = 0,
                    ranking_version = ?
                WHERE id = ?""",
-            (finder_module.CURRENT_RANKING_VERSION, scan["id"]),
+            (finder_module.LEGACY_RANKING_VERSION, scan["id"]),
         )
-    first = service.continue_from(
-        scan["id"],
-        source_url=ALTERNATE_ROOT,
-        additional_pages=1,
+    with pytest.raises(finder_module.FinderConflict, match="legacy-ranked"):
+        service.continue_from(
+            scan["id"],
+            source_url=ALTERNATE_ROOT,
+            additional_pages=1,
+        )
+
+    inactive_states = (
+        ("paused", 0, 1, PAGE_2),
+        ("canceled", 1, 0, PAGE_2),
+        ("failed", 0, 0, PAGE_2),
+        ("completed_with_errors", 0, 0, PAGE_2),
+        ("completed", 0, 0, None),
     )
-    assert first["status"] == "queued"
-    with pytest.raises(finder_module.FinderConflict, match="completed"):
+    for status, cancel_requested, pause_requested, next_url in inactive_states:
+        with database.connect() as connection:
+            connection.execute(
+                """UPDATE finder_scans
+                   SET status = ?, source_url = ?, next_url = ?,
+                       pages_completed = 1, page_limit = 50,
+                       cancel_requested = ?, pause_requested = ?,
+                       ranking_version = ?, error = 'old source failed',
+                       finished_at = updated_at
+                   WHERE id = ?""",
+                (
+                    status,
+                    ROOT,
+                    next_url,
+                    cancel_requested,
+                    pause_requested,
+                    finder_module.CURRENT_RANKING_VERSION,
+                    scan["id"],
+                ),
+            )
+        switched = service.continue_from(
+            scan["id"],
+            source_url=ALTERNATE_ROOT,
+            additional_pages=2,
+        )
+        assert switched["id"] == scan["id"]
+        assert switched["status"] == "queued"
+        assert switched["source_url"] == ALTERNATE_ROOT
+        assert switched["next_url"] == ALTERNATE_ROOT
+        assert switched["pages_completed"] == 1
+        assert switched["page_limit"] == 3
+        assert switched["cancel_requested"] is False
+        assert switched["pause_requested"] is False
+        assert switched["error"] == ""
+        assert switched["finished_at"] is None
+
+    with pytest.raises(finder_module.FinderConflict, match="Pause or cancel"):
         service.continue_from(
             scan["id"],
             source_url=ALTERNATE_ROOT,
@@ -2693,14 +2822,6 @@ async def test_finder_api_signs_best_preview(tmp_path: Path, monkeypatch) -> Non
                        WHERE id = ?""",
                     (PAGE_2, scan_id),
                 )
-            nonexhausted_continuation = await client.post(
-                f"/api/finder/scans/{scan_id}/continue",
-                json={
-                    "source_url": ALTERNATE_ROOT,
-                    "additional_pages": 1,
-                },
-            )
-            assert nonexhausted_continuation.status_code == 409
             accepted_extension = await client.post(
                 f"/api/finder/scans/{scan_id}/extend",
                 json={"additional_pages": 1},
@@ -2764,6 +2885,22 @@ async def test_finder_api_signs_best_preview(tmp_path: Path, monkeypatch) -> Non
                 json={"additional_pages": 1},
             )
             assert canceled_extension.status_code == 409
+            canceled_switch = await client.post(
+                f"/api/finder/scans/{scan_id}/continue",
+                json={
+                    "source_url": ROOT,
+                    "additional_pages": 1,
+                },
+            )
+            assert canceled_switch.status_code == 202
+            switched_scan = canceled_switch.json()["scan"]
+            assert switched_scan["id"] == scan_id
+            assert switched_scan["status"] == "queued"
+            assert switched_scan["source_url"] == ROOT
+            assert switched_scan["next_url"] == ROOT
+            assert switched_scan["cancel_requested"] is False
+            assert switched_scan["pause_requested"] is False
+            await asyncio.wait_for(app.state.finder.queue.join(), 30)
 
             with app.state.db.connect() as connection:
                 connection.execute(

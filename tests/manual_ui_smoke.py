@@ -38,6 +38,7 @@ def build_visual_app(
     finder_unusable_save: bool = False,
     finder_exhausted: bool = False,
     finder_continue: bool = False,
+    finder_switch_source: bool = False,
     finder_pagination: bool = False,
     finder_tag: bool = False,
     finder_retry: bool = False,
@@ -230,6 +231,20 @@ def build_visual_app(
     }
     finder_race_state = {"review": "pending", "results_calls": 0, "selected": []}
     finder_continue_state = {"scan_calls": 0, "continue_calls": 0}
+    finder_switch_review_counts = {
+        "pending": 119,
+        "accepted": 3,
+        "maybe": 1,
+        "rejected": 1,
+        "total": 124,
+    }
+    finder_switch_source_state: dict[str, object] = {
+        "cancel_calls": 0,
+        "continue_calls": 0,
+        "submitted_source_url": "",
+        "submitted_additional_pages": 0,
+        "cancelled_next_url": "",
+    }
     finder_retry_state = {"retry_calls": 0}
     finder_tag_state: dict[str, object] = {"created": False, "payload": None}
     finder_tag_index_state = {
@@ -252,6 +267,32 @@ def build_visual_app(
     }
     if finder_race:
         finder_scan["status"] = "running"
+    if finder_switch_source:
+        finder_scan.update(
+            {
+                "status": "running",
+                "search_mode": "joytag",
+                "joytag_tag": "pov",
+                "joytag_required_tags": ["pov", "footjob"],
+                "joytag_excluded_tags": ["solo"],
+                "reference_fingerprint": "c" * 64,
+                "ranking_version": "joytag-v1",
+                "source_url": "https://www.pornpics.com/?q=pov+footjob",
+                "next_url": "https://www.pornpics.com/?q=pov+footjob&page=2",
+                "page_limit": 50,
+                "pages_completed": 1,
+                "processed_galleries": 20,
+                "processed_images": 393,
+                "corpus_search_complete": True,
+                "corpus_galleries_scored": 418,
+                "corpus_images_scored": 8156,
+                "candidate_count": 124,
+                "minimum_score": 0.4,
+                "continuable": False,
+                "progress_percent": 2,
+                "review_counts": dict(finder_switch_review_counts),
+            }
+        )
     if finder_retry:
         finder_scan.update(
             {
@@ -541,6 +582,22 @@ def build_visual_app(
             await asyncio.sleep(1.2)
         return snapshot
 
+    async def fake_finder_cancel(scan_id: str, **kwargs: object) -> dict:
+        if (
+            scan_id != finder_scan["id"]
+            or finder_scan["status"] != "running"
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Only the running visual Finder scan can be cancelled",
+            )
+        finder_switch_source_state["cancel_calls"] = (
+            int(finder_switch_source_state["cancel_calls"]) + 1
+        )
+        finder_switch_source_state["cancelled_next_url"] = finder_scan["next_url"]
+        finder_scan["status"] = "cancelled"
+        return {"scan": dict(finder_scan)}
+
     async def fake_finder_continue(
         scan_id: str, payload: object, **kwargs: object
     ) -> dict:
@@ -555,6 +612,42 @@ def build_visual_app(
             if isinstance(payload, dict)
             else getattr(payload, "additional_pages", 5)
         )
+        if finder_switch_source:
+            if (
+                scan_id != finder_scan["id"]
+                or finder_scan["status"] != "cancelled"
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Cancel the visual Finder scan before switching source",
+                )
+            finder_switch_source_state["continue_calls"] = (
+                int(finder_switch_source_state["continue_calls"]) + 1
+            )
+            finder_switch_source_state["submitted_source_url"] = source_url
+            finder_switch_source_state["submitted_additional_pages"] = (
+                additional_pages
+            )
+            finder_scan.update(
+                {
+                    "status": "queued",
+                    "source_url": source_url,
+                    "next_url": source_url,
+                    "page_limit": (
+                        int(finder_scan["pages_completed"]) + additional_pages
+                    ),
+                    "continuable": False,
+                    "progress_percent": (
+                        int(finder_scan["pages_completed"])
+                        / (
+                            int(finder_scan["pages_completed"])
+                            + additional_pages
+                        )
+                        * 100
+                    ),
+                }
+            )
+            return {"scan": dict(finder_scan)}
         await asyncio.sleep(0.15)
         if "blocked-source" in source_url:
             raise HTTPException(
@@ -576,6 +669,19 @@ def build_visual_app(
             }
         )
         return {"scan": finder_scan}
+
+    async def fake_finder_switch_source_state() -> dict:
+        return {
+            **finder_switch_source_state,
+            "scan_id": finder_scan["id"],
+            "status": finder_scan["status"],
+            "source_url": finder_scan["source_url"],
+            "next_url": finder_scan["next_url"],
+            "page_limit": finder_scan["page_limit"],
+            "pages_completed": finder_scan["pages_completed"],
+            "candidate_count": finder_scan["candidate_count"],
+            "review_counts": dict(finder_switch_review_counts),
+        }
 
     async def fake_finder_retry(scan_id: str, **kwargs: object) -> dict:
         if scan_id != finder_scan["id"] or finder_scan["status"] != "failed":
@@ -998,6 +1104,53 @@ def build_visual_app(
                 "best_ordinal": 7,
             },
         ]
+        if finder_switch_source:
+            all_results = []
+            for index in range(124):
+                if index < 119:
+                    review = "pending"
+                elif index < 122:
+                    review = "accepted"
+                elif index == 122:
+                    review = "maybe"
+                else:
+                    review = "rejected"
+                base = results[index % len(results)]
+                all_results.append(
+                    {
+                        **base,
+                        "id": f"visual-switch-result-{index + 1}",
+                        "gallery_id": galleries[index % len(galleries)]["id"],
+                        "gallery_url": galleries[index % len(galleries)]["url"],
+                        "title": f"Retained JoyTag candidate {index + 1:03d}",
+                        "rank": index + 1,
+                        "score": 0.96 - index / 1000,
+                        "review": review,
+                    }
+                )
+            review_filter = str(kwargs.get("review", "pending"))
+            minimum_score = float(kwargs.get("min_score") or 0)
+            filtered = [
+                item
+                for item in all_results
+                if (review_filter == "all" or item["review"] == review_filter)
+                and item["score"] >= minimum_score
+            ]
+            offset = max(0, int(kwargs.get("offset") or 0))
+            limit = max(1, int(kwargs.get("limit") or 24))
+            page_items = filtered[offset : offset + limit]
+            return {
+                "items": page_items,
+                "total": len(filtered),
+                "counts": dict(finder_switch_review_counts),
+                "limit": limit,
+                "offset": offset,
+                "page": offset // limit + 1,
+                "page_size": limit,
+                "page_count": (len(filtered) + limit - 1) // limit,
+                "has_previous": offset > 0,
+                "has_next": offset + len(page_items) < len(filtered),
+            }
         if finder_pagination:
             all_results = [
                 {
@@ -2387,6 +2540,161 @@ window.addEventListener('load', () => {
   }, 16500);
 });
 """
+        if finder_switch_source:
+            script += """
+window.confirm = () => true;
+window.addEventListener('load', () => {
+  const oldCursor = 'https://www.pornpics.com/?q=pov+footjob&page=2';
+  const nextUrl = 'https://www.pornpics.com/?q=pov+paizuri';
+  let phase = 'waiting-running';
+  let initialTitle = '';
+  let initialCards = 0;
+  let statePending = false;
+  const countsOk = () => (
+    document.querySelector('#finder-pending-count')?.textContent === '119'
+    && document.querySelector('#finder-accepted-count')?.textContent === '3'
+    && document.querySelector('#finder-maybe-count')?.textContent === '1'
+    && document.querySelector('#finder-rejected-count')?.textContent === '1'
+  );
+  const resultsOk = () => {
+    const cards = document.querySelectorAll('#finder-result-grid .finder-card');
+    const title = document.querySelector('#finder-result-grid .finder-card-title')
+      ?.textContent || '';
+    return cards.length === initialCards && title === initialTitle;
+  };
+  const poll = setInterval(() => {
+    document.documentElement.dataset.finderSwitchSourcePhase = phase;
+    const session = document.querySelector('#finder-session-label')?.textContent || '';
+    const cancel = document.querySelector('#finder-cancel');
+    const form = document.querySelector('#finder-continue');
+    const title = document.querySelector('#finder-continue-title')?.textContent || '';
+    const source = document.querySelector('#finder-continue-source');
+    const pages = document.querySelector('#finder-continue-pages');
+    const button = document.querySelector('#finder-continue-button');
+    const pagesScanned = document.querySelector('#finder-pages-scanned')?.textContent || '';
+    const pagesTotal = document.querySelector('#finder-pages-total')?.textContent || '';
+    const candidates = document.querySelector('#finder-candidates-found')?.textContent || '';
+    const cardCount = document.querySelectorAll('#finder-result-grid .finder-card').length;
+    const firstTitle = document.querySelector('#finder-result-grid .finder-card-title')
+      ?.textContent || '';
+    document.documentElement.dataset.finderSwitchSourceDebug = [
+      session,
+      cancel?.hidden,
+      form?.hidden,
+      title,
+      button?.disabled,
+      source?.value,
+      pagesScanned,
+      pagesTotal,
+      candidates,
+      cardCount,
+      firstTitle,
+    ].join('|');
+    if (
+      phase === 'waiting-running'
+      && session.includes('JoyTag')
+      && session.includes('running')
+      && cancel
+      && !cancel.hidden
+      && !cancel.disabled
+      && pagesScanned === '1'
+      && pagesTotal === '50'
+      && candidates === '124'
+      && countsOk()
+      && cardCount === 24
+      && firstTitle
+    ) {
+      initialTitle = firstTitle;
+      initialCards = cardCount;
+      phase = 'cancel-sent';
+      cancel.click();
+      return;
+    }
+    if (
+      phase === 'cancel-sent'
+      && session.includes('cancelled')
+      && cancel?.hidden
+      && form
+      && !form.hidden
+      && title === 'Switch source'
+      && button?.textContent.includes('Switch source')
+      && !button.disabled
+      && pagesScanned === '1'
+      && pagesTotal === '50'
+      && candidates === '124'
+      && countsOk()
+      && resultsOk()
+    ) {
+      source.value = nextUrl;
+      source.dispatchEvent(new Event('input', { bubbles: true }));
+      pages.value = '9';
+      pages.dispatchEvent(new Event('input', { bubbles: true }));
+      const summary = document.querySelector('#finder-continue-summary')
+        ?.textContent || '';
+      if (
+        !summary.includes('Up to 9 new pages')
+        || !summary.includes('keep 124 candidates and all reviews')
+      ) return;
+      phase = 'switch-sent';
+      button.click();
+      return;
+    }
+    if (
+      phase === 'switch-sent'
+      && session.includes('queued')
+      && form?.hidden
+      && document.querySelector('#finder-source')?.value === nextUrl
+      && document.querySelector('#finder-scan-select')?.value === 'visual-finder'
+      && pagesScanned === '1'
+      && pagesTotal === '10'
+      && candidates === '124'
+      && countsOk()
+      && resultsOk()
+      && !statePending
+    ) {
+      statePending = true;
+      phase = 'checking-state';
+      fetch('/manual/finder-switch-source/state')
+        .then(response => response.json())
+        .then(data => {
+          const reviews = data.review_counts || {};
+          const passed = (
+            data.cancel_calls === 1
+            && data.continue_calls === 1
+            && data.submitted_source_url === nextUrl
+            && data.submitted_additional_pages === 9
+            && data.cancelled_next_url === oldCursor
+            && data.scan_id === 'visual-finder'
+            && data.status === 'queued'
+            && data.source_url === nextUrl
+            && data.next_url === nextUrl
+            && data.page_limit === 10
+            && data.pages_completed === 1
+            && data.candidate_count === 124
+            && reviews.pending === 119
+            && reviews.accepted === 3
+            && reviews.maybe === 1
+            && reviews.rejected === 1
+            && reviews.total === 124
+          );
+          document.documentElement.dataset.finderSwitchSource = passed
+            ? 'pass'
+            : 'fail';
+          phase = passed ? 'complete' : 'state-invalid';
+          clearInterval(poll);
+        })
+        .catch(() => {
+          phase = 'state-request-failed';
+        });
+    }
+  }, 60);
+  setTimeout(() => {
+    if (!document.documentElement.dataset.finderSwitchSource) {
+      document.documentElement.dataset.finderSwitchSource = 'fail';
+    }
+  }, 7500);
+});
+"""
         if finder_continue:
             script += """window.addEventListener('load',()=>{const failedUrl='https://www.pornpics.com/blocked-source/';const nextUrl='https://www.pornpics.com/new-category/';let phase='waiting';let successAt=0;const countsOk=()=>document.querySelector('#finder-accepted-count')?.textContent==='1'&&document.querySelector('#finder-rejected-count')?.textContent==='1';const cardOk=()=>document.querySelectorAll('#finder-result-grid .finder-card').length===1;const poll=setInterval(()=>{const form=document.querySelector('#finder-continue');const source=document.querySelector('#finder-continue-source');const pages=document.querySelector('#finder-continue-pages');const button=document.querySelector('#finder-continue-button');const toasts=[...document.querySelectorAll('.toast')].map(item=>item.textContent).join(' ');if(phase==='waiting'&&form&&!form.hidden&&source&&pages&&button&&!button.disabled&&countsOk()){document.querySelector('[data-finder-review=accepted]')?.click();pages.value='7';pages.dispatchEvent(new Event('input',{bubbles:true}));if(!document.querySelector('#finder-continue-summary')?.textContent.includes('Up to 7 new pages'))return;source.value=failedUrl;button.click();phase='failure-sent'}else if(phase==='failure-sent'&&form&&!form.hidden&&!button?.disabled&&source?.value===failedUrl&&countsOk()&&cardOk()&&toasts.includes('Could not continue Finder search')){document.documentElement.dataset.finderContinueFailure='pass';document.querySelector('#finder-refresh')?.click();setTimeout(()=>{source.value=nextUrl;button.click();successAt=Date.now();phase='success-sent'},180)}else if(phase==='success-sent'&&Date.now()-successAt>1800){const passed=form?.hidden&&document.querySelector('#finder-session-label')?.textContent.includes('running')&&document.querySelector('#finder-source')?.value===nextUrl&&document.querySelector('#finder-scan-select')?.value==='visual-finder'&&countsOk()&&cardOk();document.documentElement.dataset.finderContinue=passed?'pass':'fail';clearInterval(poll)}},50);setTimeout(()=>{if(!document.documentElement.dataset.finderContinue)document.documentElement.dataset.finderContinue='fail';if(!document.documentElement.dataset.finderContinueFailure)document.documentElement.dataset.finderContinueFailure='fail'},6500)});"""
         if finder_review_mode:
@@ -2501,6 +2809,13 @@ window.addEventListener('load', () => {
             route.endpoint = fake_finder_scans
             route.dependant.call = fake_finder_scans
         elif (
+            finder_switch_source
+            and getattr(route, "path", None) == "/api/finder/scans/{scan_id}"
+            and "DELETE" in getattr(route, "methods", set())
+        ):
+            route.endpoint = fake_finder_cancel
+            route.dependant.call = fake_finder_cancel
+        elif (
             open_finder
             and getattr(route, "path", None) == "/api/finder/scans/{scan_id}"
         ):
@@ -2574,6 +2889,12 @@ window.addEventListener('load', () => {
             fake_finder_retry_state,
             methods=["GET"],
         )
+    if finder_switch_source:
+        app.add_api_route(
+            "/manual/finder-switch-source/state",
+            fake_finder_switch_source_state,
+            methods=["GET"],
+        )
     if finder_modal_review:
         app.add_api_route(
             "/manual/finder-modal-review/boundary",
@@ -2614,6 +2935,7 @@ def main() -> None:
     parser.add_argument("--finder-unusable-save", action="store_true")
     parser.add_argument("--finder-exhausted", action="store_true")
     parser.add_argument("--finder-continue", action="store_true")
+    parser.add_argument("--finder-switch-source", action="store_true")
     parser.add_argument("--finder-pagination", action="store_true")
     parser.add_argument("--finder-tag", action="store_true")
     parser.add_argument("--finder-retry", action="store_true")
@@ -2628,6 +2950,7 @@ def main() -> None:
         or args.finder_unusable_save
         or args.finder_exhausted
         or args.finder_continue
+        or args.finder_switch_source
         or args.finder_pagination
         or args.finder_tag
         or args.finder_retry
@@ -2646,6 +2969,10 @@ def main() -> None:
         if args.finder_retry and args.mobile
         else "finder-retry"
         if args.finder_retry
+        else "finder-switch-source-mobile"
+        if args.finder_switch_source and args.mobile
+        else "finder-switch-source"
+        if args.finder_switch_source
         else "finder-pagination"
         if args.finder_pagination
         else "finder-continue-mobile"
@@ -2723,6 +3050,7 @@ def main() -> None:
                     finder_unusable_save=args.finder_unusable_save,
                     finder_exhausted=args.finder_exhausted,
                     finder_continue=args.finder_continue,
+                    finder_switch_source=args.finder_switch_source,
                     finder_pagination=args.finder_pagination,
                     finder_tag=args.finder_tag,
                     finder_retry=args.finder_retry,
@@ -2758,7 +3086,7 @@ def main() -> None:
             "--disable-sync",
             "--force-prefers-reduced-motion",
             "--no-first-run",
-            f"--virtual-time-budget={18000 if args.finder_modal_review else 8500 if args.finder_tag else 7500 if args.finder_unusable_save or args.finder_continue else 6500 if args.finder_direct_assign else 6000 if args.finder_retry else 4500 if args.finder_race else 4000 if args.finder_pose_flow else 3000 if args.lightbox or args.pose else 2000 if finder_mode else 1000}",
+            f"--virtual-time-budget={18000 if args.finder_modal_review else 8500 if args.finder_tag or args.finder_switch_source else 7500 if args.finder_unusable_save or args.finder_continue else 6500 if args.finder_direct_assign else 6000 if args.finder_retry else 4500 if args.finder_race else 4000 if args.finder_pose_flow else 3000 if args.lightbox or args.pose else 2000 if finder_mode else 1000}",
             f"--user-data-dir={Path(directory) / 'chrome-profile'}",
             f"--window-size={viewport}",
             f"--screenshot={output}",
@@ -2769,6 +3097,7 @@ def main() -> None:
             or args.finder_direct_assign
             or args.finder_unusable_save
             or args.finder_continue
+            or args.finder_switch_source
             or args.finder_pagination
             or args.finder_tag
             or args.finder_retry
@@ -2784,6 +3113,7 @@ def main() -> None:
                 or args.finder_direct_assign
                 or args.finder_unusable_save
                 or args.finder_continue
+                or args.finder_switch_source
                 or args.finder_pagination
                 or args.finder_tag
                 or args.finder_retry
@@ -2794,6 +3124,7 @@ def main() -> None:
                 or args.finder_direct_assign
                 or args.finder_unusable_save
                 or args.finder_continue
+                or args.finder_switch_source
                 or args.finder_pagination
                 or args.finder_tag
                 or args.finder_retry
@@ -2823,6 +3154,21 @@ def main() -> None:
                 raise AssertionError(
                     "continued Finder scan lost its new source, results, or review counts"
                 )
+        if (
+            args.finder_switch_source
+            and 'data-finder-switch-source="pass"' not in completed.stdout
+        ):
+            phase = completed.stdout.partition(
+                'data-finder-switch-source-phase="'
+            )[2].partition('"')[0]
+            debug = completed.stdout.partition(
+                'data-finder-switch-source-debug="'
+            )[2].partition('"')[0]
+            raise AssertionError(
+                "cancelled JoyTag Finder scan did not switch source in place "
+                "while retaining its cursor, candidates, and reviews "
+                f"(phase={phase or 'unknown'}, debug={debug or 'none'})"
+            )
         if (
             args.finder_pagination
             and 'data-finder-pagination="pass"' not in completed.stdout

@@ -3724,13 +3724,30 @@
     return finderScanSourceExhausted(scan) && Number(scan.pagesScanned || 0) < FINDER_MAX_PAGES;
   }
 
+  function finderScanCanSwitchSource(scan = state.finderScan) {
+    if (
+      !scan?.id
+      || !scan.rankingCurrent
+      || finderScanSourceExhausted(scan)
+      || Number(scan.pagesScanned || 0) >= FINDER_MAX_PAGES
+    ) return false;
+    return ['paused', 'failed', 'cancelled', 'canceled', 'completed', 'completed_with_errors', 'complete', 'done'].includes(scan.status);
+  }
+
+  function finderScanCanChangeSource(scan = state.finderScan) {
+    if (
+      !scan?.id
+      || !scan.rankingCurrent
+      || Number(scan.pagesScanned || 0) >= FINDER_MAX_PAGES
+      || !['paused', 'failed', 'cancelled', 'canceled', 'completed', 'completed_with_errors', 'complete', 'done'].includes(scan.status)
+    ) return false;
+    return finderScanCanContinue(scan) || finderScanCanSwitchSource(scan);
+  }
+
   function finderScanAtPageCap(scan = state.finderScan) {
     if (!scan?.id || !scan.rankingCurrent) return false;
-    const pagesAtCap = finderScanSourceExhausted(scan)
-      ? Number(scan.pagesScanned || 0) >= FINDER_MAX_PAGES
-      : scan.hasNextPage && Number(scan.pages || 0) >= FINDER_MAX_PAGES;
-    if (!pagesAtCap) return false;
-    return ['completed', 'completed_with_errors', 'complete', 'done', 'paused', 'running', 'scanning', 'active'].includes(scan.status);
+    return Number(scan.pagesScanned || 0) >= FINDER_MAX_PAGES
+      || (scan.hasNextPage && Number(scan.pages || 0) >= FINDER_MAX_PAGES);
   }
 
   function finderScanSourceExhausted(scan = state.finderScan) {
@@ -5199,7 +5216,8 @@
     $('#finder-ranking-note').hidden = !legacyRanking;
     ['finder-pause', 'finder-resume', 'finder-cancel'].forEach(id => { $(`#${id}`).disabled = state.finderBusy; });
     const canExtend = finderScanCanExtend(scan);
-    const canContinue = finderScanCanContinue(scan);
+    const canChangeSource = finderScanCanChangeSource(scan);
+    const switchingSource = finderScanCanSwitchSource(scan);
     const atPageCap = finderScanAtPageCap(scan);
     const joytagScan = finderScanUsesJoyTag(scan);
     const finderReady = joytagScan
@@ -5207,15 +5225,20 @@
       : Boolean(state.finderStatus?.ready);
     const finderMutationPending = state.finderFeedbackBusy || finderFeedbackIsSaving();
     $('#finder-extend').hidden = !canExtend;
-    $('#finder-continue').hidden = !canContinue;
+    $('#finder-continue').hidden = !canChangeSource;
     $('#finder-limit-note').hidden = !atPageCap;
     $('#finder-extend').classList.toggle('is-unavailable', canExtend && !finderReady);
-    $('#finder-continue').classList.toggle('is-unavailable', canContinue && !finderReady);
+    $('#finder-continue').classList.toggle('is-unavailable', canChangeSource && !finderReady);
     $('#finder-extend-pages').disabled = !canExtend || !finderReady || state.finderBusy;
     $('#finder-extend-button').disabled = !canExtend || !finderReady || state.finderBusy;
-    $('#finder-continue-source').disabled = !canContinue || !finderReady || state.finderBusy || finderMutationPending;
-    $('#finder-continue-pages').disabled = !canContinue || !finderReady || state.finderBusy || finderMutationPending;
-    $('#finder-continue-button').disabled = !canContinue || !finderReady || state.finderBusy || finderMutationPending;
+    $('#finder-continue-source').disabled = !canChangeSource || !finderReady || state.finderBusy || finderMutationPending;
+    $('#finder-continue-pages').disabled = !canChangeSource || !finderReady || state.finderBusy || finderMutationPending;
+    $('#finder-continue-button').disabled = !canChangeSource || !finderReady || state.finderBusy || finderMutationPending;
+    $('#finder-continue-title').textContent = switchingSource ? 'Switch source' : 'Explore another source';
+    const continueButtonLabel = $('#finder-continue-button-label');
+    if (continueButtonLabel) {
+      continueButtonLabel.textContent = switchingSource ? 'Switch source' : 'Continue same scan';
+    }
     const unavailableTitle = finderReady ? '' : state.finderStatus?.detail || 'Finder is unavailable';
     $('#finder-extend-button').title = unavailableTitle;
     $('#finder-continue-button').title = unavailableTitle;
@@ -5260,7 +5283,7 @@
       updateFinderExtendSummary({ commit: true });
       if (!finderReady) $('#finder-extend-summary').textContent += ' · Finder unavailable';
     }
-    if (canContinue) {
+    if (canChangeSource) {
       updateFinderContinueSummary({ commit: true });
       if (!finderReady) $('#finder-continue-summary').textContent += ' · Finder unavailable';
     }
@@ -6119,11 +6142,12 @@
   async function continueFinderScan() {
     const scan = state.finderScan;
     if (
-      !finderScanCanContinue(scan)
+      !finderScanCanChangeSource(scan)
       || state.finderBusy
       || state.finderFeedbackBusy
       || finderFeedbackIsSaving()
     ) return;
+    const switchingSource = finderScanCanSwitchSource(scan);
     const config = readFinderContinueConfig({ validate: true });
     if (!config) return;
     const button = $('#finder-continue-button');
@@ -6131,7 +6155,7 @@
     state.finderBusy = true;
     $('#finder-continue-source').disabled = true;
     $('#finder-continue-pages').disabled = true;
-    setButtonBusy(button, true, 'Continuing…');
+    setButtonBusy(button, true, switchingSource ? 'Switching…' : 'Continuing…');
     try {
       const data = await api(`/api/finder/scans/${encodeURIComponent(scan.id)}/continue`, {
         method: 'POST',
@@ -6156,13 +6180,17 @@
       );
       const keptCopy = `${formatNumber(candidateCount)} ${candidateCount === 1 ? 'candidate' : 'candidates'} and all reviews remain in this scan.`;
       toast(
-        'Exploring another source',
+        switchingSource ? 'Finder source switched' : 'Exploring another source',
         `Scanning up to ${config.additionalPages} new ${config.additionalPages === 1 ? 'page' : 'pages'} from ${displayHost(config.sourceUrl)}. ${keptCopy}`,
         'success'
       );
-      announce(`Finder scan continued from another source for up to ${config.additionalPages} pages.`);
+      announce(
+        switchingSource
+          ? `Finder source switched for up to ${config.additionalPages} pages.`
+          : `Finder scan continued from another source for up to ${config.additionalPages} pages.`
+      );
     } catch (error) {
-      toast('Could not continue Finder search', errorMessage(error), 'error');
+      toast(switchingSource ? 'Could not switch Finder source' : 'Could not continue Finder search', errorMessage(error), 'error');
     } finally {
       invalidateFinderScanLoads();
       state.finderBusy = false;
