@@ -52,6 +52,31 @@ async def check(download: bool = False) -> None:
     first_keys = {item["key"] for item in listing["items"]}
     if first_keys.intersection(item["key"] for item in second_page["items"]):
         raise RuntimeError("Live search pagination repeated page-one galleries")
+
+    pasted_search = await scraper.browse(
+        url="https://www.pornpics.com/?q=pov+footjob",
+        page=1,
+    )
+    if not pasted_search["items"]:
+        raise RuntimeError("Pasted live search URL returned no galleries")
+    if (
+        not pasted_search["next_url"]
+        or "/search/srch.php?" not in pasted_search["next_url"]
+        or "q=pov+footjob" not in pasted_search["next_url"]
+        or "offset=20" not in pasted_search["next_url"]
+    ):
+        raise RuntimeError("Pasted live search URL did not expose its JSON cursor")
+    pasted_page_two = await scraper.browse(
+        url=pasted_search["next_url"],
+        page=2,
+    )
+    if not pasted_page_two["items"]:
+        raise RuntimeError("Pasted live search URL page two returned no galleries")
+    if {item["key"] for item in pasted_search["items"]}.intersection(
+        item["key"] for item in pasted_page_two["items"]
+    ):
+        raise RuntimeError("Pasted live search URL repeated page-one galleries")
+
     first = listing["items"][0]
     gallery = await scraper.gallery(first["url"])
     if not gallery["images"]:
@@ -68,6 +93,8 @@ async def check(download: bool = False) -> None:
         "category_third_page_items": len(category_page_three["items"]),
         "search_items": len(listing["items"]),
         "second_page_items": len(second_page["items"]),
+        "pasted_search_items": len(pasted_search["items"]),
+        "pasted_search_page_two_items": len(pasted_page_two["items"]),
         "direct_gallery_items": len(direct_gallery["items"]),
         "gallery_key": gallery["key"],
         "gallery_images": len(gallery["images"]),

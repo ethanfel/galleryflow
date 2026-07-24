@@ -1,11 +1,97 @@
 from __future__ import annotations
 
 import json
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
 from app.config import AppConfig
 from app.scraper import PornPicsScraper, ScrapedPage
+
+
+@pytest.mark.asyncio
+async def test_root_search_html_builds_search_json_cursor(monkeypatch) -> None:
+    source_url = "https://www.pornpics.com/?q=pov+footjob"
+    html = """
+    <html><head><script>
+      var PP_PAGE_TYPE = 'search';
+    </script></head><body>
+      <ul id="tiles">
+        <li class="thumbwook">
+          <a class="rel-link"
+             href="https://www.pornpics.com/galleries/first-10000001/">
+            <img data-src="https://cdni.pornpics.com/460/a/first.jpg"
+                 alt="First gallery">
+          </a>
+        </li>
+        <li class="thumbwook">
+          <a class="rel-link"
+             href="https://www.pornpics.com/galleries/second-10000002/">
+            <img data-src="https://cdni.pornpics.com/460/a/second.jpg"
+                 alt="Second gallery">
+          </a>
+        </li>
+      </ul>
+    </body></html>
+    """
+    scraper = PornPicsScraper(AppConfig())
+
+    async def fake_get(url: str) -> ScrapedPage:
+        assert url == source_url
+        return ScrapedPage(source_url, html)
+
+    monkeypatch.setattr(scraper, "_get_html", fake_get)
+    result = await scraper.browse(url=source_url)
+
+    assert [item["title"] for item in result["items"]] == [
+        "First gallery",
+        "Second gallery",
+    ]
+    next_parts = urlsplit(result["next_url"])
+    assert next_parts.scheme == "https"
+    assert next_parts.netloc == "www.pornpics.com"
+    assert next_parts.path == "/search/srch.php"
+    assert parse_qs(next_parts.query) == {
+        "q": ["pov footjob"],
+        "lang": ["en"],
+        "offset": ["20"],
+        "limit": ["20"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_root_search_json_cursor_preserves_query_and_advances_offset(
+    monkeypatch,
+) -> None:
+    cursor_url = (
+        "https://www.pornpics.com/search/srch.php?"
+        "q=pov+footjob&lang=en&offset=20&limit=20"
+    )
+    payload = [
+        {
+            "g_url": "https://www.pornpics.com/galleries/third-10000003/",
+            "t_url_460": "https://cdni.pornpics.com/460/a/third.jpg",
+            "desc": "Third gallery",
+        }
+    ]
+    scraper = PornPicsScraper(AppConfig())
+
+    async def fake_get(url: str) -> ScrapedPage:
+        assert url == cursor_url
+        return ScrapedPage(cursor_url, json.dumps(payload))
+
+    monkeypatch.setattr(scraper, "_get_html", fake_get)
+    result = await scraper.browse(url=cursor_url)
+
+    assert [item["title"] for item in result["items"]] == ["Third gallery"]
+    next_parts = urlsplit(result["next_url"])
+    assert next_parts.path == "/search/srch.php"
+    assert parse_qs(next_parts.query) == {
+        "q": ["pov footjob"],
+        "lang": ["en"],
+        "offset": ["40"],
+        "limit": ["20"],
+    }
 
 
 @pytest.mark.asyncio

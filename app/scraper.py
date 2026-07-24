@@ -138,11 +138,12 @@ class PornPicsScraper:
     def _infinite_scroll_url(
         soup: BeautifulSoup, base_url: str, item_count: int
     ) -> str | None:
-        """Build the cursor used by PornPics category/tag infinite scrolling.
+        """Build the cursor used by PornPics listing infinite scrolling.
 
-        Those pages render their first 20 galleries in HTML and fetch later
-        batches from the same path as JSON using ``offset`` and ``limit``.
-        They do not expose a conventional ``rel=next`` link.
+        Category and tag pages fetch later batches from their existing path.
+        Search pages render ``/?q=...`` as HTML, then switch to the dedicated
+        JSON search endpoint. Neither form exposes a conventional
+        ``rel=next`` link.
         """
         if item_count <= 0:
             return None
@@ -151,21 +152,34 @@ class PornPicsScraper:
         )
         page_type = re.search(
             r"\bPP_PAGE_TYPE\s*=\s*['\"]"
-            r"(category_rotator_maps|tag_rotator_maps)['\"]",
+            r"(category_rotator_maps|tag_rotator_maps|search)['\"]",
             scripts,
         )
         if not page_type:
             return None
         parts = urlsplit(base_url)
-        # PornPics' category strategy starts its JSON cursor at 20 even when
-        # one rendered card is filtered locally (for example, an ad or a
-        # thumbnail from an unapproved media host). It also deliberately drops
-        # the original page query and sends only its cursor parameters.
-        params = {"offset": "20", "limit": "20"}
+        if page_type.group(1) == "search":
+            query = str((parse_qs(parts.query).get("q") or [""])[-1]).strip()
+            if not query:
+                return None
+            params = {
+                "q": query,
+                "lang": "en",
+                "offset": "20",
+                "limit": "20",
+            }
+            path = "/search/srch.php"
+        else:
+            # PornPics' category strategy starts its JSON cursor at 20 even when
+            # one rendered card is filtered locally (for example, an ad or a
+            # thumbnail from an unapproved media host). It also deliberately
+            # drops the original page query and sends only its cursor parameters.
+            params = {"offset": "20", "limit": "20"}
+            path = parts.path
         try:
             return validate_source_url(
                 urlunsplit(
-                    (parts.scheme, parts.netloc, parts.path, urlencode(params), "")
+                    (parts.scheme, parts.netloc, path, urlencode(params), "")
                 )
             )
         except ValueError:
