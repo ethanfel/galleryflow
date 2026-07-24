@@ -8,13 +8,22 @@ import mimetypes
 import os
 import re
 import shutil
+import stat
+import threading
 import time
 import uuid
+from contextlib import contextmanager
+from collections.abc import Iterator
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
 import httpx
 from PIL import Image
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows uses the process lock only.
+    fcntl = None  # type: ignore[assignment]
 
 from .config import AppConfig
 from .db import Database, utc_now
@@ -51,6 +60,17 @@ _RENAME_NOREPLACE_UNAVAILABLE = frozenset(
     }
 )
 _HARDLINK_UNAVAILABLE = _RENAME_NOREPLACE_UNAVAILABLE | {errno.EACCES}
+_FLOCK_UNAVAILABLE = frozenset(
+    {
+        errno.EACCES,
+        errno.EPERM,
+        errno.EOPNOTSUPP,
+        errno.ENOSYS,
+        errno.EINVAL,
+    }
+)
+_POSE_PUBLISH_PROCESS_LOCK = threading.Lock()
+_POSE_PUBLISH_LOCK_STATE = threading.local()
 
 try:
     _LIBC = ctypes.CDLL(None, use_errno=True)
@@ -87,6 +107,87 @@ def _rename_noreplace(source: Path, target: Path) -> None:
     error = OSError(error_number, os.strerror(error_number), source)
     error.filename2 = target
     raise error
+
+
+@contextmanager
+def _pose_publish_lock(lock_directory: Path, should_cancel=None) -> Iterator[None]:
+    """Serialize the replace fallback in this process and, when supported, beyond it."""
+
+    lock_depth = getattr(_POSE_PUBLISH_LOCK_STATE, "depth", 0)
+    if lock_depth:
+        if should_cancel and should_cancel():
+            raise PoseExportCanceled("Pose export canceled")
+        _POSE_PUBLISH_LOCK_STATE.depth = lock_depth + 1
+        try:
+            yield
+        finally:
+            _POSE_PUBLISH_LOCK_STATE.depth = lock_depth
+        return
+
+    acquired_process_lock = False
+    lock_file = None
+    flock_acquired = False
+    try:
+        while not acquired_process_lock:
+            if should_cancel and should_cancel():
+                raise PoseExportCanceled("Pose export canceled")
+            acquired_process_lock = _POSE_PUBLISH_PROCESS_LOCK.acquire(timeout=0.05)
+
+        if should_cancel and should_cancel():
+            raise PoseExportCanceled("Pose export canceled")
+        if fcntl is not None:
+            lock_path = lock_directory / ".galleryflow-publish.lock"
+            lock_flags = os.O_CREAT | os.O_RDWR
+            lock_flags |= getattr(os, "O_CLOEXEC", 0)
+            lock_flags |= getattr(os, "O_NOFOLLOW", 0)
+            lock_fd = os.open(lock_path, lock_flags, 0o600)
+            try:
+                if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+                    raise OSError(
+                        errno.EINVAL,
+                        "Pose publish lock is not a regular file",
+                        lock_path,
+                    )
+                lock_file = os.fdopen(lock_fd, "r+b", buffering=0)
+            except Exception:
+                os.close(lock_fd)
+                raise
+            while True:
+                if should_cancel and should_cancel():
+                    raise PoseExportCanceled("Pose export canceled")
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    flock_acquired = True
+                    break
+                except BlockingIOError as exc:
+                    if exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                        time.sleep(0.05)
+                        continue
+                    if exc.errno in _FLOCK_UNAVAILABLE:
+                        break
+                    raise
+                except OSError as exc:
+                    if exc.errno in _FLOCK_UNAVAILABLE:
+                        break
+                    raise
+        _POSE_PUBLISH_LOCK_STATE.depth = 1
+        try:
+            yield
+        finally:
+            _POSE_PUBLISH_LOCK_STATE.depth = 0
+    finally:
+        if lock_file is not None:
+            if flock_acquired:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            try:
+                lock_file.close()
+            except OSError:
+                pass
+        if acquired_process_lock:
+            _POSE_PUBLISH_PROCESS_LOCK.release()
 
 
 class ActiveDownloadError(RuntimeError):
@@ -633,6 +734,25 @@ class DownloadManager:
         cached: dict[str, Path],
         should_cancel=None,
     ) -> None:
+        with _pose_publish_lock(pose_root, should_cancel):
+            self._materialize_pose_pairs_locked(
+                gallery_url,
+                pose_root,
+                controls,
+                targets,
+                cached,
+                should_cancel,
+            )
+
+    def _materialize_pose_pairs_locked(
+        self,
+        gallery_url: str,
+        pose_root: Path,
+        controls: dict[str, str],
+        targets: list[dict],
+        cached: dict[str, Path],
+        should_cancel=None,
+    ) -> None:
         identity = safe_folder_name(
             gallery_key(gallery_url).rsplit(":", 1)[-1], "gallery"
         )
@@ -709,11 +829,16 @@ class DownloadManager:
         cls, source: Path, target: Path, should_cancel=None
     ) -> bool:
         def existing_result() -> bool:
-            if target.exists() and cls._files_identical(source, target):
-                return False
+            if os.path.lexists(target):
+                if target.is_file() and not target.is_symlink():
+                    try:
+                        if cls._files_identical(source, target):
+                            return False
+                    except FileNotFoundError:
+                        pass
             raise FileExistsError(f"Refusing to overwrite existing file: {target}")
 
-        if target.exists():
+        if os.path.lexists(target):
             return existing_result()
         temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.part")
         try:
@@ -748,12 +873,20 @@ class DownloadManager:
             except OSError as exc:
                 if exc.errno not in _RENAME_NOREPLACE_UNAVAILABLE:
                     raise
-                raise OSError(
-                    exc.errno,
-                    "Pose output filesystem supports neither hard links "
-                    "nor atomic no-replace rename",
-                    target,
-                ) from exc
+
+            # Some Unraid shfs and SMB/CIFS mounts reject both hard links and
+            # renameat2(RENAME_NOREPLACE). The complete, fsynced staging file
+            # can still be published safely for GalleryFlow writers by
+            # serializing, checking once more, and using a same-directory
+            # replace. Keep the sidecar lock file: unlinking it would let
+            # waiters lock different inodes.
+            with _pose_publish_lock(target.parent, should_cancel):
+                if os.path.lexists(target):
+                    return existing_result()
+                if should_cancel and should_cancel():
+                    raise PoseExportCanceled("Pose export canceled")
+                os.replace(temporary, target)
+                return True
         finally:
             temporary.unlink(missing_ok=True)
 

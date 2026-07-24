@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import errno
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -470,7 +472,7 @@ def test_linux_rename_noreplace_publishes_without_clobbering(
     assert target.read_bytes() == b"first"
 
 
-def test_pose_publish_fails_closed_when_atomic_primitives_are_unavailable(
+def test_pose_publish_uses_locked_replace_when_atomic_primitives_are_unavailable(
     tmp_path: Path, monkeypatch
 ) -> None:
     config, database = make_database(tmp_path)
@@ -484,15 +486,188 @@ def test_pose_publish_fails_closed_when_atomic_primitives_are_unavailable(
         raise OSError(errno.EPERM, "hard links unavailable")
 
     def unavailable_rename(_: Path, __: Path) -> None:
-        raise OSError(errno.EOPNOTSUPP, "rename flags unavailable")
+        raise OSError(errno.EINVAL, "rename flags unavailable")
+
+    def unavailable_flock(*_args) -> None:
+        raise OSError(errno.EINVAL, "flock unavailable")
 
     monkeypatch.setattr(downloader_module.os, "link", unavailable_link)
     monkeypatch.setattr(downloader_module, "_rename_noreplace", unavailable_rename)
-    with pytest.raises(
-        OSError, match="supports neither hard links nor atomic no-replace rename"
-    ) as error:
+    monkeypatch.setattr(downloader_module.fcntl, "flock", unavailable_flock)
+
+    assert manager._copy_without_overwrite(source, target) is True
+    assert target.read_bytes() == b"complete image"
+    lock_path = target.parent / ".galleryflow-publish.lock"
+    assert lock_path.is_file()
+    lock_path.write_bytes(b"persistent lock marker")
+
+    second_source = config.pose_root_path / "second-source.jpg"
+    second_target = target.parent / "second-pair_target.jpg"
+    second_source.write_bytes(b"second complete image")
+    assert manager._copy_without_overwrite(second_source, second_target) is True
+    assert second_target.read_bytes() == b"second complete image"
+    assert lock_path.read_bytes() == b"persistent lock marker"
+    assert list(target.parent.glob(".galleryflow-publish.lock")) == [lock_path]
+
+    assert manager._copy_without_overwrite(source, target) is False
+    assert not list(target.parent.glob(f".{target.name}.*.part"))
+
+
+def test_pose_publish_locked_replace_rechecks_without_overwriting_winner(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, database = make_database(tmp_path)
+    manager = DownloadManager(config, database, object(), EventBroker())  # type: ignore[arg-type]
+    source = config.pose_root_path / "source.jpg"
+    target = config.pose_root_path / "pose/selected_target/pair_target.jpg"
+    source.write_bytes(b"complete image")
+    target.parent.mkdir(parents=True)
+
+    def unavailable_link(_: Path, __: Path) -> None:
+        raise OSError(errno.EPERM, "hard links unavailable")
+
+    def racing_rename(_: Path, final: Path) -> None:
+        final.write_bytes(b"other writer")
+        raise OSError(errno.EINVAL, "rename flags unavailable")
+
+    def unexpected_replace(_: Path, __: Path) -> None:
+        raise AssertionError("an existing target must not be replaced")
+
+    monkeypatch.setattr(downloader_module.os, "link", unavailable_link)
+    monkeypatch.setattr(downloader_module, "_rename_noreplace", racing_rename)
+    monkeypatch.setattr(downloader_module.os, "replace", unexpected_replace)
+
+    with pytest.raises(FileExistsError, match="Refusing to overwrite"):
         manager._copy_without_overwrite(source, target)
-    assert error.value.errno == errno.EOPNOTSUPP
+    assert target.read_bytes() == b"other writer"
+    assert not list(target.parent.glob(f".{target.name}.*.part"))
+
+
+def test_pose_publish_locked_replace_propagates_failure_and_releases_lock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, database = make_database(tmp_path)
+    manager = DownloadManager(config, database, object(), EventBroker())  # type: ignore[arg-type]
+    source = config.pose_root_path / "source.jpg"
+    target = config.pose_root_path / "pose/selected_target/pair_target.jpg"
+    source.write_bytes(b"complete image")
+    target.parent.mkdir(parents=True)
+    real_replace = downloader_module.os.replace
+
+    def unavailable_link(_: Path, __: Path) -> None:
+        raise OSError(errno.EPERM, "hard links unavailable")
+
+    def unavailable_rename(_: Path, __: Path) -> None:
+        raise OSError(errno.EINVAL, "rename flags unavailable")
+
+    def denied_replace(_: Path, __: Path) -> None:
+        raise OSError(errno.EACCES, "replace denied")
+
+    monkeypatch.setattr(downloader_module.os, "link", unavailable_link)
+    monkeypatch.setattr(downloader_module, "_rename_noreplace", unavailable_rename)
+    monkeypatch.setattr(downloader_module.os, "replace", denied_replace)
+
+    with pytest.raises(OSError) as error:
+        manager._copy_without_overwrite(source, target)
+    assert error.value.errno == errno.EACCES
+    assert not target.exists()
+    assert not list(target.parent.glob(f".{target.name}.*.part"))
+
+    monkeypatch.setattr(downloader_module.os, "replace", real_replace)
+    assert manager._copy_without_overwrite(source, target) is True
+    assert target.read_bytes() == b"complete image"
+
+
+def test_pose_publish_locked_replace_serializes_competing_threads(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, database = make_database(tmp_path)
+    manager = DownloadManager(config, database, object(), EventBroker())  # type: ignore[arg-type]
+    source_a = config.pose_root_path / "source-a.jpg"
+    source_b = config.pose_root_path / "source-b.jpg"
+    target = config.pose_root_path / "pose/selected_target/pair_target.jpg"
+    source_a.write_bytes(b"first complete image")
+    source_b.write_bytes(b"second complete image")
+    target.parent.mkdir(parents=True)
+    rename_barrier = threading.Barrier(2)
+
+    def unavailable_link(_: Path, __: Path) -> None:
+        raise OSError(errno.EPERM, "hard links unavailable")
+
+    def synchronized_unavailable_rename(_: Path, __: Path) -> None:
+        rename_barrier.wait(timeout=5)
+        raise OSError(errno.EINVAL, "rename flags unavailable")
+
+    monkeypatch.setattr(downloader_module.os, "link", unavailable_link)
+    monkeypatch.setattr(
+        downloader_module, "_rename_noreplace", synchronized_unavailable_rename
+    )
+
+    def publish(source: Path) -> bool | str:
+        try:
+            return manager._copy_without_overwrite(source, target)
+        except FileExistsError:
+            return "conflict"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(publish, (source_a, source_b)))
+
+    assert sorted(results, key=str) == [True, "conflict"]
+    assert target.read_bytes() in {source_a.read_bytes(), source_b.read_bytes()}
+    assert not list(target.parent.glob(f".{target.name}.*.part"))
+
+
+def test_pose_publish_never_replaces_a_dangling_target_symlink(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, database = make_database(tmp_path)
+    manager = DownloadManager(config, database, object(), EventBroker())  # type: ignore[arg-type]
+    source = config.pose_root_path / "source.jpg"
+    target = config.pose_root_path / "pose/selected_target/pair_target.jpg"
+    source.write_bytes(b"complete image")
+    target.parent.mkdir(parents=True)
+    target.symlink_to(target.parent / "missing.jpg")
+
+    def unexpected_publish(_: Path, __: Path) -> None:
+        raise AssertionError("a dangling target symlink must be treated as occupied")
+
+    monkeypatch.setattr(downloader_module.os, "link", unexpected_publish)
+    with pytest.raises(FileExistsError, match="Refusing to overwrite"):
+        manager._copy_without_overwrite(source, target)
+    assert target.is_symlink()
+
+
+def test_pose_publish_cancellation_interrupts_process_lock_wait(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, database = make_database(tmp_path)
+    manager = DownloadManager(config, database, object(), EventBroker())  # type: ignore[arg-type]
+    source = config.pose_root_path / "source.jpg"
+    target = config.pose_root_path / "pose/selected_target/pair_target.jpg"
+    source.write_bytes(b"complete image")
+    target.parent.mkdir(parents=True)
+    checks = 0
+
+    def unavailable_link(_: Path, __: Path) -> None:
+        raise OSError(errno.EPERM, "hard links unavailable")
+
+    def unavailable_rename(_: Path, __: Path) -> None:
+        raise OSError(errno.EINVAL, "rename flags unavailable")
+
+    def should_cancel() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks >= 5
+
+    monkeypatch.setattr(downloader_module.os, "link", unavailable_link)
+    monkeypatch.setattr(downloader_module, "_rename_noreplace", unavailable_rename)
+    downloader_module._POSE_PUBLISH_PROCESS_LOCK.acquire()
+    try:
+        with pytest.raises(PoseExportCanceled, match="Pose export canceled"):
+            manager._copy_without_overwrite(source, target, should_cancel)
+    finally:
+        downloader_module._POSE_PUBLISH_PROCESS_LOCK.release()
+
     assert not target.exists()
     assert not list(target.parent.glob(f".{target.name}.*.part"))
 
@@ -575,6 +750,165 @@ def test_pose_publish_does_not_fallback_on_readonly_hardlink_error(
     with pytest.raises(OSError) as error:
         manager._copy_without_overwrite(source, target)
     assert error.value.errno == errno.EROFS
+    assert not target.exists()
+    assert not list(target.parent.glob(f".{target.name}.*.part"))
+
+
+def test_materialize_pose_pairs_reuses_one_root_lock_for_all_outputs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, database = make_database(tmp_path)
+    manager = DownloadManager(config, database, object(), EventBroker())  # type: ignore[arg-type]
+    control_source = config.pose_root_path / "control-source.jpg"
+    target_source = config.pose_root_path / "target-source.jpg"
+    control_source.write_bytes(b"complete control")
+    target_source.write_bytes(b"complete target")
+
+    def unavailable_link(_: Path, __: Path) -> None:
+        raise OSError(errno.EPERM, "hard links unavailable")
+
+    def unavailable_rename(_: Path, __: Path) -> None:
+        raise OSError(errno.EINVAL, "rename flags unavailable")
+
+    monkeypatch.setattr(downloader_module.os, "link", unavailable_link)
+    monkeypatch.setattr(downloader_module, "_rename_noreplace", unavailable_rename)
+
+    manager._materialize_pose_pairs(
+        GALLERY,
+        config.pose_root_path,
+        {"solo": CONTROL},
+        [
+            {
+                "image_url": TARGET_A,
+                "ordinal": 2,
+                "pose_slug": "standing",
+                "role": "solo",
+            }
+        ],
+        {CONTROL: control_source, TARGET_A: target_source},
+    )
+
+    pose_directory = config.pose_root_path / "standing"
+    assert (
+        pose_directory / "selected_control/g79186222-0002_control.jpg"
+    ).read_bytes() == b"complete control"
+    assert (
+        pose_directory / "selected_target/g79186222-0002_target.jpg"
+    ).read_bytes() == b"complete target"
+    assert (config.pose_root_path / ".galleryflow-publish.lock").is_file()
+    assert not list(pose_directory.rglob(".galleryflow-publish.lock"))
+
+
+def test_materialize_pose_pairs_serializes_whole_transactions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, database = make_database(tmp_path)
+    manager = DownloadManager(config, database, object(), EventBroker())  # type: ignore[arg-type]
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    state_guard = threading.Lock()
+    active = 0
+    max_active = 0
+    call_count = 0
+
+    def observe_locked_materialization(*_args) -> None:
+        nonlocal active, max_active, call_count
+        with state_guard:
+            call_count += 1
+            call_number = call_count
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            if call_number == 1:
+                first_entered.set()
+                assert release_first.wait(timeout=5)
+        finally:
+            with state_guard:
+                active -= 1
+
+    monkeypatch.setattr(
+        manager, "_materialize_pose_pairs_locked", observe_locked_materialization
+    )
+    arguments = (
+        GALLERY,
+        config.pose_root_path,
+        {},
+        [],
+        {},
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(manager._materialize_pose_pairs, *arguments)
+        assert first_entered.wait(timeout=5)
+        second = executor.submit(manager._materialize_pose_pairs, *arguments)
+        assert not second.done()
+        release_first.set()
+        first.result(timeout=5)
+        second.result(timeout=5)
+
+    assert max_active == 1
+    assert call_count == 2
+    assert (config.pose_root_path / ".galleryflow-publish.lock").is_file()
+
+
+def test_pose_publish_refuses_symlinked_sidecar_lock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    if not getattr(downloader_module.os, "O_NOFOLLOW", 0):
+        pytest.skip("O_NOFOLLOW is unavailable")
+    config, database = make_database(tmp_path)
+    manager = DownloadManager(config, database, object(), EventBroker())  # type: ignore[arg-type]
+    source = config.pose_root_path / "source.jpg"
+    target = config.pose_root_path / "pose/selected_target/pair_target.jpg"
+    source.write_bytes(b"complete image")
+    target.parent.mkdir(parents=True)
+    outside = tmp_path / "outside-lock"
+    outside.write_bytes(b"must stay unchanged")
+    (target.parent / ".galleryflow-publish.lock").symlink_to(outside)
+
+    def unavailable_link(_: Path, __: Path) -> None:
+        raise OSError(errno.EPERM, "hard links unavailable")
+
+    def unavailable_rename(_: Path, __: Path) -> None:
+        raise OSError(errno.EINVAL, "rename flags unavailable")
+
+    monkeypatch.setattr(downloader_module.os, "link", unavailable_link)
+    monkeypatch.setattr(downloader_module, "_rename_noreplace", unavailable_rename)
+
+    with pytest.raises(OSError) as error:
+        manager._copy_without_overwrite(source, target)
+    assert error.value.errno == errno.ELOOP
+    assert outside.read_bytes() == b"must stay unchanged"
+    assert not target.exists()
+    assert not list(target.parent.glob(f".{target.name}.*.part"))
+
+
+def test_pose_publish_refuses_nonregular_sidecar_lock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    if not hasattr(downloader_module.os, "mkfifo"):
+        pytest.skip("FIFOs are unavailable")
+    config, database = make_database(tmp_path)
+    manager = DownloadManager(config, database, object(), EventBroker())  # type: ignore[arg-type]
+    source = config.pose_root_path / "source.jpg"
+    target = config.pose_root_path / "pose/selected_target/pair_target.jpg"
+    source.write_bytes(b"complete image")
+    target.parent.mkdir(parents=True)
+    downloader_module.os.mkfifo(target.parent / ".galleryflow-publish.lock")
+
+    def unavailable_link(_: Path, __: Path) -> None:
+        raise OSError(errno.EPERM, "hard links unavailable")
+
+    def unavailable_rename(_: Path, __: Path) -> None:
+        raise OSError(errno.EINVAL, "rename flags unavailable")
+
+    monkeypatch.setattr(downloader_module.os, "link", unavailable_link)
+    monkeypatch.setattr(downloader_module, "_rename_noreplace", unavailable_rename)
+
+    with pytest.raises(OSError) as error:
+        manager._copy_without_overwrite(source, target)
+    assert error.value.errno == errno.EINVAL
+    assert "not a regular file" in str(error.value)
     assert not target.exists()
     assert not list(target.parent.glob(f".{target.name}.*.part"))
 
