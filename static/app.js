@@ -34,6 +34,9 @@
     finderFeedbackGallerySelection: new Set(),
     finderFeedbackGalleryDirty: false,
     finderFeedbackGallerySaving: false,
+    galleryReviewBusy: false,
+    galleryDetailRequest: 0,
+    galleryNavigationRequest: 0,
     galleryMode: 'download',
     poseSelectedImages: new Set(),
     poseTags: [],
@@ -45,6 +48,8 @@
     poseSaveTimer: null,
     poseSavePromise: null,
     poseMutation: 0,
+    poseApplying: false,
+    poseApplyRequest: 0,
     poseAssignment: 'target',
     galleryContext: null,
     lightboxIndex: -1,
@@ -961,12 +966,110 @@
   function finderFeedbackGalleryResult() {
     const key = state.galleryContext?.finderFeedbackResultKey;
     if (key === undefined || key === null) return null;
-    return state.finderResults.find(result => String(result.key) === String(key)) || null;
+    const active = state.galleryContext?.activeFinderResult;
+    if (active && String(active.key) === String(key)) return active;
+    return state.finderResults.find(result => String(result.key) === String(key))
+      || state.galleryContext?.finderReviewQueue?.results?.find(result => String(result.key) === String(key))
+      || null;
   }
 
   function finderFeedbackGalleryAvailable() {
+    return Boolean(finderFeedbackGalleryResult());
+  }
+
+  function finderReviewLabel(review) {
+    return {
+      pending: 'To review',
+      accepted: 'Accepted',
+      maybe: 'Maybe',
+      rejected: 'Rejected'
+    }[review] || 'To review';
+  }
+
+  function createFinderGalleryReviewQueue(result) {
+    const review = state.finderReview;
+    const threshold = Math.max(0, Math.min(1, Number($('#finder-result-threshold').value || 0)));
+    let results = state.finderResults.filter(item => item.review === review && item.score >= threshold);
+    if (!results.some(item => String(item.key) === String(result.key))) results = [...results, result];
+    const index = Math.max(0, results.findIndex(item => String(item.key) === String(result.key)));
+    const baseOffset = Math.max(0, (state.finderResultPage - 1) * state.finderResultPageSize);
+    const total = Math.max(results.length, Number(state.finderResultTotal || 0));
+    return {
+      scanId: String(state.finderScan?.id || ''),
+      review,
+      threshold,
+      results,
+      index,
+      baseOffset,
+      total,
+      pageSize: Math.max(1, Number(state.finderResultPageSize || FINDER_RESULTS_PAGE_SIZE)),
+      exhaustedBefore: baseOffset <= 0,
+      exhaustedAfter: !finderScanIsRunning() && baseOffset + results.length >= total,
+      forwardProbeOffset: baseOffset + results.length,
+      forwardProbeRemovedCount: 0,
+      loading: false
+    };
+  }
+
+  function renderFinderGalleryReview() {
+    const rail = $('#gallery-review-rail');
     const result = finderFeedbackGalleryResult();
-    return Boolean(result && ['accepted', 'rejected'].includes(result.review));
+    const queue = state.galleryContext?.finderReviewQueue;
+    const available = Boolean(result && queue && String(queue.scanId) === String(state.finderScan?.id || ''));
+    const workspaceLocked = Boolean(
+      state.poseApplying
+      || (available && (state.galleryReviewBusy || queue.loading || state.finderFeedbackGallerySaving))
+    );
+    const modalBody = $('.gallery-modal-body');
+    const modalFooter = $('.gallery-footer');
+    if (modalBody) modalBody.inert = workspaceLocked;
+    if (modalFooter) modalFooter.inert = workspaceLocked;
+    $('#gallery-modal').classList.toggle('is-review-transition', workspaceLocked);
+    $('#gallery-modal').setAttribute('aria-busy', String(workspaceLocked));
+    rail.hidden = !available;
+    if (!available) return;
+    const index = Math.max(0, Math.min(queue.results.length - 1, Number(queue.index || 0)));
+    const position = Math.max(1, Number(queue.baseOffset || 0) + index + 1);
+    const total = Math.max(position, Number(queue.total || queue.results.length || 1));
+    const feedbackCount = state.finderFeedbackGallerySelection.size;
+    const review = normalizeFinderReview(result.review);
+    const busy = state.galleryReviewBusy
+      || queue.loading
+      || state.loadingDetail
+      || state.finderFeedbackBusy
+      || state.finderFeedbackGallerySaving
+      || state.poseApplying
+      || Boolean(result.feedbackSaving);
+    $('#gallery-review-position').textContent = `${formatNumber(position)} of ${formatNumber(total)}`;
+    $('#gallery-review-queue').textContent = `${finderReviewLabel(queue.review)} queue · use ← →`;
+    $('#gallery-review-feedback-count').textContent = formatNumber(feedbackCount);
+    $('#gallery-review-status').textContent = finderReviewLabel(review);
+    rail.classList.toggle('is-accepted', review === 'accepted');
+    rail.classList.toggle('is-maybe', review === 'maybe');
+    rail.classList.toggle('is-rejected', review === 'rejected');
+    $$('[data-gallery-finder-review]', rail).forEach(button => {
+      const buttonReview = button.dataset.galleryFinderReview;
+      const active = buttonReview === review;
+      button.classList.toggle('is-active', active);
+      button.setAttribute('aria-pressed', String(active));
+      button.disabled = busy
+        || (buttonReview === 'accepted' && !feedbackCount)
+        || (active && !state.finderFeedbackGalleryDirty);
+    });
+    const accept = $('#gallery-review-accept');
+    accept.title = feedbackCount
+      ? `Accept with ${feedbackCount} selected Finder feedback ${feedbackCount === 1 ? 'image' : 'images'}`
+      : 'Choose at least one image in Finder review before accepting';
+    $('#gallery-review-maybe').title = 'Keep this gallery neutral for a later decision';
+    $('#gallery-review-reject').title = feedbackCount
+      ? `Reject with ${feedbackCount} selected negative feedback ${feedbackCount === 1 ? 'image' : 'images'}`
+      : 'Reject the gallery without image-level feedback';
+    const previous = $('#gallery-review-previous');
+    const next = $('#gallery-review-next');
+    previous.disabled = busy || (index <= 0 && queue.exhaustedBefore);
+    next.disabled = busy || (index >= queue.results.length - 1 && queue.exhaustedAfter);
+    previous.setAttribute('aria-label', `Previous gallery in ${finderReviewLabel(queue.review).toLowerCase()} queue`);
+    next.setAttribute('aria-label', `Next gallery in ${finderReviewLabel(queue.review).toLowerCase()} queue`);
   }
 
   function restoreFinderFeedbackGallerySelection() {
@@ -1001,6 +1104,9 @@
     const summarySource = context?.summary || state.galleries.find(item => String(item.id) === String(id));
     const summary = summarySource ? normalizeGallery(summarySource) : null;
     if (!summary) return;
+    const detailRequest = ++state.galleryDetailRequest;
+    state.poseApplyRequest += 1;
+    state.poseApplying = false;
     window.clearTimeout(state.poseSaveTimer);
     state.poseSaving = false;
     state.poseSavePromise = null;
@@ -1020,7 +1126,9 @@
     window.clearTimeout(state.poseSaveTimer);
     $('#pose-tag-input').value = '';
     $('#pose-control-role').value = 'solo';
-    const feedbackRequested = context?.mode === 'feedback' && ['accepted', 'rejected'].includes(context?.finderFeedbackReview);
+    const feedbackRequested = context?.mode === 'feedback'
+      && context?.finderFeedbackResultKey !== undefined
+      && context?.finderFeedbackResultKey !== null;
     const requestedMode = feedbackRequested ? 'feedback' : context?.mode === 'pose' ? 'pose' : 'download';
     if (requestedMode === 'pose' && state.galleryContext?.suggestions.length) state.poseAssignment = 'target';
     setGalleryMode(requestedMode, { load: false, render: false });
@@ -1033,15 +1141,17 @@
     renderImageSkeletons();
     renderGallerySummary();
     updateSelectionUi();
-    $('#gallery-modal').showModal();
+    const dialog = $('#gallery-modal');
+    if (!dialog.open) dialog.showModal();
     try {
       const data = await api(withParams(`/api/galleries/${encodeURIComponent(id)}`, { profile: state.activeProfile }));
+      if (detailRequest !== state.galleryDetailRequest) return;
       state.gallery = normalizeDetail(data);
       const listItem = state.galleries.find(item => String(item.id) === String(id));
       if (listItem) Object.assign(listItem, { saved: state.gallery.saved, ignored: state.gallery.ignored, imageCount: state.gallery.imageCount, thumbnailUrl: state.gallery.thumbnailUrl || listItem.thumbnailUrl });
       const pendingImages = state.gallery.images.filter(image => !image.downloaded);
       state.selectedImages = new Set((pendingImages.length ? pendingImages : state.gallery.images).map(image => image.url));
-      if (feedbackRequested) {
+      if (context?.finderFeedbackResultKey !== undefined && context?.finderFeedbackResultKey !== null) {
         const galleryUrls = new Set(state.gallery.images.map(image => image.url));
         state.finderFeedbackGallerySelection = new Set(
           (Array.isArray(context?.feedbackImageUrls) ? context.feedbackImageUrls : [])
@@ -1049,6 +1159,9 @@
             .filter(url => galleryUrls.has(url))
             .slice(0, 3)
         );
+        state.finderFeedbackGalleryDirty = false;
+      }
+      if (feedbackRequested) {
         setGalleryMode('feedback', { load: false, render: false });
       }
       if (requestedMode === 'pose') {
@@ -1067,14 +1180,17 @@
       $('#gallery-modal-title').textContent = state.gallery.title;
       if (requestedMode === 'pose' || requestedMode === 'feedback') scrollToFinderSuggestion();
     } catch (error) {
+      if (detailRequest !== state.galleryDetailRequest) return;
       $('#image-grid').replaceChildren();
       $('#images-empty').hidden = false;
       $('#selection-summary').textContent = errorMessage(error);
       toast('Could not open gallery', errorMessage(error), 'error');
     } finally {
+      if (detailRequest !== state.galleryDetailRequest) return;
       state.loadingDetail = false;
       $('#image-grid').setAttribute('aria-busy', 'false');
       updateSelectionUi();
+      renderFinderGalleryReview();
     }
   }
 
@@ -1220,7 +1336,7 @@
     $('#pose-preflight-detail').textContent = result.issues.length
       ? result.issues.join(' · ')
       : `Ready to build ${formatNumber(result.targets)} paired image${result.targets === 1 ? '' : 's'}.`;
-    $('#pose-export').disabled = state.poseLoading || state.poseSaving || Boolean(result.issues.length);
+    $('#pose-export').disabled = state.poseLoading || state.poseSaving || state.poseApplying || Boolean(result.issues.length);
   }
 
   function renderPoseSaveStatus(message = '') {
@@ -1241,7 +1357,7 @@
       const active = button.dataset.poseAssignment === state.poseAssignment;
       button.classList.toggle('is-active', active);
       button.setAttribute('aria-pressed', String(active));
-      button.disabled = state.poseLoading;
+      button.disabled = state.poseLoading || state.poseApplying;
     });
     $('#pose-target-fields').hidden = !isTarget;
     $('#pose-control-hint').hidden = isTarget;
@@ -1253,8 +1369,8 @@
       ? `Set ${poseRoleLabel(targetRole).toLowerCase()} control first`
       : checked ? `Apply to ${formatNumber(checked)} checked` : 'Apply to checked';
     const missingTag = isTarget && !$('#pose-tag-input').value.trim();
-    apply.disabled = state.poseLoading || !checked || missingTag || missingControl || (!isTarget && checked !== 1);
-    $('#pose-clear-checked').disabled = !checked || ![...state.poseSelectedImages].some(url => poseAssignmentFor(url));
+    apply.disabled = state.poseLoading || state.poseApplying || !checked || missingTag || missingControl || (!isTarget && checked !== 1);
+    $('#pose-clear-checked').disabled = state.poseApplying || !checked || ![...state.poseSelectedImages].some(url => poseAssignmentFor(url));
     renderPoseSaveStatus();
     renderPosePreflight();
   }
@@ -1277,16 +1393,17 @@
       const active = assignment?.type === 'control' && assignment.role === button.dataset.lightboxControl;
       button.classList.toggle('is-active', active);
       button.setAttribute('aria-pressed', String(active));
+      button.disabled = state.poseApplying;
     });
     $('#lightbox-pose-tag-input').value = assignment?.type === 'target' ? assignment.poseLabel : '';
     $('#lightbox-pose-control-role').value = assignment?.type === 'target' ? assignment.role : 'solo';
     updateLightboxTargetAvailability();
-    $('#lightbox-clear-pose').disabled = !assignment;
+    $('#lightbox-clear-pose').disabled = state.poseApplying || !assignment;
   }
 
   function updateLightboxTargetAvailability() {
     const targetRole = $('#lightbox-pose-control-role').value;
-    $('#lightbox-set-target').disabled = !state.poseDraft.controls[targetRole];
+    $('#lightbox-set-target').disabled = state.poseApplying || !state.poseDraft.controls[targetRole];
     $('#lightbox-set-target').title = state.poseDraft.controls[targetRole] ? 'Set this image as a pose target' : `Set a ${targetRole} control first`;
   }
 
@@ -1315,11 +1432,14 @@
       renderImages();
       renderPoseWorkspace();
     } catch (error) {
+      if (key !== currentPoseKey()) return;
       renderPoseSaveStatus('Draft unavailable');
       toast('Could not load pose draft', errorMessage(error), 'error');
     } finally {
-      state.poseLoading = false;
-      renderPoseWorkspace();
+      if (key === currentPoseKey()) {
+        state.poseLoading = false;
+        renderPoseWorkspace();
+      }
     }
   }
 
@@ -1330,6 +1450,7 @@
       toast('Feedback selection is saving', 'Wait for the save to finish before switching workflows.', 'info');
       return false;
     }
+    if (state.galleryReviewBusy && nextMode !== state.galleryMode) return false;
     state.galleryMode = nextMode;
     const poseMode = state.galleryMode === 'pose';
     const feedbackMode = state.galleryMode === 'feedback';
@@ -1348,7 +1469,9 @@
     $('#pose-preflight').hidden = !poseMode;
     $('#queue-download').hidden = poseMode || feedbackMode;
     $('#pose-export').hidden = !poseMode;
-    $('#finder-feedback-gallery-save').hidden = !feedbackMode;
+    const feedbackResult = finderFeedbackGalleryResult();
+    const reviewedFeedback = ['accepted', 'rejected'].includes(feedbackResult?.review);
+    $('#finder-feedback-gallery-save').hidden = !feedbackMode || !reviewedFeedback;
     $('.modal-profile').hidden = feedbackMode;
     $('#modal-profile-label').textContent = poseMode ? 'Organize in' : 'Download to';
     $('#image-picker-title').textContent = feedbackMode ? 'Review gallery feedback' : poseMode ? 'Prepare pose pairs' : 'Choose images';
@@ -1356,11 +1479,17 @@
     $('.picker-actions > span').hidden = feedbackMode;
     $('#select-all').textContent = poseMode ? 'Check all' : 'Select all';
     $('#select-none').textContent = feedbackMode ? 'Clear selection' : poseMode ? 'Uncheck all' : 'Clear';
-    const feedbackResult = finderFeedbackGalleryResult();
     $('#finder-feedback-gallery-review').textContent = feedbackResult?.review || 'Feedback';
+    const feedbackHelp = $('#finder-feedback-gallery-toolbar p');
+    if (feedbackHelp) {
+      feedbackHelp.textContent = ['accepted', 'rejected'].includes(feedbackResult?.review)
+        ? 'Pick up to 3 images from anywhere in this gallery, then save the edited feedback selection.'
+        : 'Pick up to 3 images from anywhere in this gallery, then use Accept, Maybe, or Reject above.';
+    }
     $('#finder-feedback-prepare-pose').hidden = feedbackResult?.review !== 'accepted';
     if (render) renderImages();
     renderPoseWorkspace();
+    renderFinderGalleryReview();
     if (poseMode && load) loadPoseWorkspace();
     return true;
   }
@@ -1385,6 +1514,7 @@
   }
 
   async function handlePoseAssignmentButton(button) {
+    if (state.galleryReviewBusy) return;
     const assignment = button.dataset.poseAssignment;
     if (!['target', ...POSE_ROLES].includes(assignment)) return;
     state.poseAssignment = assignment;
@@ -1538,7 +1668,7 @@
 
   async function applyPoseAssignment(urls, assignment, { button = null, clearChecked = false } = {}) {
     const selected = [...urls];
-    if (!selected.length || state.poseLoading) return false;
+    if (!selected.length || state.poseLoading || state.poseApplying || state.galleryReviewBusy) return false;
     if (assignment !== 'target' && selected.length !== 1) {
       toast('Choose one control image', 'Each Solo, Couple, or Group slot uses exactly one control.', 'info');
       return false;
@@ -1563,6 +1693,16 @@
         return false;
       }
     }
+    const poseKey = currentPoseKey();
+    const applyRequest = ++state.poseApplyRequest;
+    const stillCurrent = () => (
+      applyRequest === state.poseApplyRequest
+      && $('#gallery-modal').open
+      && poseKey === currentPoseKey()
+    );
+    state.poseApplying = true;
+    renderPoseWorkspace();
+    renderFinderGalleryReview();
     if (button) setButtonBusy(button, true, assignment === 'target' ? 'Tagging…' : 'Assigning…');
     try {
       if (assignment === 'target') {
@@ -1570,6 +1710,7 @@
         const roleSelect = button?.closest('#lightbox-pose-dock') ? $('#lightbox-pose-control-role') : $('#pose-control-role');
         const role = POSE_ROLES.includes(roleSelect.value) ? roleSelect.value : 'solo';
         const tag = await ensurePoseTag(input.value, role);
+        if (!stillCurrent()) return false;
         selected.forEach(url => setPoseTarget(url, tag, role));
         announce(`${selected.length} image${selected.length === 1 ? '' : 's'} assigned as ${tag.label} targets`);
       } else {
@@ -1582,10 +1723,16 @@
       renderPoseWorkspace();
       return true;
     } catch (error) {
+      if (!stillCurrent()) return false;
       toast('Could not assign image', errorMessage(error), 'error');
       return false;
     } finally {
       if (button) setButtonBusy(button, false);
+      if (applyRequest === state.poseApplyRequest) {
+        state.poseApplying = false;
+        renderPoseWorkspace();
+        renderFinderGalleryReview();
+      }
     }
   }
 
@@ -1801,6 +1948,7 @@
   }
 
   function toggleImage(url, checked) {
+    if (state.galleryReviewBusy) return;
     const feedbackMode = state.galleryMode === 'feedback';
     const selection = feedbackMode
       ? state.finderFeedbackGallerySelection
@@ -1823,6 +1971,7 @@
   }
 
   function selectAllImages(selected) {
+    if (state.galleryReviewBusy) return;
     if (state.galleryMode === 'feedback' && selected) {
       toast('Choose feedback images individually', 'You can select up to 3 images from this gallery.', 'info');
       return;
@@ -1887,7 +2036,10 @@
       || (feedbackResult?.review === 'accepted' && !selected);
     saveFeedback.title = feedbackResult?.review === 'accepted' && !selected
       ? 'Accepted feedback needs at least one selected image'
-      : state.finderFeedbackGalleryDirty ? 'Save this Finder feedback selection' : 'Selection is already saved';
+      : !['accepted', 'rejected'].includes(feedbackResult?.review)
+        ? 'Use Accept or Reject above to save this selection'
+        : state.finderFeedbackGalleryDirty ? 'Save this Finder feedback selection' : 'Selection is already saved';
+    renderFinderGalleryReview();
     renderPoseToolbar();
   }
 
@@ -1899,6 +2051,7 @@
       || !['accepted', 'rejected'].includes(review)
       || state.finderFeedbackGallerySaving
       || state.finderFeedbackBusy
+      || state.galleryReviewBusy
       || result.feedbackSaving
     ) return;
     const feedbackImageUrls = [...state.finderFeedbackGallerySelection];
@@ -1946,7 +2099,13 @@
 
   async function queueGallery() {
     const gallery = state.gallery;
-    if (!gallery || !state.selectedImages.size) return;
+    if (
+      !gallery
+      || !state.selectedImages.size
+      || state.galleryReviewBusy
+      || state.finderFeedbackGallerySaving
+      || state.poseApplying
+    ) return;
     const button = $('#queue-download');
     const profile = $('#modal-profile-select').value || state.activeProfile;
     const payload = {
@@ -5424,6 +5583,20 @@
     }
   }
 
+  function finderResultCopies(result) {
+    const key = String(result?.key ?? '');
+    const copies = [];
+    const add = item => {
+      if (!item || String(item.key ?? '') !== key || copies.includes(item)) return;
+      copies.push(item);
+    };
+    add(result);
+    add(state.galleryContext?.activeFinderResult);
+    (state.galleryContext?.finderReviewQueue?.results || []).forEach(add);
+    state.finderResults.forEach(add);
+    return copies;
+  }
+
   function toggleFinderFeedbackMatch(input) {
     const result = state.finderResults.find(item => String(item.key) === String(input.dataset.finderResult));
     const matchKey = input.dataset.finderFeedbackMatch;
@@ -5473,6 +5646,7 @@
       feedbackSelectionProvided: result.feedbackSelectionProvided,
       feedbackSelectionDirty: result.feedbackSelectionDirty
     };
+    const resultCopies = finderResultCopies(result);
     if (snapshot.review === review && !snapshot.feedbackSelectionDirty && explicitFeedbackUrls === null) return false;
     const feedbackImageUrls = review === 'maybe'
       ? []
@@ -5486,12 +5660,15 @@
     const sameScan = () => String(state.finderScan?.id || '') === scanId;
     state.finderResultMutationEpoch += 1;
     state.finderFeedbackMutations += 1;
-    result.feedbackSaving = true;
+    resultCopies.forEach(copy => {
+      copy.feedbackSaving = true;
+      copy.review = review;
+    });
     adjustFinderReviewCounts(snapshot.review, review);
-    result.review = review;
     recountFinderReviews();
     renderFinderResults();
     renderFinderFeedback();
+    renderFinderGalleryReview();
     syncFinderConfigAvailability();
     if (button) button.disabled = true;
     try {
@@ -5505,9 +5682,10 @@
       if (!sameScan()) return false;
       const index = state.finderResults.findIndex(item => String(item.key) === resultKey);
       const current = index >= 0 ? state.finderResults[index] : result;
+      let merged;
       if (data) {
         const updated = normalizeFinderResult(data?.result || data, result.rank - 1);
-        if (index >= 0) state.finderResults[index] = {
+        merged = {
           ...current,
           ...updated,
           galleryId: updated.galleryId || current.galleryId,
@@ -5532,43 +5710,46 @@
           feedbackSaving: false
         };
       } else {
-        current.review = review;
-        current.feedbackImageUrls = [...feedbackImageUrls];
-        current.feedbackMatchKeys = current.matches
-          .filter(match => feedbackImageUrls.includes(match.imageUrl))
-          .map(match => match.feedbackKey);
-        current.feedbackUsableImageUrls = [];
-        current.feedbackPendingImageUrls = [];
-        current.feedbackAnalysisProvided = false;
-        current.feedbackSelectionProvided = true;
-        current.feedbackSelectionDirty = false;
-        current.feedbackSaving = false;
+        merged = {
+          ...current,
+          review,
+          feedbackImageUrls: [...feedbackImageUrls],
+          feedbackMatchKeys: current.matches
+            .filter(match => feedbackImageUrls.includes(match.imageUrl))
+            .map(match => match.feedbackKey),
+          feedbackUsableImageUrls: [],
+          feedbackPendingImageUrls: [],
+          feedbackAnalysisProvided: false,
+          feedbackSelectionProvided: true,
+          feedbackSelectionDirty: false,
+          feedbackSaving: false
+        };
       }
+      resultCopies.forEach(copy => Object.assign(copy, merged));
+      if (index >= 0) Object.assign(state.finderResults[index], merged);
       recountFinderReviews();
       renderFinderWorkspace();
+      renderFinderGalleryReview();
       if (!applyFinderFeedbackResponse(data)) loadFinderFeedback({ quiet: true, force: true });
       announce(`${result.title} ${review}`);
       return true;
     } catch (error) {
       if (sameScan()) {
         adjustFinderReviewCounts(review, snapshot.review);
-        const index = state.finderResults.findIndex(item => String(item.key) === resultKey);
-        if (index >= 0) {
-          state.finderResults[index] = {
-            ...state.finderResults[index],
-            review: snapshot.review,
-            feedbackMatchKeys: snapshot.feedbackMatchKeys,
-            feedbackImageUrls: snapshot.feedbackImageUrls,
-            feedbackUsableImageUrls: snapshot.feedbackUsableImageUrls,
-            feedbackPendingImageUrls: snapshot.feedbackPendingImageUrls,
-            feedbackAnalysisProvided: snapshot.feedbackAnalysisProvided,
-            feedbackSelectionProvided: snapshot.feedbackSelectionProvided,
-            feedbackSelectionDirty: snapshot.feedbackSelectionDirty,
-            feedbackSaving: false
-          };
-        }
+        resultCopies.forEach(copy => Object.assign(copy, {
+          review: snapshot.review,
+          feedbackMatchKeys: [...snapshot.feedbackMatchKeys],
+          feedbackImageUrls: [...snapshot.feedbackImageUrls],
+          feedbackUsableImageUrls: [...snapshot.feedbackUsableImageUrls],
+          feedbackPendingImageUrls: [...snapshot.feedbackPendingImageUrls],
+          feedbackAnalysisProvided: snapshot.feedbackAnalysisProvided,
+          feedbackSelectionProvided: snapshot.feedbackSelectionProvided,
+          feedbackSelectionDirty: snapshot.feedbackSelectionDirty,
+          feedbackSaving: false
+        }));
         recountFinderReviews();
         renderFinderWorkspace();
+        renderFinderGalleryReview();
       }
       toast('Could not save review', errorMessage(error), 'error');
       return false;
@@ -5577,12 +5758,13 @@
       state.finderResultMutationEpoch += 1;
       if (sameScan()) scheduleFreshFinderResults();
       if (sameScan()) {
-        const current = state.finderResults.find(item => String(item.key) === resultKey);
-        if (current?.feedbackSaving) {
-          current.feedbackSaving = false;
+        const stillSaving = resultCopies.some(copy => copy.feedbackSaving);
+        resultCopies.forEach(copy => { copy.feedbackSaving = false; });
+        if (stillSaving) {
           renderFinderResults();
         }
         renderFinderFeedback();
+        renderFinderGalleryReview();
       }
       syncFinderConfigAvailability();
     }
@@ -5599,11 +5781,271 @@
     };
   }
 
-  async function openFinderResult(result) {
+  function finderQueueResultStillMatches(queue, result) {
+    return result.review === queue.review && result.score >= queue.threshold;
+  }
+
+  async function loadFinderGalleryQueueEdge(queue, direction) {
+    if (
+      !queue
+      || String(queue.scanId) !== String(state.finderScan?.id || '')
+      || ![-1, 1].includes(direction)
+    ) return [];
+    const existingKeys = new Set(queue.results.map(result => String(result.key)));
+    const removedCount = queue.results.filter(result => !finderQueueResultStillMatches(queue, result)).length;
+    let offset;
+    let limit;
+    if (direction > 0) {
+      const computedOffset = queue.baseOffset
+        + queue.results.filter(result => finderQueueResultStillMatches(queue, result)).length;
+      const removedSinceProbe = removedCount - Number(queue.forwardProbeRemovedCount || 0);
+      offset = Math.max(
+        computedOffset,
+        Math.max(0, Number(queue.forwardProbeOffset ?? computedOffset) - removedSinceProbe)
+      );
+      limit = queue.pageSize;
+      let rawFetched = [];
+      let fetched = [];
+      let liveTotal = 0;
+      for (let attempt = 0; attempt < 16; attempt += 1) {
+        const data = await api(withParams(`/api/finder/scans/${encodeURIComponent(queue.scanId)}/results`, {
+          review: queue.review,
+          min_score: queue.threshold,
+          limit,
+          offset
+        }));
+        if (String(queue.scanId) !== String(state.finderScan?.id || '')) return [];
+        rawFetched = apiItems(data, 'results');
+        liveTotal = Math.max(0, Number(data?.total ?? rawFetched.length) || 0);
+        fetched = rawFetched
+          .map((item, index) => normalizeFinderResult(item, offset + index))
+          .filter(result => !existingKeys.has(String(result.key)));
+        queue.forwardProbeOffset = offset + rawFetched.length;
+        queue.forwardProbeRemovedCount = removedCount;
+        queue.total = Math.max(queue.total, queue.baseOffset + queue.results.length + fetched.length);
+        const reachedLiveEnd = rawFetched.length < limit || offset + rawFetched.length >= liveTotal;
+        if (fetched.length || reachedLiveEnd) {
+          queue.results.push(...fetched);
+          queue.exhaustedAfter = !finderScanIsRunning() && reachedLiveEnd;
+          return fetched;
+        }
+        offset += rawFetched.length;
+      }
+      queue.exhaustedAfter = false;
+      return [];
+    } else if (finderScanIsRunning()) {
+      // Offset pages move while an active scan inserts better-ranked results.
+      // Probe from the live beginning until an already loaded result anchors the
+      // stable modal queue, then prepend every unseen predecessor before it.
+      const anchorKeys = new Set(queue.results.map(result => String(result.key)));
+      if (!anchorKeys.size) {
+        queue.exhaustedBefore = false;
+        return [];
+      }
+      offset = 0;
+      limit = Math.min(500, Math.max(queue.pageSize, queue.baseOffset + queue.pageSize));
+      const fetched = [];
+      const fetchedKeys = new Set(existingKeys);
+      let liveTotal = 0;
+      for (let attempt = 0; attempt < 32; attempt += 1) {
+        const data = await api(withParams(`/api/finder/scans/${encodeURIComponent(queue.scanId)}/results`, {
+          // Reviewed-away queue entries still provide a stable rank anchor.
+          review: 'all',
+          min_score: queue.threshold,
+          limit,
+          offset
+        }));
+        if (String(queue.scanId) !== String(state.finderScan?.id || '')) return [];
+        const rawFetched = apiItems(data, 'results');
+        liveTotal = Math.max(0, Number(data?.total ?? rawFetched.length) || 0);
+        const normalized = rawFetched.map(
+          (item, index) => normalizeFinderResult(item, offset + index)
+        );
+        const anchorIndex = normalized.findIndex(result => anchorKeys.has(String(result.key)));
+        const predecessors = (anchorIndex >= 0 ? normalized.slice(0, anchorIndex) : normalized)
+          .filter(result => finderQueueResultStillMatches(queue, result));
+        predecessors.forEach(result => {
+          const key = String(result.key);
+          if (fetchedKeys.has(key)) return;
+          fetchedKeys.add(key);
+          fetched.push(result);
+        });
+        if (anchorIndex >= 0) {
+          queue.results.unshift(...fetched);
+          queue.index += fetched.length;
+          queue.baseOffset = 0;
+          const liveQueueTotal = Math.max(
+            0,
+            Number(data?.counts?.[queue.review] ?? queue.total) || 0
+          );
+          queue.total = Math.max(queue.total, liveQueueTotal + removedCount, queue.results.length);
+          queue.exhaustedBefore = true;
+          return fetched;
+        }
+        const reachedLiveEnd = rawFetched.length < limit || offset + rawFetched.length >= liveTotal;
+        if (reachedLiveEnd || !rawFetched.length) break;
+        offset += rawFetched.length;
+      }
+      // The known page may have been reviewed away while the scan was moving.
+      // Keep the edge retryable instead of prepending an unanchored live slice.
+      queue.exhaustedBefore = false;
+      return [];
+    } else {
+      offset = Math.max(0, queue.baseOffset - queue.pageSize);
+      limit = Math.max(0, queue.baseOffset - offset);
+      if (!limit) {
+        queue.exhaustedBefore = true;
+        return [];
+      }
+    }
+    const data = await api(withParams(`/api/finder/scans/${encodeURIComponent(queue.scanId)}/results`, {
+      review: queue.review,
+      min_score: queue.threshold,
+      limit,
+      offset
+    }));
+    if (String(queue.scanId) !== String(state.finderScan?.id || '')) return [];
+    const rawFetched = apiItems(data, 'results');
+    const fetched = rawFetched
+      .map((item, index) => normalizeFinderResult(item, offset + index))
+      .filter(result => !existingKeys.has(String(result.key)));
+    queue.total = Math.max(queue.total, queue.baseOffset + queue.results.length + fetched.length);
+    queue.results.unshift(...fetched);
+    queue.index += fetched.length;
+    queue.baseOffset = offset;
+    queue.exhaustedBefore = offset <= 0;
+    return fetched;
+  }
+
+  async function reviewFinderGallery(review, button = null) {
+    const result = finderFeedbackGalleryResult();
+    if (
+      !result
+      || !['accepted', 'maybe', 'rejected'].includes(review)
+      || state.galleryReviewBusy
+      || state.finderFeedbackGallerySaving
+    ) return false;
+    const feedbackImageUrls = review === 'maybe' ? [] : [...state.finderFeedbackGallerySelection];
+    if (review === 'accepted' && !feedbackImageUrls.length) {
+      toast('Choose a matching image', 'Open Finder review and select at least one image before accepting this gallery.', 'info');
+      return false;
+    }
+    state.galleryReviewBusy = true;
+    state.finderFeedbackGallerySaving = true;
+    if (button) setButtonBusy(button, true, 'Saving…');
+    renderFinderGalleryReview();
+    try {
+      const saved = await reviewFinderResult(result, review, null, { feedbackImageUrls });
+      if (!saved) return false;
+      if (state.galleryContext) {
+        state.galleryContext.finderFeedbackReview = review;
+        state.galleryContext.feedbackImageUrls = [...result.feedbackImageUrls];
+      }
+      state.finderFeedbackGallerySelection = new Set(result.feedbackImageUrls);
+      state.finderFeedbackGalleryDirty = false;
+      setGalleryMode(state.galleryMode, { load: false, render: false });
+      renderImages();
+      updateSelectionUi();
+      const feedbackCount = result.feedbackImageUrls.length;
+      toast(
+        `Gallery ${finderReviewLabel(review).toLowerCase()}`,
+        review === 'maybe'
+          ? 'Kept neutral. Use the arrows when you are ready for another gallery.'
+          : feedbackCount
+            ? `${formatNumber(feedbackCount)} feedback ${feedbackCount === 1 ? 'image was' : 'images were'} saved. You can finish the pose assignments before moving on.`
+            : 'The gallery decision was saved without image-level feedback.',
+        'success'
+      );
+      return true;
+    } finally {
+      state.galleryReviewBusy = false;
+      state.finderFeedbackGallerySaving = false;
+      if (button) setButtonBusy(button, false);
+      updateSelectionUi();
+      renderFinderGalleryReview();
+    }
+  }
+
+  async function navigateFinderGallery(direction) {
+    const queue = state.galleryContext?.finderReviewQueue;
+    if (
+      !queue
+      || ![-1, 1].includes(direction)
+      || state.galleryReviewBusy
+      || queue.loading
+      || state.finderFeedbackGallerySaving
+      || state.poseApplying
+    ) return false;
+    const discardFeedback = state.finderFeedbackGalleryDirty;
+    if (discardFeedback && !window.confirm('Discard the unsaved Finder feedback selection and move to another gallery?')) return false;
+    const navigationRequest = ++state.galleryNavigationRequest;
+    const stillCurrent = () => (
+      navigationRequest === state.galleryNavigationRequest
+      && $('#gallery-modal').open
+      && state.galleryContext?.finderReviewQueue === queue
+    );
+    state.galleryReviewBusy = true;
+    queue.loading = true;
+    renderFinderGalleryReview();
+    const requestedMode = state.galleryMode;
+    try {
+      await flushPoseDraft();
+      if (!stillCurrent()) return false;
+      if (state.poseDirty) {
+        toast('Pose draft still has unsaved changes', 'Resolve the save error before moving to another gallery.', 'error');
+        return false;
+      }
+      let targetIndex = queue.index + direction;
+      if (targetIndex < 0 && !queue.exhaustedBefore) {
+        await loadFinderGalleryQueueEdge(queue, -1);
+        if (!stillCurrent()) return false;
+        targetIndex = queue.index - 1;
+      } else if (targetIndex >= queue.results.length && !queue.exhaustedAfter) {
+        await loadFinderGalleryQueueEdge(queue, 1);
+        if (!stillCurrent()) return false;
+        targetIndex = queue.index + 1;
+      }
+      const target = queue.results[targetIndex];
+      if (!target) {
+        const catchingUp = direction > 0 ? !queue.exhaustedAfter : !queue.exhaustedBefore;
+        toast(
+          catchingUp
+            ? 'Review queue is catching up'
+            : direction > 0 ? 'End of this review queue' : 'Start of this review queue',
+          catchingUp
+            ? `New scan results changed the ranking while this modal was open. Use ${direction > 0 ? 'Next' : 'Previous'} again to continue the stable queue.`
+            : `There are no more ${finderReviewLabel(queue.review).toLowerCase()} galleries in that direction.`,
+          'info'
+        );
+        renderFinderGalleryReview();
+        return false;
+      }
+      if (!stillCurrent()) return false;
+      if (state.poseApplying || state.finderFeedbackGallerySaving) return false;
+      if (discardFeedback) restoreFinderFeedbackGallerySelection();
+      queue.index = targetIndex;
+      await openFinderResult(target, { reviewQueue: queue, mode: requestedMode });
+      return true;
+    } catch (error) {
+      toast('Could not open the next gallery', errorMessage(error), 'error');
+      return false;
+    } finally {
+      queue.loading = false;
+      if (navigationRequest === state.galleryNavigationRequest) {
+        state.galleryReviewBusy = false;
+        renderFinderGalleryReview();
+      }
+    }
+  }
+
+  async function openFinderResult(result, { reviewQueue = null, mode = null } = {}) {
     if (!result?.galleryId) {
       toast('Gallery unavailable', 'This Finder result has no gallery identifier.', 'error');
       return;
     }
+    const queue = reviewQueue || createFinderGalleryReviewQueue(result);
+    const queueIndex = queue.results.findIndex(item => String(item.key) === String(result.key));
+    if (queueIndex >= 0) queue.index = queueIndex;
     const feedbackReview = ['accepted', 'rejected'].includes(result.review);
     await openGallery(result.galleryId, {
       summary: {
@@ -5613,10 +6055,12 @@
         thumbnail_url: result.bestPreviewUrl,
         image_count: result.imageCount
       },
-      mode: feedbackReview ? 'feedback' : 'pose',
+      mode: mode || (feedbackReview ? 'feedback' : 'pose'),
       poseTag: finderPoseTagForScan(),
       finderFeedbackResultKey: result.key,
       finderFeedbackReview: result.review,
+      activeFinderResult: result,
+      finderReviewQueue: queue,
       feedbackImageUrls: [...result.feedbackImageUrls],
       suggestions: (result.matches?.length ? result.matches : [{ imageUrl: result.bestImageUrl, ordinal: result.bestOrdinal, score: result.score }]).map(match => ({
         imageUrl: match.imageUrl,
@@ -6452,6 +6896,11 @@
     $('#select-all').addEventListener('click', () => selectAllImages(true));
     $('#select-none').addEventListener('click', () => selectAllImages(false));
     $$('[data-gallery-mode]').forEach(button => button.addEventListener('click', () => setGalleryMode(button.dataset.galleryMode)));
+    $$('[data-gallery-finder-review]').forEach(button => button.addEventListener('click', () => {
+      reviewFinderGallery(button.dataset.galleryFinderReview, button);
+    }));
+    $('#gallery-review-previous').addEventListener('click', () => navigateFinderGallery(-1));
+    $('#gallery-review-next').addEventListener('click', () => navigateFinderGallery(1));
     $('#finder-feedback-gallery-save').addEventListener('click', saveFinderGalleryFeedbackSelection);
     $('#finder-feedback-prepare-pose').addEventListener('click', prepareFinderPoseFromFeedback);
     $$('[data-pose-assignment]').forEach(button => button.addEventListener('click', () => handlePoseAssignmentButton(button)));
@@ -6506,12 +6955,19 @@
     });
     $('#lightbox-modal').addEventListener('close', resetLightbox);
     $('#gallery-modal').addEventListener('close', () => {
+      state.galleryDetailRequest += 1;
+      state.galleryNavigationRequest += 1;
+      state.poseApplyRequest += 1;
+      state.loadingDetail = false;
       closeModal($('#lightbox-modal'));
       flushPoseDraft();
       state.galleryContext = null;
       state.finderFeedbackGallerySelection = new Set();
       state.finderFeedbackGalleryDirty = false;
       state.finderFeedbackGallerySaving = false;
+      state.galleryReviewBusy = false;
+      state.poseApplying = false;
+      renderFinderGalleryReview();
     });
     $('#gallery-modal').addEventListener('cancel', event => {
       if (!state.finderFeedbackGalleryDirty && !state.finderFeedbackGallerySaving) return;
@@ -6550,6 +7006,12 @@
     } else if (lightboxOpen && !editing && event.key === 'ArrowRight') {
       event.preventDefault();
       navigateLightbox(1);
+    } else if (galleryOpen && !lightboxOpen && !editing && !$('#gallery-review-rail').hidden && event.key === 'ArrowLeft') {
+      event.preventDefault();
+      navigateFinderGallery(-1);
+    } else if (galleryOpen && !lightboxOpen && !editing && !$('#gallery-review-rail').hidden && event.key === 'ArrowRight') {
+      event.preventDefault();
+      navigateFinderGallery(1);
     } else if (state.view === 'sort' && !editing && !anyDialogOpen && !event.ctrlKey && !event.metaKey && !event.altKey && ['z', 'n', 's'].includes(key)) {
       event.preventDefault();
       if (key === 'z' && !$('#sort-undo').disabled) undoSortAction();

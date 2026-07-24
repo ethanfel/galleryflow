@@ -575,6 +575,28 @@
           <button class="icon-button" type="button" data-close-modal aria-label="Close gallery"><svg><use href="#i-close"></use></svg></button>
         </div>
       </header>
+      <section class="gallery-review-rail" id="gallery-review-rail" aria-label="Finder gallery review" hidden>
+        <button class="gallery-review-nav gallery-review-previous" id="gallery-review-previous" type="button" title="Previous Finder gallery (Left arrow)" aria-label="Previous Finder gallery">
+          <svg><use href="#i-chevron"></use></svg>
+        </button>
+        <div class="gallery-review-progress">
+          <strong id="gallery-review-position">1 of 1</strong>
+          <span id="gallery-review-queue">To review queue</span>
+        </div>
+        <div class="gallery-review-decisions" role="group" aria-label="Review this Finder gallery">
+          <button class="button finder-accept" id="gallery-review-accept" type="button" data-gallery-finder-review="accepted"><svg><use href="#i-check"></use></svg><span>Accept</span></button>
+          <button class="button finder-maybe" id="gallery-review-maybe" type="button" data-gallery-finder-review="maybe"><svg><use href="#i-more"></use></svg><span>Maybe</span></button>
+          <button class="button finder-reject" id="gallery-review-reject" type="button" data-gallery-finder-review="rejected"><svg><use href="#i-close"></use></svg><span>Reject</span></button>
+        </div>
+        <div class="gallery-review-feedback">
+          <strong id="gallery-review-feedback-count">0</strong>
+          <span>feedback images</span>
+          <i id="gallery-review-status">To review</i>
+        </div>
+        <button class="gallery-review-nav gallery-review-next" id="gallery-review-next" type="button" title="Next Finder gallery (Right arrow)" aria-label="Next Finder gallery">
+          <svg><use href="#i-chevron"></use></svg>
+        </button>
+      </section>
       <div class="modal-body gallery-modal-body">
         <aside class="gallery-summary" id="gallery-summary">
           <div class="summary-cover" id="summary-cover"><div class="image-placeholder"><svg><use href="#i-image"></use></svg></div></div>

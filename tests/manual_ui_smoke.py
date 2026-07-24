@@ -40,6 +40,7 @@ def build_visual_app(
     finder_continue: bool = False,
     finder_pagination: bool = False,
     finder_tag: bool = False,
+    finder_modal_review: bool = False,
 ):
     finder_source_exhausted = finder_exhausted or finder_continue
     finder_pose_mode = open_finder_pose_flow or finder_direct_assign
@@ -55,6 +56,7 @@ def build_visual_app(
     db = app.state.db
     config.ensure_directories()
     db.initialize()
+    pose_tag = db.create_pose_tag("mating press - backview", "couple")
     target_dir = config.sort_root_path / "visual-sort/targets"
     control_dir = config.sort_root_path / "visual-sort/references"
     target_dir.mkdir(parents=True)
@@ -129,7 +131,25 @@ def build_visual_app(
     app.state.scraper.browse = fake_browse
 
     async def fake_gallery(url: str) -> dict:
-        gallery = next((item for item in galleries if item["url"] == url), galleries[0])
+        boundary_marker = "/galleries/manual-boundary-"
+        if boundary_marker in url:
+            boundary_name = url.split(boundary_marker, 1)[1].split("/", 1)[0]
+            if boundary_name.isdigit():
+                title = f"Boundary candidate {int(boundary_name):03d}"
+            else:
+                title = f"Higher-ranked insert {boundary_name.rsplit('-', 1)[-1].upper()}"
+            gallery = {
+                "id": encode_gallery_id(url),
+                "key": gallery_key(url),
+                "url": url,
+                "title": title,
+                "thumbnail_remote_url": sample_image,
+                "image_count": 21,
+            }
+        else:
+            gallery = next(
+                (item for item in galleries if item["url"] == url), galleries[0]
+            )
         return {
             **gallery,
             "images": [
@@ -163,7 +183,7 @@ def build_visual_app(
         "id": "visual-finder",
         "status": "completed",
         "example_directory": "sorted_outpaint/mating press - backview/selected_target_upscaled",
-        "pose_tag_id": 1,
+        "pose_tag_id": pose_tag["id"],
         "pose_tag_label": "mating press - backview",
         "source_url": "https://www.pornpics.com/",
         "next_url": (
@@ -191,8 +211,23 @@ def build_visual_app(
         "post_calls": 0,
         "delete_calls": 0,
     }
+    finder_modal_review_state: dict[str, object] = {
+        "reviews": {
+            "visual-result-1": "pending",
+            "visual-result-2": "pending",
+            "visual-result-3": "pending",
+        },
+        "selections": {},
+        "review_history": [],
+        "boundary_mode": False,
+        "higher_ranked_inserts": False,
+        "boundary_backward_probe_seen": False,
+    }
     if finder_race:
         finder_scan["status"] = "running"
+    if finder_modal_review:
+        finder_scan["status"] = "running"
+        finder_scan["candidate_count"] = 3
 
     async def fake_finder_status(**kwargs: object) -> dict:
         return {
@@ -289,7 +324,7 @@ def build_visual_app(
 
     async def fake_finder_feedback(**kwargs: object) -> dict:
         return {
-            "pose_tag_id": 1,
+            "pose_tag_id": pose_tag["id"],
             "revision": 19,
             "accepted_galleries": 4,
             "rejected_galleries": 3,
@@ -321,7 +356,7 @@ def build_visual_app(
         return {
             "items": [
                 {
-                    "id": 1,
+                    "id": pose_tag["id"],
                     "label": "mating press - backview",
                     "slug": "mating-press-backview",
                     "default_role": "couple",
@@ -430,7 +465,7 @@ def build_visual_app(
             {
                 "id": "visual-tag-finder",
                 "status": "completed",
-                "pose_tag_id": 1,
+                "pose_tag_id": pose_tag["id"],
                 "pose_tag_label": "mating press - backview",
                 "search_mode": "joytag",
                 "joytag_tag": "mating_press",
@@ -490,11 +525,217 @@ def build_visual_app(
         )
         return {"scan": finder_scan}
 
+    def finder_modal_review_result(result_id: str) -> dict:
+        result_number = int(result_id.rsplit("-", 1)[-1])
+        gallery = galleries[result_number + 1]
+        first_ordinal = 1 + ((result_number - 1) * 3)
+        selected = list(
+            finder_modal_review_state["selections"].get(result_id, [])
+        )
+        review = str(finder_modal_review_state["reviews"][result_id])
+        return {
+            "id": result_id,
+            "gallery_id": gallery["id"],
+            "gallery_url": gallery["url"],
+            "title": f"Modal review candidate {result_number}",
+            "rank": result_number,
+            "score": 0.97 - (result_number * 0.02),
+            "base_score": 0.93 - (result_number * 0.02),
+            "feedback_adjustment": 0.02,
+            "feedback_applied": True,
+            "feedback_revision": 19,
+            "ranking_tier": 2,
+            "online_scanned": False,
+            "review": review,
+            "feedback_image_urls": selected,
+            "feedback_usable_image_urls": selected,
+            "feedback_pending_image_urls": [],
+            "images_scored": 24,
+            "image_count": 21,
+            "person_count": 2,
+            "score_breakdown": {
+                "exact": 0.31,
+                "pose": 0.97 - (result_number * 0.02),
+                "appearance": 0.72,
+            },
+            "top_matches": [
+                {
+                    "rank": offset + 1,
+                    "image_url": (
+                        "https://cdni.pornpics.com/1280/manual/"
+                        f"{first_ordinal + offset:03d}.jpg"
+                    ),
+                    "preview_url": (
+                        "/api/media?url=https%3A%2F%2Fexample.test%2F"
+                        f"modal-candidate-{result_number}-{offset + 1}.jpg"
+                        "&token=visual"
+                    ),
+                    "ordinal": first_ordinal + offset,
+                    "score": 0.97 - (result_number * 0.02) - (offset * 0.03),
+                    "pose_score": 0.97
+                    - (result_number * 0.02)
+                    - (offset * 0.03),
+                    "pose_reliable": True,
+                    "match_type": "pose",
+                    "ranking_tier": 2,
+                    "person_count": 2,
+                }
+                for offset in range(3)
+            ],
+        }
+
+    def finder_modal_boundary_result(
+        result_id: str,
+        *,
+        rank: int,
+        label: str,
+        score: float,
+    ) -> dict:
+        gallery_url = (
+            f"https://www.pornpics.com/galleries/manual-boundary-{label}/"
+        )
+        image_number = max(1, min(999, rank))
+        return {
+            "id": result_id,
+            "gallery_id": encode_gallery_id(gallery_url),
+            "gallery_url": gallery_url,
+            "title": (
+                f"Boundary candidate {int(label):03d}"
+                if label.isdigit()
+                else f"Higher-ranked insert {label.rsplit('-', 1)[-1].upper()}"
+            ),
+            "rank": rank,
+            "score": score,
+            "ranking_tier": 2,
+            "online_scanned": True,
+            "review": "pending",
+            "feedback_image_urls": [],
+            "feedback_usable_image_urls": [],
+            "feedback_pending_image_urls": [],
+            "images_scored": 21,
+            "image_count": 21,
+            "person_count": 2,
+            "top_matches": [
+                {
+                    "rank": 1,
+                    "image_url": (
+                        "https://cdni.pornpics.com/1280/manual/"
+                        f"{image_number:03d}.jpg"
+                    ),
+                    "preview_url": (
+                        "/api/media?url=https%3A%2F%2Fexample.test%2F"
+                        f"boundary-{label}.jpg&token=visual"
+                    ),
+                    "ordinal": image_number,
+                    "score": score,
+                    "pose_score": score,
+                    "pose_reliable": True,
+                    "match_type": "pose",
+                    "ranking_tier": 2,
+                    "person_count": 2,
+                }
+            ],
+        }
+
     async def fake_finder_results(**kwargs: object) -> dict:
         def media(name: str) -> str:
             return (
                 f"/api/media?url=https%3A%2F%2Fexample.test%2F{name}.jpg&token=visual"
             )
+
+        if finder_modal_review:
+            if finder_modal_review_state["boundary_mode"]:
+                originals = [
+                    finder_modal_boundary_result(
+                        f"boundary-result-{index:03d}",
+                        rank=index,
+                        label=f"{index:03d}",
+                        score=0.99 - (index / 1000),
+                    )
+                    for index in range(1, 51)
+                ]
+                inserts = (
+                    [
+                        finder_modal_boundary_result(
+                            f"boundary-insert-{suffix}",
+                            rank=index,
+                            label=f"insert-{suffix}",
+                            score=0.999 - (index / 10000),
+                        )
+                        for index, suffix in enumerate(("a", "b"), 1)
+                    ]
+                    if finder_modal_review_state["higher_ranked_inserts"]
+                    else []
+                )
+                all_results = [*inserts, *originals]
+                review_filter = str(kwargs.get("review") or "pending")
+                offset = max(0, int(kwargs.get("offset") or 0))
+                limit = max(1, int(kwargs.get("limit") or 24))
+                if (
+                    finder_modal_review_state["higher_ranked_inserts"]
+                    and offset < 24
+                ):
+                    if review_filter != "all":
+                        raise HTTPException(
+                            status_code=422,
+                            detail=(
+                                "Active backward queue probes must use review=all "
+                                "to retain the stable predecessor anchor"
+                            ),
+                        )
+                    finder_modal_review_state["boundary_backward_probe_seen"] = (
+                        True
+                    )
+                filtered = [
+                    result
+                    for result in all_results
+                    if review_filter == "all" or result["review"] == review_filter
+                ]
+                page_items = filtered[offset : offset + limit]
+                return {
+                    "results": page_items,
+                    "total": len(filtered),
+                    "counts": {
+                        "pending": len(filtered),
+                        "accepted": 0,
+                        "maybe": 0,
+                        "rejected": 0,
+                        "total": len(filtered),
+                    },
+                    "limit": limit,
+                    "offset": offset,
+                    "page": offset // limit + 1,
+                    "page_size": limit,
+                    "page_count": (len(filtered) + limit - 1) // limit,
+                    "has_previous": offset > 0,
+                    "has_next": offset + len(page_items) < len(filtered),
+                }
+            all_results = [
+                finder_modal_review_result(f"visual-result-{index}")
+                for index in range(1, 4)
+            ]
+            review_filter = str(kwargs.get("review") or "pending")
+            filtered = [
+                result
+                for result in all_results
+                if review_filter == "all" or result["review"] == review_filter
+            ]
+            counts = {
+                review: sum(result["review"] == review for result in all_results)
+                for review in ("pending", "accepted", "maybe", "rejected")
+            }
+            counts["total"] = len(all_results)
+            return {
+                "results": filtered,
+                "counts": counts,
+                "limit": 24,
+                "offset": 0,
+                "page": 1,
+                "page_size": 24,
+                "page_count": 1,
+                "has_previous": False,
+                "has_next": False,
+            }
 
         if finder_tag:
             result = {
@@ -739,6 +980,19 @@ def build_visual_app(
     async def fake_finder_review(
         scan_id: str, result_id: str, payload, **kwargs: object
     ) -> dict:
+        if finder_modal_review:
+            review = str(payload.review)
+            selected = list(payload.feedback_image_urls or [])
+            finder_modal_review_state["reviews"][result_id] = review
+            finder_modal_review_state["selections"][result_id] = selected
+            finder_modal_review_state["review_history"].append(
+                {
+                    "result_id": result_id,
+                    "review": review,
+                    "feedback_image_urls": selected,
+                }
+            )
+            return {"result": finder_modal_review_result(result_id)}
         await asyncio.sleep(0.6 if finder_race else 0)
         finder_race_state["review"] = payload.review
         selected = list(payload.feedback_image_urls or [])
@@ -759,6 +1013,32 @@ def build_visual_app(
                 "feedback_usable_image_urls": usable,
                 "feedback_pending_image_urls": pending,
             }
+        }
+
+    async def fake_finder_modal_boundary_start() -> dict:
+        finder_modal_review_state["boundary_mode"] = True
+        finder_modal_review_state["higher_ranked_inserts"] = False
+        finder_scan.update(
+            {
+                "status": "running",
+                "candidate_count": 50,
+                "processed_galleries": 150,
+                "processed_images": 3150,
+                "progress_percent": 72,
+            }
+        )
+        return {"active": True, "candidates": 50}
+
+    async def fake_finder_modal_boundary_insert() -> dict:
+        finder_modal_review_state["higher_ranked_inserts"] = True
+        finder_scan["candidate_count"] = 52
+        return {"inserted": 2, "candidates": 52}
+
+    async def fake_finder_modal_boundary_state() -> dict:
+        return {
+            "backward_probe_seen": bool(
+                finder_modal_review_state["boundary_backward_probe_seen"]
+            )
         }
 
     async def fake_events(request=None) -> Response:
@@ -1095,6 +1375,499 @@ window.addEventListener('load', () => {
 """
         if finder_pagination:
             script += "window.addEventListener('load',()=>{let clicked=false;const poll=setInterval(()=>{const status=document.querySelector('#finder-page-status')?.textContent;const cards=document.querySelectorAll('#finder-result-grid .finder-card');if(!clicked&&status==='Page 1 of 3'&&cards.length===24){document.querySelector('#finder-page-next')?.click();clicked=true}else if(clicked&&status==='Page 2 of 3'&&cards.length===24&&cards[0]?.querySelector('.finder-rank')?.textContent==='#25'){document.documentElement.dataset.finderPagination='pass';clearInterval(poll)}},50);setTimeout(()=>{if(!document.documentElement.dataset.finderPagination)document.documentElement.dataset.finderPagination='fail'},4500)});"
+        if finder_modal_review:
+            script += """
+window.addEventListener('load', () => {
+  let phase = 'open-first';
+  let refreshAt = 0;
+  const optionAt = index =>
+    document.querySelectorAll('#image-grid .image-option')[index];
+  const optionInput = index => optionAt(index)?.querySelector('input');
+  const checkedCount = () => document.querySelectorAll(
+    '#image-grid .image-option input:checked'
+  ).length;
+  const reviewButton = review => document.querySelector(
+    `[data-gallery-finder-review="${review}"]`
+  );
+  const setPhase = value => {
+    phase = value;
+    document.documentElement.dataset.finderModalReviewPhase = value;
+  };
+  const poll = setInterval(() => {
+    const modal = document.querySelector('#gallery-modal');
+    const title = document.querySelector('#gallery-modal-title')?.textContent || '';
+    const position = document.querySelector(
+      '#gallery-review-position'
+    )?.textContent || '';
+    const status = document.querySelector(
+      '#gallery-review-status'
+    )?.textContent || '';
+    const feedbackCount = document.querySelector(
+      '#gallery-review-feedback-count'
+    )?.textContent || '';
+    const poseStatus = document.querySelector(
+      '#pose-save-status'
+    )?.textContent || '';
+    const counts = [
+      document.querySelector('#finder-accepted-count')?.textContent,
+      document.querySelector('#finder-maybe-count')?.textContent,
+      document.querySelector('#finder-rejected-count')?.textContent,
+    ].join('/');
+    document.documentElement.dataset.finderModalReviewDebug = [
+      phase,
+      title,
+      position,
+      status,
+      feedbackCount,
+      modal?.className,
+      modal?.open,
+      checkedCount(),
+      poseStatus,
+      counts,
+      document.querySelectorAll('#finder-result-grid .finder-card').length,
+      document.querySelector('#finder-pending-count')?.textContent,
+      document.querySelector('#finder-page-status')?.textContent,
+      document.querySelector('#finder-session-label')?.textContent,
+      document.querySelector('#finder-scan-select')?.value,
+      document.querySelector('#finder-scan-select')?.disabled,
+      document.querySelector('#finder-result-grid')?.getAttribute('aria-busy'),
+      document.querySelector('#finder-result-threshold')?.value,
+    ].join('|');
+
+    if (phase === 'open-first') {
+      const cards = document.querySelectorAll(
+        '#finder-result-grid .finder-card'
+      );
+      if (
+        cards.length === 3
+        && document.querySelector('#finder-pending-count')?.textContent === '3'
+      ) {
+        cards[0].querySelector('.finder-open')?.click();
+        setPhase('open-feedback');
+      }
+      return;
+    }
+
+    if (
+      phase === 'open-feedback'
+      && modal?.open
+      && !document.querySelector('#gallery-review-rail')?.hidden
+      && title === 'After-hours city gallery'
+      && position === '1 of 3'
+      && document.querySelector('#image-grid')?.getAttribute('aria-busy')
+        === 'false'
+      && optionAt(20)
+    ) {
+      if (!modal.classList.contains('is-feedback-mode')) {
+        document.querySelector('[data-gallery-mode="feedback"]')?.click();
+        return;
+      }
+      setPhase('clear-feedback');
+      return;
+    }
+
+    if (phase === 'clear-feedback' && modal.classList.contains(
+      'is-feedback-mode'
+    )) {
+      if (checkedCount()) {
+        document.querySelector('#select-none')?.click();
+        return;
+      }
+      setPhase('select-feedback');
+      return;
+    }
+
+    if (phase === 'select-feedback') {
+      const target = optionInput(9);
+      if (target && !target.checked) {
+        target.click();
+        return;
+      }
+      if (
+        target?.checked
+        && feedbackCount === '1'
+        && !reviewButton('accepted')?.disabled
+      ) {
+        reviewButton('accepted').click();
+        setPhase('accepted');
+      }
+      return;
+    }
+
+    if (
+      phase === 'accepted'
+      && status === 'Accepted'
+      && feedbackCount === '1'
+      && document.querySelector('#finder-accepted-count')?.textContent === '1'
+    ) {
+      const prepare = document.querySelector('#finder-feedback-prepare-pose');
+      if (prepare && !prepare.hidden && !prepare.disabled) {
+        prepare.click();
+        setPhase('set-control');
+      }
+      return;
+    }
+
+    if (
+      phase === 'set-control'
+      && modal.classList.contains('is-pose-mode')
+      && !poseStatus.includes('Loading')
+      && optionAt(20)
+    ) {
+      document.querySelectorAll(
+        '#image-grid .image-option input:checked'
+      ).forEach(input => input.click());
+      const control = optionInput(0);
+      if (control && !control.checked) control.click();
+      const setControl = document.querySelector(
+        '[data-pose-assignment="couple"]'
+      );
+      if (setControl && !setControl.disabled) {
+        setControl.click();
+        setPhase('set-target');
+      }
+      return;
+    }
+
+    if (
+      phase === 'set-target'
+      && optionAt(0)?.classList.contains('has-pose-control')
+      && !poseStatus.includes('Loading')
+    ) {
+      const target = optionInput(9);
+      if (target && !target.checked) target.click();
+      const applyTarget = document.querySelector(
+        '[data-pose-assignment="target"]'
+      );
+      if (target?.checked && applyTarget && !applyTarget.disabled) {
+        applyTarget.click();
+        setPhase('draft-saved');
+      }
+      return;
+    }
+
+    if (
+      phase === 'draft-saved'
+      && optionAt(0)?.classList.contains('has-pose-control')
+      && optionAt(9)?.classList.contains('has-pose-target')
+      && poseStatus.includes('Draft saved')
+      && feedbackCount === '1'
+    ) {
+      const next = document.querySelector('#gallery-review-next');
+      if (next && !next.disabled) {
+        next.click();
+        setPhase('maybe-second');
+      }
+      return;
+    }
+
+    if (
+      phase === 'maybe-second'
+      && title === 'Soft focus summer collection'
+      && position === '2 of 3'
+      && !reviewButton('maybe')?.disabled
+    ) {
+      reviewButton('maybe').click();
+      setPhase('next-after-maybe');
+      return;
+    }
+
+    if (
+      phase === 'next-after-maybe'
+      && status === 'Maybe'
+      && document.querySelector('#finder-maybe-count')?.textContent === '1'
+    ) {
+      const next = document.querySelector('#gallery-review-next');
+      if (next && !next.disabled) {
+        next.click();
+        setPhase('reject-third');
+      }
+      return;
+    }
+
+    if (
+      phase === 'reject-third'
+      && title === 'Classic monochrome session'
+      && position === '3 of 3'
+      && !reviewButton('rejected')?.disabled
+    ) {
+      reviewButton('rejected').click();
+      setPhase('previous-to-second');
+      return;
+    }
+
+    if (
+      phase === 'previous-to-second'
+      && status === 'Rejected'
+      && document.querySelector('#finder-rejected-count')?.textContent === '1'
+    ) {
+      const previous = document.querySelector('#gallery-review-previous');
+      if (previous && !previous.disabled) {
+        previous.click();
+        setPhase('previous-to-first');
+      }
+      return;
+    }
+
+    if (
+      phase === 'previous-to-first'
+      && title === 'Soft focus summer collection'
+      && position === '2 of 3'
+      && status === 'Maybe'
+    ) {
+      const previous = document.querySelector('#gallery-review-previous');
+      if (previous && !previous.disabled) {
+        previous.click();
+        setPhase('verify-feedback');
+      }
+      return;
+    }
+
+    if (
+      phase === 'verify-feedback'
+      && title === 'After-hours city gallery'
+      && position === '1 of 3'
+      && status === 'Accepted'
+      && feedbackCount === '1'
+      && document.querySelector('#gallery-review-previous')?.disabled
+    ) {
+      if (!modal.classList.contains('is-feedback-mode')) {
+        document.querySelector('[data-gallery-mode="feedback"]')?.click();
+        return;
+      }
+      if (checkedCount() !== 1 || !optionInput(9)?.checked) return;
+      document.querySelector('[data-gallery-mode="pose"]')?.click();
+      setPhase('verify-draft');
+      return;
+    }
+
+    if (
+      phase === 'verify-draft'
+      && modal.classList.contains('is-pose-mode')
+      && optionAt(0)?.classList.contains('has-pose-control')
+      && optionAt(9)?.classList.contains('has-pose-target')
+      && poseStatus.includes('Draft saved')
+      && feedbackCount === '1'
+      && counts === '1/1/1'
+    ) {
+      document.querySelector('#select-none')?.click();
+      setPhase('prepare-busy-enter');
+      return;
+    }
+
+    if (
+      phase === 'prepare-busy-enter'
+      && modal.classList.contains('is-pose-mode')
+      && checkedCount() === 0
+      && optionAt(0)?.classList.contains('has-pose-control')
+      && optionAt(9)?.classList.contains('has-pose-target')
+    ) {
+      const untouchedTarget = optionInput(3);
+      if (untouchedTarget && !untouchedTarget.checked) {
+        untouchedTarget.click();
+        setPhase('trigger-busy-enter');
+        return;
+      }
+    }
+
+    if (
+      phase === 'trigger-busy-enter'
+      && modal.classList.contains('is-pose-mode')
+    ) {
+      const untouchedTarget = optionInput(3);
+      const apply = document.querySelector('#pose-apply-checked');
+      const next = document.querySelector('#gallery-review-next');
+      if (untouchedTarget?.checked && apply && !apply.disabled && next && !next.disabled) {
+        next.click();
+        document.body.dispatchEvent(new KeyboardEvent('keydown', {
+          key: 'Enter',
+          bubbles: true,
+        }));
+        setPhase('verify-busy-enter');
+      }
+      return;
+    }
+
+    if (
+      phase === 'verify-busy-enter'
+      && title === 'Soft focus summer collection'
+      && position === '2 of 3'
+    ) {
+      const previous = document.querySelector('#gallery-review-previous');
+      if (previous && !previous.disabled) {
+        previous.click();
+        setPhase('verify-busy-enter-return');
+      }
+      return;
+    }
+
+    if (
+      phase === 'verify-busy-enter-return'
+      && title === 'After-hours city gallery'
+      && position === '1 of 3'
+      && modal.classList.contains('is-pose-mode')
+      && optionAt(0)?.classList.contains('has-pose-control')
+      && optionAt(9)?.classList.contains('has-pose-target')
+      && !optionAt(3)?.classList.contains('has-pose-target')
+      && document.querySelector('#pose-target-count')?.textContent === '1'
+      && poseStatus.includes('Draft saved')
+    ) {
+      modal.querySelector('.modal-header [data-close-modal]')?.click();
+      setPhase('boundary-starting');
+      fetch('/manual/finder-modal-review/boundary', {
+        method: 'POST',
+      }).then(response => {
+        if (!response.ok) {
+          setPhase(`boundary-start-http-${response.status}`);
+          return;
+        }
+        setPhase('boundary-refresh');
+      }).catch(() => {
+        setPhase('boundary-start-failed');
+      });
+      return;
+    }
+
+    if (phase === 'boundary-refresh' && !modal.open) {
+      const acceptedTab = document.querySelector(
+        '[data-finder-review="accepted"]'
+      );
+      if (acceptedTab) {
+        acceptedTab.click();
+        refreshAt = Date.now();
+        setPhase('boundary-select-pending');
+      }
+      return;
+    }
+
+    if (
+      phase === 'boundary-select-pending'
+      && document.querySelector('[data-finder-review="accepted"]')
+        ?.getAttribute('aria-selected') === 'true'
+    ) {
+      document.querySelector('[data-finder-review="pending"]')?.click();
+      refreshAt = Date.now();
+      setPhase('boundary-page-one');
+      return;
+    }
+
+    if (phase === 'boundary-page-one') {
+      const cards = document.querySelectorAll(
+        '#finder-result-grid .finder-card'
+      );
+      if (
+        cards.length === 24
+        && document.querySelector('#finder-pending-count')?.textContent === '50'
+        && document.querySelector('#finder-page-status')?.textContent
+          === 'Page 1 of 3'
+        && document.querySelector('#finder-session-label')?.textContent
+          .includes('running')
+      ) {
+        document.querySelector('#finder-page-next')?.click();
+        setPhase('boundary-page-two');
+      } else if (Date.now() - refreshAt > 600) {
+        const pendingTab = document.querySelector(
+          '[data-finder-review="pending"]'
+        );
+        if (pendingTab?.getAttribute('aria-selected') !== 'true') {
+          pendingTab?.click();
+        } else {
+          document.querySelector('#finder-result-threshold')?.dispatchEvent(
+            new Event('change', { bubbles: true })
+          );
+        }
+        refreshAt = Date.now();
+      }
+      return;
+    }
+
+    if (phase === 'boundary-page-two') {
+      const cards = document.querySelectorAll(
+        '#finder-result-grid .finder-card'
+      );
+      if (
+        cards.length === 24
+        && document.querySelector('#finder-page-status')?.textContent
+          === 'Page 2 of 3'
+        && cards[0]?.querySelector('.finder-rank')?.textContent === '#25'
+        && cards[0]?.querySelector('.finder-card-title')?.textContent
+          === 'Boundary candidate 025'
+      ) {
+        cards[0].querySelector('.finder-open')?.click();
+        setPhase('boundary-open');
+      }
+      return;
+    }
+
+    if (
+      phase === 'boundary-open'
+      && modal.open
+      && title === 'Boundary candidate 025'
+      && position === '25 of 50'
+      && document.querySelector('#image-grid')?.getAttribute('aria-busy')
+        === 'false'
+    ) {
+      setPhase('boundary-inserting');
+      fetch('/manual/finder-modal-review/insert', {
+        method: 'POST',
+      }).then(response => {
+        if (!response.ok) {
+          setPhase(`boundary-insert-http-${response.status}`);
+          return;
+        }
+        setPhase('boundary-inserted');
+      }).catch(() => {
+        setPhase('boundary-insert-failed');
+      });
+      return;
+    }
+
+    if (phase === 'boundary-inserted') {
+      const previous = document.querySelector('#gallery-review-previous');
+      if (previous && !previous.disabled) {
+        previous.click();
+        setPhase('boundary-previous-24');
+      }
+      return;
+    }
+
+    if (
+      phase === 'boundary-previous-24'
+      && title === 'Boundary candidate 024'
+    ) {
+      const previous = document.querySelector('#gallery-review-previous');
+      if (previous && !previous.disabled) {
+        previous.click();
+        setPhase('boundary-previous-23');
+      }
+      return;
+    }
+
+    if (
+      phase === 'boundary-previous-23'
+      && title === 'Boundary candidate 023'
+    ) {
+      setPhase('boundary-probe-check');
+      fetch('/manual/finder-modal-review/state')
+        .then(response => response.json())
+        .then(data => {
+          if (data.backward_probe_seen) {
+            document.documentElement.dataset.finderModalReview = 'pass';
+            clearInterval(poll);
+          } else {
+            setPhase('boundary-probe-missing');
+          }
+        })
+        .catch(() => setPhase('boundary-probe-check-failed'));
+    }
+  }, 60);
+  setTimeout(() => {
+    if (!document.documentElement.dataset.finderModalReview) {
+      document.documentElement.dataset.finderModalReview = 'fail';
+    }
+  }, 16500);
+});
+"""
         if finder_continue:
             script += """window.addEventListener('load',()=>{const failedUrl='https://www.pornpics.com/blocked-source/';const nextUrl='https://www.pornpics.com/new-category/';let phase='waiting';let successAt=0;const countsOk=()=>document.querySelector('#finder-accepted-count')?.textContent==='1'&&document.querySelector('#finder-rejected-count')?.textContent==='1';const cardOk=()=>document.querySelectorAll('#finder-result-grid .finder-card').length===1;const poll=setInterval(()=>{const form=document.querySelector('#finder-continue');const source=document.querySelector('#finder-continue-source');const pages=document.querySelector('#finder-continue-pages');const button=document.querySelector('#finder-continue-button');const toasts=[...document.querySelectorAll('.toast')].map(item=>item.textContent).join(' ');if(phase==='waiting'&&form&&!form.hidden&&source&&pages&&button&&!button.disabled&&countsOk()){document.querySelector('[data-finder-review=accepted]')?.click();pages.value='7';pages.dispatchEvent(new Event('input',{bubbles:true}));if(!document.querySelector('#finder-continue-summary')?.textContent.includes('Up to 7 new pages'))return;source.value=failedUrl;button.click();phase='failure-sent'}else if(phase==='failure-sent'&&form&&!form.hidden&&!button?.disabled&&source?.value===failedUrl&&countsOk()&&cardOk()&&toasts.includes('Could not continue Finder search')){document.documentElement.dataset.finderContinueFailure='pass';document.querySelector('#finder-refresh')?.click();setTimeout(()=>{source.value=nextUrl;button.click();successAt=Date.now();phase='success-sent'},180)}else if(phase==='success-sent'&&Date.now()-successAt>1800){const passed=form?.hidden&&document.querySelector('#finder-session-label')?.textContent.includes('running')&&document.querySelector('#finder-source')?.value===nextUrl&&document.querySelector('#finder-scan-select')?.value==='visual-finder'&&countsOk()&&cardOk();document.documentElement.dataset.finderContinue=passed?'pass':'fail';clearInterval(poll)}},50);setTimeout(()=>{if(!document.documentElement.dataset.finderContinue)document.documentElement.dataset.finderContinue='fail';if(!document.documentElement.dataset.finderContinueFailure)document.documentElement.dataset.finderContinueFailure='fail'},6500)});"""
         if finder_review_mode:
@@ -1249,6 +2022,22 @@ window.addEventListener('load', () => {
             fake_finder_joytag_index_cancel,
             methods=["DELETE"],
         )
+    if finder_modal_review:
+        app.add_api_route(
+            "/manual/finder-modal-review/boundary",
+            fake_finder_modal_boundary_start,
+            methods=["POST"],
+        )
+        app.add_api_route(
+            "/manual/finder-modal-review/insert",
+            fake_finder_modal_boundary_insert,
+            methods=["POST"],
+        )
+        app.add_api_route(
+            "/manual/finder-modal-review/state",
+            fake_finder_modal_boundary_state,
+            methods=["GET"],
+        )
     return app
 
 
@@ -1270,6 +2059,7 @@ def main() -> None:
     parser.add_argument("--finder-continue", action="store_true")
     parser.add_argument("--finder-pagination", action="store_true")
     parser.add_argument("--finder-tag", action="store_true")
+    parser.add_argument("--finder-modal-review", action="store_true")
     args = parser.parse_args()
     finder_mode = (
         args.finder
@@ -1282,9 +2072,14 @@ def main() -> None:
         or args.finder_continue
         or args.finder_pagination
         or args.finder_tag
+        or args.finder_modal_review
     )
     suffix = (
-        "finder-tag-mobile"
+        "finder-modal-review-mobile"
+        if args.finder_modal_review and args.mobile
+        else "finder-modal-review"
+        if args.finder_modal_review
+        else "finder-tag-mobile"
         if args.finder_tag and args.mobile
         else "finder-tag"
         if args.finder_tag
@@ -1367,6 +2162,7 @@ def main() -> None:
                     finder_continue=args.finder_continue,
                     finder_pagination=args.finder_pagination,
                     finder_tag=args.finder_tag,
+                    finder_modal_review=args.finder_modal_review,
                 ),
                 host="127.0.0.1",
                 port=18101,
@@ -1398,7 +2194,7 @@ def main() -> None:
             "--disable-sync",
             "--force-prefers-reduced-motion",
             "--no-first-run",
-            f"--virtual-time-budget={8500 if args.finder_tag else 7500 if args.finder_unusable_save or args.finder_continue else 6500 if args.finder_direct_assign else 4500 if args.finder_race else 4000 if args.finder_pose_flow else 3000 if args.lightbox or args.pose else 2000 if finder_mode else 1000}",
+            f"--virtual-time-budget={18000 if args.finder_modal_review else 8500 if args.finder_tag else 7500 if args.finder_unusable_save or args.finder_continue else 6500 if args.finder_direct_assign else 4500 if args.finder_race else 4000 if args.finder_pose_flow else 3000 if args.lightbox or args.pose else 2000 if finder_mode else 1000}",
             f"--user-data-dir={Path(directory) / 'chrome-profile'}",
             f"--window-size={viewport}",
             f"--screenshot={output}",
@@ -1411,6 +2207,7 @@ def main() -> None:
             or args.finder_continue
             or args.finder_pagination
             or args.finder_tag
+            or args.finder_modal_review
         ):
             command.insert(1, "--dump-dom")
         completed = subprocess.run(
@@ -1424,6 +2221,7 @@ def main() -> None:
                 or args.finder_continue
                 or args.finder_pagination
                 or args.finder_tag
+                or args.finder_modal_review
             ),
             text=(
                 args.finder_race
@@ -1432,6 +2230,7 @@ def main() -> None:
                 or args.finder_continue
                 or args.finder_pagination
                 or args.finder_tag
+                or args.finder_modal_review
             ),
         )
         if args.finder_race and 'data-finder-race="pass"' not in completed.stdout:
@@ -1474,6 +2273,21 @@ def main() -> None:
             raise AssertionError(
                 "Tag Finder corpus indexing, analysis, scan payload, or result "
                 f"rendering failed (phase={phase or 'unknown'}, debug={debug or 'none'})"
+            )
+        if (
+            args.finder_modal_review
+            and 'data-finder-modal-review="pass"' not in completed.stdout
+        ):
+            phase = completed.stdout.partition(
+                'data-finder-modal-review-phase="'
+            )[2].partition('"')[0]
+            debug = completed.stdout.partition(
+                'data-finder-modal-review-debug="'
+            )[2].partition('"')[0]
+            raise AssertionError(
+                "in-modal Finder decisions, result navigation, selected-image "
+                "feedback, or pose-draft persistence failed "
+                f"(phase={phase or 'unknown'}, debug={debug or 'none'})"
             )
         server.should_exit = True
         thread.join(timeout=5)
