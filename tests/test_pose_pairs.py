@@ -966,7 +966,7 @@ async def test_pose_api_contract_and_validation(tmp_path: Path, monkeypatch) -> 
                 "group": None,
             }
 
-            invalid = await client.put(
+            target_first = await client.put(
                 f"/api/galleries/{gallery_id}/pose-draft",
                 json={
                     "expected_revision": 0,
@@ -980,10 +980,25 @@ async def test_pose_api_contract_and_validation(tmp_path: Path, monkeypatch) -> 
                     ],
                 },
             )
-            assert invalid.status_code == 400
+            assert target_first.status_code == 200
+            target_first_draft = target_first.json()["draft"]
+            assert target_first_draft["revision"] == 1
+            assert target_first_draft["controls"]["solo"] is None
+            assert target_first_draft["targets"][0]["pose_slug"] == "standing"
+
+            incomplete_export = await client.post(
+                "/api/pose-exports",
+                json={
+                    "gallery_id": gallery_id,
+                    "profile": "Default",
+                    "expected_revision": 1,
+                },
+            )
+            assert incomplete_export.status_code == 422
+            assert incomplete_export.json()["detail"] == "Missing solo control"
 
             body = {
-                "expected_revision": 0,
+                "expected_revision": 1,
                 "controls": {"solo": CONTROL},
                 "targets": [
                     {
@@ -999,7 +1014,7 @@ async def test_pose_api_contract_and_validation(tmp_path: Path, monkeypatch) -> 
             )
             assert saved.status_code == 200
             draft = saved.json()["draft"]
-            assert draft["revision"] == 1
+            assert draft["revision"] == 2
             assert draft["targets"][0]["pose_slug"] == "standing"
             draft_event = pose_events.get_nowait()
             app.state.events.unsubscribe(pose_events)
@@ -1008,14 +1023,14 @@ async def test_pose_api_contract_and_validation(tmp_path: Path, monkeypatch) -> 
                 "action": "draft",
                 "gallery_id": gallery_id,
                 "profile": "Default",
-                "revision": 1,
+                "revision": 2,
             }
 
             stale = await client.put(
                 f"/api/galleries/{gallery_id}/pose-draft", json=body
             )
             assert stale.status_code == 409
-            assert stale.json()["draft"]["revision"] == 1
+            assert stale.json()["draft"]["revision"] == 2
 
             changed = await client.patch(
                 f"/api/pose-tags/{tag['id']}",
@@ -1029,7 +1044,7 @@ async def test_pose_api_contract_and_validation(tmp_path: Path, monkeypatch) -> 
                 json={
                     "gallery_id": gallery_id,
                     "profile": "Default",
-                    "expected_revision": 1,
+                    "expected_revision": 2,
                 },
             )
             assert exported.status_code == 202
@@ -1041,11 +1056,11 @@ async def test_pose_api_contract_and_validation(tmp_path: Path, monkeypatch) -> 
                 json={
                     "gallery_id": gallery_id,
                     "profile": "Default",
-                    "expected_revision": 2,
+                    "expected_revision": 3,
                 },
             )
             assert stale_export.status_code == 409
-            assert stale_export.json()["draft"]["revision"] == 1
+            assert stale_export.json()["draft"]["revision"] == 2
 
             app.state.db.create_job(
                 {

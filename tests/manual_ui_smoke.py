@@ -246,6 +246,7 @@ def build_visual_app(
         "boundary_mode": False,
         "higher_ranked_inserts": False,
         "boundary_backward_probe_seen": False,
+        "pose_export_calls": [],
     }
     if finder_race:
         finder_scan["status"] = "running"
@@ -1062,7 +1063,10 @@ def build_visual_app(
         return {
             "backward_probe_seen": bool(
                 finder_modal_review_state["boundary_backward_probe_seen"]
-            )
+            ),
+            "pose_export_calls": len(
+                finder_modal_review_state["pose_export_calls"]
+            ),
         }
 
     async def fake_finder_modal_prefetch_state() -> dict:
@@ -1091,6 +1095,68 @@ def build_visual_app(
             },
             "background_detail_peak": gallery_detail_concurrency["peak"],
         }
+
+    def finder_modal_pose_export_job() -> dict:
+        calls = finder_modal_review_state["pose_export_calls"]
+        pose_revision = int(calls[0].get("expected_revision") or 0) if calls else 0
+        return {
+            "id": "visual-pose-export",
+            "kind": "pose_export",
+            "status": "queued",
+            "gallery_id": galleries[2]["id"],
+            "gallery_url": galleries[2]["url"],
+            "title": galleries[2]["title"],
+            "profile": "Default",
+            "pair_count": 1,
+            "pose_revision": pose_revision,
+            "total_images": 2,
+            "completed_images": 0,
+            "progress": 0,
+            "created_at": "2026-07-24T12:00:00+00:00",
+        }
+
+    async def fake_finder_modal_pose_export(
+        payload: object, **kwargs: object
+    ) -> dict:
+        values = (
+            payload.model_dump()
+            if callable(getattr(payload, "model_dump", None))
+            else dict(payload)
+            if isinstance(payload, dict)
+            else {}
+        )
+        finder_modal_review_state["pose_export_calls"].append(values)
+        if len(finder_modal_review_state["pose_export_calls"]) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail="The visual pose draft was already queued",
+            )
+        if (
+            values.get("gallery_id") != galleries[2]["id"]
+            or values.get("profile") != "Default"
+            or int(values.get("expected_revision") or 0) < 1
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="The visual pose export payload was invalid",
+            )
+        return {"job": finder_modal_pose_export_job()}
+
+    async def fake_finder_modal_downloads(**kwargs: object) -> dict:
+        jobs = (
+            [finder_modal_pose_export_job()]
+            if finder_modal_review_state["pose_export_calls"]
+            else []
+        )
+        return {"downloads": jobs}
+
+    async def fake_finder_modal_pose_exports(**kwargs: object) -> dict:
+        jobs = (
+            [finder_modal_pose_export_job()]
+            if finder_modal_review_state["pose_export_calls"]
+            else []
+        )
+        return {"items": jobs}
 
     async def fake_events(request=None) -> Response:
         return Response(status_code=204)
@@ -1432,6 +1498,7 @@ window.addEventListener('load', () => {
   let phase = 'open-first';
   let refreshAt = 0;
   let prefetchRequestPending = false;
+  let poseExportStatePending = false;
   let previewBaseline = {};
   let prefetchDiagnostics = '';
   const optionAt = index =>
@@ -1486,6 +1553,8 @@ window.addEventListener('load', () => {
       document.querySelector('#finder-scan-select')?.disabled,
       document.querySelector('#finder-result-grid')?.getAttribute('aria-busy'),
       document.querySelector('#finder-result-threshold')?.value,
+      document.querySelector('#pose-export')?.disabled,
+      document.querySelector('#pose-export')?.textContent?.trim(),
       prefetchDiagnostics,
     ].join('|');
 
@@ -1748,23 +1817,6 @@ window.addEventListener('load', () => {
       document.querySelectorAll(
         '#image-grid .image-option input:checked'
       ).forEach(input => input.click());
-      const control = optionInput(0);
-      if (control && !control.checked) control.click();
-      const setControl = document.querySelector(
-        '[data-pose-assignment="couple"]'
-      );
-      if (setControl && !setControl.disabled) {
-        setControl.click();
-        setPhase('set-target');
-      }
-      return;
-    }
-
-    if (
-      phase === 'set-target'
-      && optionAt(0)?.classList.contains('has-pose-control')
-      && !poseStatus.includes('Loading')
-    ) {
       const target = optionInput(9);
       if (target && !target.checked) target.click();
       const applyTarget = document.querySelector(
@@ -1772,6 +1824,31 @@ window.addEventListener('load', () => {
       );
       if (target?.checked && applyTarget && !applyTarget.disabled) {
         applyTarget.click();
+        setPhase('target-before-control');
+      }
+      return;
+    }
+
+    if (
+      phase === 'target-before-control'
+      && optionAt(9)?.classList.contains('has-pose-target')
+      && poseStatus.includes('Draft saved')
+    ) {
+      const exportButton = document.querySelector('#pose-export');
+      if (!exportButton?.disabled) {
+        setPhase('target-without-control-export-enabled');
+        return;
+      }
+      document.querySelectorAll(
+        '#image-grid .image-option input:checked'
+      ).forEach(input => input.click());
+      const control = optionInput(0);
+      if (control && !control.checked) control.click();
+      const setControl = document.querySelector(
+        '[data-pose-assignment="couple"]'
+      );
+      if (control?.checked && setControl && !setControl.disabled) {
+        setControl.click();
         setPhase('draft-saved');
       }
       return;
@@ -1784,10 +1861,49 @@ window.addEventListener('load', () => {
       && poseStatus.includes('Draft saved')
       && feedbackCount === '1'
     ) {
+      const exportButton = document.querySelector('#pose-export');
+      if (
+        exportButton
+        && !exportButton.disabled
+        && exportButton.textContent.includes('Download & organize')
+      ) {
+        exportButton.click();
+        setPhase('pose-export-queued');
+      }
+      return;
+    }
+
+    if (
+      phase === 'pose-export-queued'
+      && modal.open
+      && title === 'After-hours city gallery'
+      && position === '1 of 3'
+      && !poseExportStatePending
+    ) {
+      const exportButton = document.querySelector('#pose-export');
       const next = document.querySelector('#gallery-review-next');
-      if (next && !next.disabled) {
-        next.click();
-        setPhase('maybe-second');
+      if (
+        exportButton?.disabled
+        && exportButton.textContent.includes('Queued')
+        && next
+        && !next.disabled
+      ) {
+        poseExportStatePending = true;
+        fetch('/manual/finder-modal-review/state')
+          .then(response => response.json())
+          .then(data => {
+            poseExportStatePending = false;
+            if (data.pose_export_calls !== 1) {
+              setPhase('pose-export-count-invalid');
+              return;
+            }
+            next.click();
+            setPhase('maybe-second');
+          })
+          .catch(() => {
+            poseExportStatePending = false;
+            setPhase('pose-export-state-failed');
+          });
       }
       return;
     }
@@ -1881,8 +1997,46 @@ window.addEventListener('load', () => {
       && feedbackCount === '1'
       && counts === '1/1/1'
     ) {
-      document.querySelector('#select-none')?.click();
-      setPhase('prepare-busy-enter');
+      const exportButton = document.querySelector('#pose-export');
+      if (
+        exportButton?.disabled
+        && exportButton.textContent.includes('Queued')
+      ) {
+        exportButton.click();
+        setPhase('verify-pose-export-idempotent');
+      }
+      return;
+    }
+
+    if (
+      phase === 'verify-pose-export-idempotent'
+      && modal.open
+      && !poseExportStatePending
+    ) {
+      const exportButton = document.querySelector('#pose-export');
+      if (
+        !exportButton?.disabled
+        || !exportButton.textContent.includes('Queued')
+      ) {
+        setPhase('returned-pose-export-enabled');
+        return;
+      }
+      poseExportStatePending = true;
+      fetch('/manual/finder-modal-review/state')
+        .then(response => response.json())
+        .then(data => {
+          poseExportStatePending = false;
+          if (data.pose_export_calls !== 1) {
+            setPhase('pose-export-duplicated');
+            return;
+          }
+          document.querySelector('#select-none')?.click();
+          setPhase('prepare-busy-enter');
+        })
+        .catch(() => {
+          poseExportStatePending = false;
+          setPhase('pose-export-state-failed');
+        });
       return;
     }
 
@@ -2133,6 +2287,27 @@ window.addEventListener('load', () => {
         elif getattr(route, "path", None) == "/api/events":
             route.endpoint = fake_events
             route.dependant.call = fake_events
+        elif (
+            finder_modal_review
+            and getattr(route, "path", None) == "/api/pose-exports"
+            and "POST" in getattr(route, "methods", set())
+        ):
+            route.endpoint = fake_finder_modal_pose_export
+            route.dependant.call = fake_finder_modal_pose_export
+        elif (
+            finder_modal_review
+            and getattr(route, "path", None) == "/api/pose-exports"
+            and "GET" in getattr(route, "methods", set())
+        ):
+            route.endpoint = fake_finder_modal_pose_exports
+            route.dependant.call = fake_finder_modal_pose_exports
+        elif (
+            finder_modal_review
+            and getattr(route, "path", None) == "/api/downloads"
+            and "GET" in getattr(route, "methods", set())
+        ):
+            route.endpoint = fake_finder_modal_downloads
+            route.dependant.call = fake_finder_modal_downloads
         elif open_finder and getattr(route, "path", None) == "/api/finder/status":
             route.endpoint = fake_finder_status
             route.dependant.call = fake_finder_status

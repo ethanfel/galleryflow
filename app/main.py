@@ -238,10 +238,6 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
                 raise ValueError("An image cannot be both a control and a target")
             if canonical in used_targets:
                 raise ValueError("A target image can have only one pose")
-            if not controls[requested.role]:
-                raise ValueError(
-                    f"The {requested.role} control must be selected before using that role"
-                )
             if not database.get_pose_tag(requested.pose_tag_id):
                 raise ValueError("A selected pose tag no longer exists")
             ordinal = int(available[canonical]["ordinal"])

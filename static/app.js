@@ -61,6 +61,8 @@
     poseMutation: 0,
     poseApplying: false,
     poseApplyRequest: 0,
+    poseExporting: false,
+    poseExportRequest: 0,
     poseAssignment: 'target',
     galleryContext: null,
     lightboxIndex: -1,
@@ -327,6 +329,7 @@
     let progress = Number(item.progress ?? (total ? (complete / total) * 100 : status === 'completed' ? 100 : 0));
     if (progress > 0 && progress <= 1 && item.progress !== undefined) progress *= 100;
     progress = Math.max(0, Math.min(100, progress));
+    const poseRevision = item.pose_revision ?? item.poseRevision ?? null;
     return {
       ...item,
       id: item.id ?? item.job_id,
@@ -343,6 +346,7 @@
       speed: Number(item.speed ?? item.bytes_per_second ?? 0),
       kind: item.kind === 'pose_export' ? 'pose_export' : 'download',
       pairCount: Number(item.pair_count ?? 0),
+      poseRevision: poseRevision === null ? null : Number(poseRevision),
       error: item.error || item.message || '',
       createdAt: item.created_at || item.started_at || item.date_added || ''
     };
@@ -1093,6 +1097,7 @@
     const available = Boolean(result && queue && String(queue.scanId) === String(state.finderScan?.id || ''));
     const workspaceLocked = Boolean(
       state.poseApplying
+      || state.poseExporting
       || (available && (state.galleryReviewBusy || queue.loading || state.finderFeedbackGallerySaving))
     );
     const modalBody = $('.gallery-modal-body');
@@ -1114,6 +1119,7 @@
       || state.finderFeedbackBusy
       || state.finderFeedbackGallerySaving
       || state.poseApplying
+      || state.poseExporting
       || Boolean(result.feedbackSaving);
     $('#gallery-review-position').textContent = `${formatNumber(position)} of ${formatNumber(total)}`;
     $('#gallery-review-queue').textContent = `${finderReviewLabel(queue.review)} queue · use ← →`;
@@ -1588,6 +1594,9 @@
     const detailRequest = ++state.galleryDetailRequest;
     state.poseApplyRequest += 1;
     state.poseApplying = false;
+    state.poseExportRequest += 1;
+    state.poseExporting = false;
+    setButtonBusy($('#pose-export'), false);
     window.clearTimeout(state.poseSaveTimer);
     state.poseSaving = false;
     state.poseSavePromise = null;
@@ -1756,6 +1765,75 @@
     return `${gallery.id}\n${profile}`;
   }
 
+  function poseExportMatchesGallery(job, gallery = state.gallery) {
+    if (!gallery || job?.kind !== 'pose_export') return false;
+    if (
+      job.galleryId !== undefined
+      && job.galleryId !== null
+      && gallery.id !== undefined
+      && gallery.id !== null
+      && String(job.galleryId) === String(gallery.id)
+    ) return true;
+    return Boolean(
+      job.galleryUrl
+      && gallery.url
+      && normalizeHistoryUrl(job.galleryUrl) === normalizeHistoryUrl(gallery.url)
+    );
+  }
+
+  function poseExportForDraft(
+    gallery = state.gallery,
+    profile = $('#modal-profile-select')?.value || state.activeProfile,
+    revision = state.poseDraft.revision
+  ) {
+    const galleryJobs = state.jobs.filter(job => poseExportMatchesGallery(job, gallery));
+    const active = galleryJobs.find(job => !isTerminalJob(job));
+    if (active) {
+      const exact = active.profile === profile
+        && active.poseRevision !== null
+        && Number(active.poseRevision) === Number(revision);
+      return { state: exact ? 'queued' : 'active', job: active };
+    }
+    const completed = galleryJobs.find(job => (
+      job.status === 'completed'
+      && job.profile === profile
+      && job.poseRevision !== null
+      && Number(job.poseRevision) === Number(revision)
+    ));
+    return completed ? { state: 'exported', job: completed } : null;
+  }
+
+  function jobProgressRank(job) {
+    if (isTerminalJob(job)) return 5;
+    return {
+      queued: 0,
+      starting: 1,
+      downloading: 2,
+      running: 2,
+      active: 2,
+      canceling: 3
+    }[job?.status] ?? 0;
+  }
+
+  function upsertJob(item) {
+    if (!item) return null;
+    const incoming = normalizeJob(item);
+    if (incoming.id === undefined || incoming.id === null) return null;
+    const existing = state.jobs.find(job => String(job.id) === String(incoming.id));
+    const job = existing && jobProgressRank(existing) > jobProgressRank(incoming)
+      ? { ...incoming, ...existing, poseRevision: existing.poseRevision ?? incoming.poseRevision }
+      : incoming;
+    state.jobs = [job, ...state.jobs.filter(candidate => String(candidate.id) !== String(job.id))];
+    return job;
+  }
+
+  function renderOpenPoseExportState() {
+    if ($('#gallery-modal').open && state.galleryMode === 'pose') {
+      renderPosePreflight();
+      renderFinderGalleryReview();
+    }
+  }
+
   function poseTargetFor(url) {
     return state.poseDraft.targets.find(target => target.imageUrl === url) || null;
   }
@@ -1823,14 +1901,35 @@
 
   function renderPosePreflight() {
     const result = posePreflight();
+    const button = $('#pose-export');
+    const priorExport = poseExportForDraft();
+    const blocksExport = ['queued', 'active'].includes(priorExport?.state)
+      || (priorExport?.state === 'exported' && !state.poseDirty);
+    let detail = `Ready to build ${formatNumber(result.targets)} paired image${result.targets === 1 ? '' : 's'}.`;
+    if (result.issues.length) detail = result.issues.join(' · ');
+    else if (priorExport?.state === 'queued') detail = 'This saved draft already has a pose dataset queued.';
+    else if (priorExport?.state === 'active') detail = 'Another pose export for this gallery is still active.';
+    else if (priorExport?.state === 'exported' && !state.poseDirty) detail = 'This saved draft has already been exported.';
     $('#pose-target-count').textContent = formatNumber(result.targets);
     $('#pose-control-count').textContent = formatNumber(result.controls);
     $('#pose-issue-count').textContent = formatNumber(result.issues.length);
     $('#pose-issue-count').classList.toggle('has-issues', Boolean(result.issues.length));
-    $('#pose-preflight-detail').textContent = result.issues.length
-      ? result.issues.join(' · ')
-      : `Ready to build ${formatNumber(result.targets)} paired image${result.targets === 1 ? '' : 's'}.`;
-    $('#pose-export').disabled = state.poseLoading || state.poseSaving || state.poseApplying || Boolean(result.issues.length);
+    $('#pose-preflight-detail').textContent = detail;
+    if (!button.dataset.originalHtml) {
+      const label = $('span', button);
+      if (label) {
+        if (priorExport?.state === 'queued') label.textContent = 'Queued';
+        else if (priorExport?.state === 'active') label.textContent = 'Export active';
+        else if (priorExport?.state === 'exported' && !state.poseDirty) label.textContent = 'Exported';
+        else label.textContent = 'Download & organize';
+      }
+    }
+    button.disabled = state.poseLoading
+      || state.poseSaving
+      || state.poseApplying
+      || state.poseExporting
+      || blocksExport
+      || Boolean(result.issues.length);
   }
 
   function renderPoseSaveStatus(message = '') {
@@ -1851,20 +1950,16 @@
       const active = button.dataset.poseAssignment === state.poseAssignment;
       button.classList.toggle('is-active', active);
       button.setAttribute('aria-pressed', String(active));
-      button.disabled = state.poseLoading || state.poseApplying;
+      button.disabled = state.poseLoading || state.poseApplying || state.poseExporting;
     });
     $('#pose-target-fields').hidden = !isTarget;
     $('#pose-control-hint').hidden = isTarget;
     const apply = $('#pose-apply-checked');
     const label = $('span', apply);
-    const targetRole = $('#pose-control-role').value;
-    const missingControl = isTarget && !state.poseDraft.controls[targetRole];
-    label.textContent = missingControl
-      ? `Set ${poseRoleLabel(targetRole).toLowerCase()} control first`
-      : checked ? `Apply to ${formatNumber(checked)} checked` : 'Apply to checked';
+    label.textContent = checked ? `Apply to ${formatNumber(checked)} checked` : 'Apply to checked';
     const missingTag = isTarget && !$('#pose-tag-input').value.trim();
-    apply.disabled = state.poseLoading || state.poseApplying || !checked || missingTag || missingControl || (!isTarget && checked !== 1);
-    $('#pose-clear-checked').disabled = state.poseApplying || !checked || ![...state.poseSelectedImages].some(url => poseAssignmentFor(url));
+    apply.disabled = state.poseLoading || state.poseApplying || state.poseExporting || !checked || missingTag || (!isTarget && checked !== 1);
+    $('#pose-clear-checked').disabled = state.poseApplying || state.poseExporting || !checked || ![...state.poseSelectedImages].some(url => poseAssignmentFor(url));
     renderPoseSaveStatus();
     renderPosePreflight();
   }
@@ -1887,18 +1982,17 @@
       const active = assignment?.type === 'control' && assignment.role === button.dataset.lightboxControl;
       button.classList.toggle('is-active', active);
       button.setAttribute('aria-pressed', String(active));
-      button.disabled = state.poseApplying;
+      button.disabled = state.poseApplying || state.poseExporting;
     });
     $('#lightbox-pose-tag-input').value = assignment?.type === 'target' ? assignment.poseLabel : '';
     $('#lightbox-pose-control-role').value = assignment?.type === 'target' ? assignment.role : 'solo';
     updateLightboxTargetAvailability();
-    $('#lightbox-clear-pose').disabled = state.poseApplying || !assignment;
+    $('#lightbox-clear-pose').disabled = state.poseApplying || state.poseExporting || !assignment;
   }
 
   function updateLightboxTargetAvailability() {
-    const targetRole = $('#lightbox-pose-control-role').value;
-    $('#lightbox-set-target').disabled = state.poseApplying || !state.poseDraft.controls[targetRole];
-    $('#lightbox-set-target').title = state.poseDraft.controls[targetRole] ? 'Set this image as a pose target' : `Set a ${targetRole} control first`;
+    $('#lightbox-set-target').disabled = state.poseApplying || state.poseExporting;
+    $('#lightbox-set-target').title = 'Set this image as a pose target';
   }
 
   function renderPoseWorkspace() {
@@ -2041,11 +2135,6 @@
       $('#pose-tag-input').focus();
       return;
     }
-    const role = $('#pose-control-role').value;
-    if (!state.poseDraft.controls[role]) {
-      toast(`Set a ${poseRoleLabel(role).toLowerCase()} control first`, `Check one control image and use Set ${poseRoleLabel(role).toLowerCase()} control, then re-check or keep the target candidates highlighted.`, 'info', 7000);
-      return;
-    }
     await applyPoseAssignment(state.poseSelectedImages, 'target', { button, clearChecked: true });
   }
 
@@ -2162,19 +2251,12 @@
 
   async function applyPoseAssignment(urls, assignment, { button = null, clearChecked = false } = {}) {
     const selected = [...urls];
-    if (!selected.length || state.poseLoading || state.poseApplying || state.galleryReviewBusy) return false;
+    if (!selected.length || state.poseLoading || state.poseApplying || state.poseExporting || state.galleryReviewBusy) return false;
     if (assignment !== 'target' && selected.length !== 1) {
       toast('Choose one control image', 'Each Solo, Couple, or Group slot uses exactly one control.', 'info');
       return false;
     }
     if (assignment === 'target') {
-      const dockAction = button?.closest('#lightbox-pose-dock');
-      const roleSelect = dockAction ? $('#lightbox-pose-control-role') : $('#pose-control-role');
-      const role = POSE_ROLES.includes(roleSelect.value) ? roleSelect.value : 'solo';
-      if (!state.poseDraft.controls[role]) {
-        toast(`Set a ${poseRoleLabel(role).toLowerCase()} control first`, 'Every target needs its matching control before the draft can be saved.', 'info');
-        return false;
-      }
       const occupiedControl = selected.map(poseControlFor).find(Boolean);
       if (occupiedControl) {
         toast('This image is a control', `Replace the ${poseRoleLabel(occupiedControl).toLowerCase()} control before tagging it as a target.`, 'info');
@@ -2629,28 +2711,84 @@
   async function exportPoseDataset() {
     const gallery = state.gallery;
     const profile = $('#modal-profile-select').value || state.activeProfile;
-    if (!gallery || !profile) return;
+    const currentExport = poseExportForDraft(gallery, profile);
+    if (
+      !gallery
+      || !profile
+      || state.poseExporting
+      || ['queued', 'active'].includes(currentExport?.state)
+      || (currentExport?.state === 'exported' && !state.poseDirty)
+    ) return;
     const button = $('#pose-export');
+    const poseKey = currentPoseKey(gallery, profile);
+    const exportRequest = ++state.poseExportRequest;
+    let expectedRevision = null;
+    const stillCurrent = () => (
+      exportRequest === state.poseExportRequest
+      && $('#gallery-modal').open
+      && poseKey === currentPoseKey()
+    );
+    state.poseExporting = true;
+    renderPoseWorkspace();
+    renderFinderGalleryReview();
     setButtonBusy(button, true, 'Preparing…');
     try {
       await flushPoseDraft();
+      if (!stillCurrent()) return;
       if (state.poseDirty) throw new ApiError('The pose draft could not be saved. Try again before exporting.');
       const preflight = posePreflight();
       if (preflight.issues.length) throw new ApiError(preflight.issues.join(' · '));
+      expectedRevision = Number(state.poseDraft.revision);
+      const priorExport = poseExportForDraft(gallery, profile, expectedRevision);
+      if (priorExport) return;
       const data = await api('/api/pose-exports', {
         method: 'POST',
-        body: { gallery_id: gallery.id, profile, expected_revision: state.poseDraft.revision }
+        body: { gallery_id: gallery.id, profile, expected_revision: expectedRevision }
       });
       const pairs = Number(data?.job?.pair_count ?? preflight.targets);
-      closeModal($('#lightbox-modal'));
-      $('#gallery-modal').close();
-      toast('Pose dataset queued', `${formatNumber(pairs)} pair${pairs === 1 ? '' : 's'} will download and organize in “${profile}”.`, 'success');
+      const queuedJob = upsertJob(data?.job);
+      if (queuedJob) {
+        renderJobs();
+        renderGalleries();
+      }
+      if (stillCurrent()) {
+        state.poseExporting = false;
+        setButtonBusy(button, false);
+        renderPoseWorkspace();
+        renderFinderGalleryReview();
+      }
+      toast('Pose dataset queued', `${formatNumber(pairs)} pair${pairs === 1 ? '' : 's'} will download and organize in “${profile}”. Use Next when you are ready for another gallery.`, 'success');
       await loadJobs({ quiet: true });
     } catch (error) {
-      toast('Could not export pose dataset', errorMessage(error), 'error');
+      const activeJob = error instanceof ApiError && error.status === 409
+        ? upsertJob(error.data?.job)
+        : null;
+      if (activeJob) {
+        renderJobs();
+        renderGalleries();
+        const exact = poseExportMatchesGallery(activeJob, gallery)
+          && activeJob.profile === profile
+          && expectedRevision !== null
+          && activeJob.poseRevision !== null
+          && Number(activeJob.poseRevision) === expectedRevision;
+        toast(
+          exact ? 'Pose dataset already queued' : 'Another pose export is active',
+          exact
+            ? 'The existing queued job was restored in this review window.'
+            : 'Finish or cancel the active export for this gallery before queuing this draft.',
+          'info'
+        );
+        await loadJobs({ quiet: true });
+      } else {
+        toast('Could not export pose dataset', errorMessage(error), 'error');
+      }
     } finally {
-      setButtonBusy(button, false);
-      renderPoseWorkspace();
+      if (exportRequest === state.poseExportRequest) {
+        state.poseExporting = false;
+        setButtonBusy(button, false);
+        renderPoseWorkspace();
+        renderFinderGalleryReview();
+      }
     }
   }
 
@@ -2685,6 +2823,7 @@
       });
       renderJobs();
       renderGalleries();
+      renderOpenPoseExportState();
       scheduleJobPoll();
     } catch (error) {
       if (!quiet) toast('Could not load queue', errorMessage(error), 'error');
@@ -2765,6 +2904,7 @@
       await api(`/api/downloads/${encodeURIComponent(job.id)}`, { method: 'DELETE' });
       state.jobs = state.jobs.filter(item => String(item.id) !== String(job.id));
       renderJobs();
+      renderOpenPoseExportState();
       const title = isTerminalJob(job) ? 'Transfer removed' : job.kind === 'pose_export' ? 'Pose export cancelled' : 'Download cancelled';
       toast(title, job.title, 'info');
     } catch (error) {
@@ -2785,6 +2925,7 @@
     const removedIds = new Set(jobs.filter((_, index) => results[index].status === 'fulfilled').map(job => String(job.id)));
     state.jobs = state.jobs.filter(job => !removedIds.has(String(job.id)));
     renderJobs();
+    renderOpenPoseExportState();
     setButtonBusy(button, false);
     const failures = results.filter(result => result.status === 'rejected').length;
     if (failures) toast('Some transfers could not be cleared', `${failures} entries remain.`, 'error');
@@ -6490,6 +6631,7 @@
       || queue.loading
       || state.finderFeedbackGallerySaving
       || state.poseApplying
+      || state.poseExporting
     ) return false;
     const discardFeedback = state.finderFeedbackGalleryDirty;
     if (discardFeedback && !window.confirm('Discard the unsaved Finder feedback selection and move to another gallery?')) return false;
@@ -6536,7 +6678,7 @@
         return false;
       }
       if (!stillCurrent()) return false;
-      if (state.poseApplying || state.finderFeedbackGallerySaving) return false;
+      if (state.poseApplying || state.poseExporting || state.finderFeedbackGallerySaving) return false;
       if (discardFeedback) restoreFinderFeedbackGallerySelection();
       queue.index = targetIndex;
       await openFinderResult(target, { reviewQueue: queue, mode: requestedMode });
@@ -7474,6 +7616,7 @@
       state.galleryDetailRequest += 1;
       state.galleryNavigationRequest += 1;
       state.poseApplyRequest += 1;
+      state.poseExportRequest += 1;
       cancelAdjacentGalleryPrefetches({ includeForeground: true });
       state.loadingDetail = false;
       closeModal($('#lightbox-modal'));
@@ -7484,6 +7627,8 @@
       state.finderFeedbackGallerySaving = false;
       state.galleryReviewBusy = false;
       state.poseApplying = false;
+      state.poseExporting = false;
+      setButtonBusy($('#pose-export'), false);
       renderFinderGalleryReview();
     });
     $('#gallery-modal').addEventListener('cancel', event => {
