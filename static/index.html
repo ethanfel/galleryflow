@@ -302,6 +302,22 @@
                 <span id="finder-corpus-partial-wrap"><i></i><b id="finder-corpus-partial">0</b> historic top-three only</span>
               </div>
               <p id="finder-corpus-copy"><strong>Saved in /data.</strong> Every new scan searches all indexed galleries first—not only the selected source—then explores that Source URL for more.</p>
+              <section class="finder-corpus-joytag" id="finder-corpus-joytag" aria-labelledby="finder-corpus-joytag-title" hidden>
+                <header>
+                  <span><small>JoyTag local coverage</small><strong id="finder-corpus-joytag-title"><b id="finder-corpus-joytag-cached">—</b> / <b id="finder-corpus-joytag-total">—</b> images cached</strong></span>
+                  <i id="finder-corpus-joytag-state" role="status" aria-live="polite">Checking</i>
+                </header>
+                <div class="finder-corpus-index-progress" id="finder-corpus-index-progress" role="progressbar" aria-label="JoyTag local corpus indexing progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                  <i id="finder-corpus-index-progress-bar"></i>
+                </div>
+                <p id="finder-corpus-index-progress-copy">Checking cached image coverage…</p>
+                <p class="finder-corpus-index-policy"><strong>Ordinary Tag searches do not index.</strong> They compare cached local images only, skip uncached images, then go straight to the Source URL.</p>
+                <div class="finder-corpus-index-actions">
+                  <button class="button button-quiet" id="finder-corpus-index-start" type="button"><svg><use href="#i-spark"></use></svg><span>Index local corpus</span></button>
+                  <button class="button button-danger" id="finder-corpus-index-cancel" type="button" hidden><svg><use href="#i-close"></use></svg><span>Cancel</span></button>
+                </div>
+                <p class="finder-corpus-index-error" id="finder-corpus-index-error" role="alert" hidden></p>
+              </section>
             </section>
 
             <button class="button button-primary finder-start" id="finder-start" type="button" disabled><svg><use href="#i-play"></use></svg><span>Start scan</span></button>

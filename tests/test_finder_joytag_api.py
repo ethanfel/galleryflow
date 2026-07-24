@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from app.config import AppConfig
+from app.finder import FinderConflict
 from app.main import create_app
 
 
@@ -143,3 +144,85 @@ async def test_reference_analysis_and_joytag_scan_api_contract(
             },
         )
         assert too_many.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_joytag_corpus_index_api_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig(
+        data_dir=tmp_path / "data",
+        download_root=tmp_path / "downloads",
+        sqlite_vfs=None,
+    )
+    app = create_app(config)
+    actions: list[str] = []
+
+    def response(status: str) -> dict[str, object]:
+        return {
+            "job": {
+                "id": "joytag-index-1",
+                "status": status,
+                "model_key": "joytag-v1",
+                "dimensions": 5813,
+            },
+            "coverage": {
+                "model_key": "joytag-v1",
+                "dimensions": 5813,
+                "total_images": 100,
+                "cached_images": 25,
+                "missing_images": 75,
+                "percent": 25.0,
+                "cache_entries": 25,
+                "cache_bytes": 145_325,
+            },
+        }
+
+    def fake_status() -> dict[str, object]:
+        actions.append("status")
+        return response("running")
+
+    def fake_start() -> dict[str, object]:
+        actions.append("start")
+        return response("queued")
+
+    def fake_cancel() -> dict[str, object]:
+        actions.append("cancel")
+        return response("canceling")
+
+    monkeypatch.setattr(app.state.finder, "joytag_index_status", fake_status)
+    monkeypatch.setattr(app.state.finder, "create_joytag_index_job", fake_start)
+    monkeypatch.setattr(app.state.finder, "cancel_joytag_index_job", fake_cancel)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+    ) as client:
+        status = await client.get("/api/finder/corpus/joytag-index")
+        started = await client.post("/api/finder/corpus/joytag-index")
+        canceled = await client.delete("/api/finder/corpus/joytag-index")
+
+    assert status.status_code == 200
+    assert status.json()["job"]["status"] == "running"
+    assert started.status_code == 202
+    assert started.json()["job"]["status"] == "queued"
+    assert canceled.status_code == 200
+    assert canceled.json()["job"]["status"] == "canceling"
+    assert actions == ["status", "start", "cancel"]
+
+    def no_active_job() -> dict[str, object]:
+        raise FinderConflict("No JoyTag corpus indexing job is active")
+
+    monkeypatch.setattr(
+        app.state.finder,
+        "cancel_joytag_index_job",
+        no_active_job,
+    )
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+    ) as client:
+        conflict = await client.delete("/api/finder/corpus/joytag-index")
+    assert conflict.status_code == 409

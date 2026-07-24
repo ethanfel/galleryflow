@@ -12,7 +12,7 @@ import app.finder as finder_module
 from app.config import AppConfig
 from app.db import Database
 from app.downloader import EventBroker
-from app.finder import FinderService
+from app.finder import FinderConflict, FinderService
 
 
 ROOT = "https://www.pornpics.com/"
@@ -230,6 +230,43 @@ def configured(tmp_path: Path) -> tuple[AppConfig, Database, int]:
     return config, database, int(pose_tag["id"])
 
 
+def seed_corpus_gallery(
+    database: Database,
+    gallery_url: str,
+    previews: list[str],
+    *,
+    title: str = "Corpus gallery",
+) -> None:
+    now = "2026-01-01T00:00:00+00:00"
+    key = finder_module.gallery_key(gallery_url)
+    with database.connect() as db:
+        db.execute(
+            """INSERT INTO finder_corpus_galleries(
+                   gallery_key, gallery_url, title, thumbnail_remote_url,
+                   state, image_count, created_at, updated_at
+               ) VALUES (?, ?, ?, '', 'complete', ?, ?, ?)""",
+            (key, gallery_url, title, len(previews), now, now),
+        )
+        db.executemany(
+            """INSERT INTO finder_corpus_images(
+                   gallery_key, source_key, image_url, preview_remote_url,
+                   ordinal, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    key,
+                    FinderService._remote_source_key(preview),
+                    preview.replace("/preview/", "/full/"),
+                    preview,
+                    ordinal,
+                    now,
+                    now,
+                )
+                for ordinal, preview in enumerate(previews, 1)
+            ],
+        )
+
+
 @pytest.mark.asyncio
 async def test_joytag_mode_analyzes_one_reference_filters_before_top_three_and_reuses(
     tmp_path: Path,
@@ -317,7 +354,7 @@ async def test_joytag_mode_analyzes_one_reference_filters_before_top_three_and_r
 
 
 @pytest.mark.asyncio
-async def test_joytag_local_corpus_backfills_once_and_reuses_vector_for_new_tag(
+async def test_joytag_local_corpus_is_cache_only_and_explicit_index_reuses_vectors(
     tmp_path: Path,
 ) -> None:
     config, database, pose_tag_id = configured(tmp_path)
@@ -378,6 +415,49 @@ async def test_joytag_local_corpus_backfills_once_and_reuses_vector_for_new_tag(
                     ),
                 )
         analysis = await service.analyze_reference_directory("one-reference")
+        calls_after_analysis = list(joytag.batch_calls)
+        uncached = service.create_scan(
+            example_directory="one-reference",
+            pose_tag_id=pose_tag_id,
+            source_url=ROOT,
+            page_limit=1,
+            minimum_score=0.7,
+            mode="joytag",
+            joytag_tag="target_tag",
+            reference_fingerprint=analysis["fingerprint"],
+        )
+        await asyncio.wait_for(service.queue.join(), 10)
+        assert service.get_scan(uncached["id"])["status"] == "completed"
+        assert service.results(
+            uncached["id"],
+            review="pending",
+            min_score=None,
+            limit=20,
+            offset=0,
+        )[1] == 0
+        assert fetched == []
+        assert joytag.batch_calls == calls_after_analysis
+
+        started = service.create_joytag_index_job()
+        duplicate = service.create_joytag_index_job()
+        assert duplicate["job"]["id"] == started["job"]["id"]
+        await asyncio.wait_for(service.joytag_index_queue.join(), 10)
+        indexed = service.joytag_index_status()
+        assert indexed["job"]["status"] == "completed"
+        assert indexed["job"]["total_images"] == 2
+        assert indexed["job"]["processed_images"] == 2
+        assert indexed["job"]["indexed_images"] == 2
+        assert indexed["job"]["failed_images"] == 0
+        assert indexed["coverage"]["cached_images"] == 2
+        assert indexed["coverage"]["missing_images"] == 0
+        assert sorted(url.rsplit("/", 1)[-1] for url in fetched) == [
+            "blue.png",
+            "green.png",
+        ]
+        assert joytag.batch_calls[len(calls_after_analysis) :] == [2]
+
+        calls_after_index = list(joytag.batch_calls)
+        fetched_after_index = list(fetched)
         first = service.create_scan(
             example_directory="one-reference",
             pose_tag_id=pose_tag_id,
@@ -397,13 +477,7 @@ async def test_joytag_local_corpus_backfills_once_and_reuses_vector_for_new_tag(
             offset=0,
         )[0]
         assert [item["gallery_url"] for item in first_results] == [GALLERY]
-        assert sorted(url.rsplit("/", 1)[-1] for url in fetched) == [
-            "blue.png",
-            "green.png",
-        ]
 
-        calls_after_backfill = list(joytag.batch_calls)
-        fetched_after_backfill = list(fetched)
         second = service.create_scan(
             example_directory="one-reference",
             pose_tag_id=pose_tag_id,
@@ -423,10 +497,276 @@ async def test_joytag_local_corpus_backfills_once_and_reuses_vector_for_new_tag(
             offset=0,
         )[0]
         assert [item["gallery_url"] for item in second_results] == [OTHER_GALLERY]
-        assert fetched == fetched_after_backfill
-        assert joytag.batch_calls == calls_after_backfill
+        assert fetched == fetched_after_index
+        assert joytag.batch_calls == calls_after_index
     finally:
         await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_joytag_corpus_index_deduplicates_shared_source_keys(
+    tmp_path: Path,
+) -> None:
+    config, database, _ = configured(tmp_path)
+    fetched: list[str] = []
+
+    async def counting_media(url: str, referer: str) -> bytes:
+        fetched.append(url)
+        return await fake_media(url, referer)
+
+    joytag = FakeJoyTag()
+    service = FinderService(
+        config,
+        database,
+        EmptyScraper(),
+        EventBroker(),
+        encoder=FakeEncoder(),
+        joytagger=joytag,
+        media_fetcher=counting_media,
+    )
+    await service.start()
+    try:
+        shared = "https://cdni.pornpics.com/preview/blue.png"
+        seed_corpus_gallery(database, GALLERY, [shared], title="First association")
+        seed_corpus_gallery(
+            database,
+            OTHER_GALLERY,
+            [shared],
+            title="Second association",
+        )
+
+        before = service.joytag_index_status()["coverage"]
+        assert before["total_images"] == 1
+        assert before["cached_images"] == 0
+        assert before["missing_images"] == 1
+
+        service.create_joytag_index_job()
+        await asyncio.wait_for(service.joytag_index_queue.join(), 10)
+        final = service.joytag_index_status()
+        assert final["job"]["status"] == "completed"
+        assert final["job"]["total_images"] == 1
+        assert final["job"]["processed_images"] == 1
+        assert final["job"]["indexed_images"] == 1
+        assert final["coverage"]["total_images"] == 1
+        assert final["coverage"]["cached_images"] == 1
+        assert final["coverage"]["missing_images"] == 0
+        assert fetched == [shared]
+        assert joytag.batch_calls == [1]
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_joytag_corpus_index_cancellation_is_persistent(
+    tmp_path: Path,
+) -> None:
+    config, database, _ = configured(tmp_path)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocking_media(url: str, referer: str) -> bytes:
+        started.set()
+        await release.wait()
+        return await fake_media(url, referer)
+
+    service = FinderService(
+        config,
+        database,
+        EmptyScraper(),
+        EventBroker(),
+        encoder=FakeEncoder(),
+        joytagger=FakeJoyTag(),
+        media_fetcher=blocking_media,
+    )
+    await service.start()
+    try:
+        seed_corpus_gallery(
+            database,
+            GALLERY,
+            [
+                "https://cdni.pornpics.com/preview/blue.png",
+                "https://cdni.pornpics.com/preview/green.png",
+            ],
+        )
+        created = service.create_joytag_index_job()
+        await asyncio.wait_for(started.wait(), 5)
+        canceling = service.cancel_joytag_index_job()
+        assert canceling["job"]["id"] == created["job"]["id"]
+        assert canceling["job"]["status"] == "canceling"
+        release.set()
+        await asyncio.wait_for(service.joytag_index_queue.join(), 10)
+        final = service.joytag_index_status()["job"]
+        assert final["status"] == "canceled"
+        assert final["cancel_requested"] is True
+        assert final["finished_at"]
+        with pytest.raises(FinderConflict, match="No JoyTag"):
+            service.cancel_joytag_index_job()
+    finally:
+        release.set()
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_joytag_corpus_index_cancel_wins_terminal_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, database, _ = configured(tmp_path)
+    service = FinderService(
+        config,
+        database,
+        EmptyScraper(),
+        EventBroker(),
+        encoder=FakeEncoder(),
+        joytagger=FakeJoyTag(),
+        media_fetcher=fake_media,
+    )
+    await service.start()
+    try:
+        seed_corpus_gallery(
+            database,
+            GALLERY,
+            ["https://cdni.pornpics.com/preview/blue.png"],
+        )
+        original_finalize = service._finalize_joytag_index_job
+        canceled = False
+
+        def cancel_before_finalize(job_id: str, **values: object):
+            nonlocal canceled
+            if not canceled and values.get("status") == "completed":
+                canceled = True
+                service.cancel_joytag_index_job()
+            return original_finalize(job_id, **values)
+
+        monkeypatch.setattr(
+            service,
+            "_finalize_joytag_index_job",
+            cancel_before_finalize,
+        )
+        service.create_joytag_index_job()
+        await asyncio.wait_for(service.joytag_index_queue.join(), 10)
+        final = service.joytag_index_status()["job"]
+        assert canceled is True
+        assert final["status"] == "canceled"
+        assert final["cancel_requested"] is True
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_joytag_corpus_index_bounds_failures(
+    tmp_path: Path,
+) -> None:
+    config, database, _ = configured(tmp_path)
+
+    async def failing_media(url: str, _: str) -> bytes:
+        raise RuntimeError(f"cannot fetch {url}")
+
+    service = FinderService(
+        config,
+        database,
+        EmptyScraper(),
+        EventBroker(),
+        encoder=FakeEncoder(),
+        joytagger=FakeJoyTag(),
+        media_fetcher=failing_media,
+    )
+    await service.start()
+    try:
+        seed_corpus_gallery(
+            database,
+            GALLERY,
+            [
+                f"https://cdni.pornpics.com/preview/failure-{index}.png"
+                for index in range(25)
+            ],
+        )
+        service.create_joytag_index_job()
+        await asyncio.wait_for(service.joytag_index_queue.join(), 10)
+        final = service.joytag_index_status()
+        job = final["job"]
+        assert job["status"] == "completed_with_errors"
+        assert job["processed_images"] == 25
+        assert job["indexed_images"] == 0
+        assert job["failed_images"] == 25
+        assert job["progress"] == 100.0
+        assert len(job["errors"]) == finder_module.MAX_JOYTAG_INDEX_ERRORS
+        assert final["coverage"]["missing_images"] == 25
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_joytag_corpus_index_restart_reconciles_committed_vectors(
+    tmp_path: Path,
+) -> None:
+    config, database, _ = configured(tmp_path)
+    initial = FinderService(
+        config,
+        database,
+        EmptyScraper(),
+        EventBroker(),
+        encoder=FakeEncoder(),
+        joytagger=FakeJoyTag(),
+        media_fetcher=fake_media,
+    )
+    initial.ensure_schema()
+    blue = "https://cdni.pornpics.com/preview/blue.png"
+    green = "https://cdni.pornpics.com/preview/green.png"
+    seed_corpus_gallery(database, GALLERY, [blue, green])
+    now = "2026-01-01T00:00:00+00:00"
+    with database.connect() as db:
+        # This vector committed just before the old process stopped. The job's
+        # cursor/counters did not commit with it.
+        db.execute(
+            """INSERT INTO finder_joytag_cache(
+                   model_key, source_key, dimensions, scores,
+                   created_at, last_used_at
+               ) VALUES ('fake-joytag-v1', ?, 2, ?, ?, ?)""",
+            (
+                FinderService._remote_source_key(blue),
+                bytes((230, 26)),
+                now,
+                now,
+            ),
+        )
+        db.execute(
+            """INSERT INTO finder_joytag_index_jobs(
+                   id, model_key, dimensions, status, total_images,
+                   cached_images_at_start, created_at, updated_at
+               ) VALUES (
+                   'restart-window', 'fake-joytag-v1', 2, 'running', 2,
+                   0, ?, ?
+               )""",
+            (now, now),
+        )
+
+    fetched: list[str] = []
+
+    async def counting_media(url: str, referer: str) -> bytes:
+        fetched.append(url)
+        return await fake_media(url, referer)
+
+    restarted = FinderService(
+        config,
+        database,
+        EmptyScraper(),
+        EventBroker(),
+        encoder=FakeEncoder(),
+        joytagger=FakeJoyTag(),
+        media_fetcher=counting_media,
+    )
+    await restarted.start()
+    try:
+        await asyncio.wait_for(restarted.joytag_index_queue.join(), 10)
+        final = restarted.joytag_index_status()
+        assert final["job"]["status"] == "completed"
+        assert final["job"]["processed_images"] == 2
+        assert final["job"]["indexed_images"] == 2
+        assert final["coverage"]["cached_images"] == 2
+        assert [url.rsplit("/", 1)[-1] for url in fetched] == ["green.png"]
+    finally:
+        await restarted.stop()
 
 
 @pytest.mark.asyncio

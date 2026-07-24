@@ -60,6 +60,11 @@ HARD_NEGATIVE_MIN_AFFINITY = 0.82
 HARD_NEGATIVE_MARGIN = 0.04
 MAX_JOYTAG_QUERY_TAGS = 16
 DEFAULT_JOYTAG_REJECT_THRESHOLD = 0.4
+MAX_JOYTAG_INDEX_ERRORS = 20
+JOYTAG_INDEX_ACTIVE_STATUSES = frozenset({"queued", "running", "canceling"})
+JOYTAG_INDEX_TERMINAL_STATUSES = frozenset(
+    {"completed", "completed_with_errors", "canceled", "failed"}
+)
 
 try:
     from .vision import perceptual_hash_bytes as _perceptual_hash_bytes
@@ -84,6 +89,10 @@ class _FinderPaused(RuntimeError):
 
 
 class _FinderCanceled(RuntimeError):
+    pass
+
+
+class _JoyTagIndexCanceled(RuntimeError):
     pass
 
 
@@ -161,6 +170,8 @@ class FinderService:
         self.joytag_tags_path = config.finder_joytag_tags_path.resolve()
         self.queue: asyncio.Queue[str] = asyncio.Queue()
         self._workers: list[asyncio.Task] = []
+        self.joytag_index_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._joytag_index_worker_task: asyncio.Task | None = None
         self._client: httpx.AsyncClient | None = None
         self._network_semaphore = asyncio.Semaphore(config.finder_network_workers)
         self._embedding_semaphore = asyncio.Semaphore(1)
@@ -185,6 +196,7 @@ class FinderService:
         self._model_key = ""
         self._joytag_model_key = ""
         self._last_event_at: dict[str, float] = {}
+        self._last_joytag_index_event_at = 0.0
         self._cache_writes_since_prune = 0
 
     def ensure_schema(self) -> None:
@@ -317,6 +329,24 @@ class FinderService:
                     last_used_at TEXT NOT NULL,
                     PRIMARY KEY (model_key, source_key)
                 );
+                CREATE TABLE IF NOT EXISTS finder_joytag_index_jobs (
+                    id TEXT PRIMARY KEY,
+                    model_key TEXT NOT NULL,
+                    dimensions INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    total_images INTEGER NOT NULL DEFAULT 0,
+                    cached_images_at_start INTEGER NOT NULL DEFAULT 0,
+                    processed_images INTEGER NOT NULL DEFAULT 0,
+                    indexed_images INTEGER NOT NULL DEFAULT 0,
+                    failed_images INTEGER NOT NULL DEFAULT 0,
+                    cursor_source_key TEXT NOT NULL DEFAULT '',
+                    cancel_requested INTEGER NOT NULL DEFAULT 0,
+                    errors_json TEXT NOT NULL DEFAULT '[]',
+                    error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    finished_at TEXT
+                );
                 CREATE TABLE IF NOT EXISTS finder_feedback_decisions (
                     origin_result_id TEXT PRIMARY KEY,
                     pose_tag_id INTEGER NOT NULL,
@@ -370,6 +400,8 @@ class FinderService:
                     );
                 CREATE INDEX IF NOT EXISTS idx_finder_joytag_cache_source
                     ON finder_joytag_cache(source_key);
+                CREATE INDEX IF NOT EXISTS idx_finder_joytag_index_jobs_updated
+                    ON finder_joytag_index_jobs(updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_finder_corpus_images_source
                     ON finder_corpus_images(source_key);
                 CREATE INDEX IF NOT EXISTS idx_finder_corpus_images_scan
@@ -424,6 +456,9 @@ class FinderService:
                     "ranking_tier": "INTEGER NOT NULL DEFAULT 1",
                     "online_scanned": "INTEGER NOT NULL DEFAULT 1",
                     "selected_images_json": "TEXT NOT NULL DEFAULT '[]'",
+                },
+                "finder_joytag_index_jobs": {
+                    "dimensions": "INTEGER NOT NULL DEFAULT 0",
                 },
             }
             for table, additions in migrations.items():
@@ -544,6 +579,22 @@ class FinderService:
                     CURRENT_RANKING_VERSION,
                     JOYTAG_RANKING_VERSION,
                 ),
+            )
+            now = utc_now()
+            db.execute(
+                """UPDATE finder_joytag_index_jobs
+                   SET status = 'canceled', finished_at = COALESCE(finished_at, ?),
+                       updated_at = ?
+                   WHERE cancel_requested = 1
+                     AND status IN ('queued', 'running', 'canceling')""",
+                (now, now),
+            )
+            db.execute(
+                """UPDATE finder_joytag_index_jobs
+                   SET status = 'queued', updated_at = ?
+                   WHERE cancel_requested = 0
+                     AND status IN ('running', 'canceling')""",
+                (now,),
             )
 
     @staticmethod
@@ -1111,6 +1162,12 @@ class FinderService:
                 asyncio.create_task(self._worker(index), name=f"finder-worker-{index}")
                 for index in range(self.config.finder_workers)
             ]
+        for job_id in self._queued_joytag_index_job_ids():
+            self.joytag_index_queue.put_nowait(job_id)
+        self._joytag_index_worker_task = asyncio.create_task(
+            self._joytag_index_worker(),
+            name="finder-joytag-corpus-index",
+        )
 
     async def _ensure_encoder_ready(self) -> None:
         if not self._available or self.encoder is None:
@@ -1171,8 +1228,16 @@ class FinderService:
         self._stopping = True
         for worker in self._workers:
             worker.cancel()
+        if self._joytag_index_worker_task is not None:
+            self._joytag_index_worker_task.cancel()
         await asyncio.gather(*self._workers, return_exceptions=True)
         self._workers.clear()
+        if self._joytag_index_worker_task is not None:
+            await asyncio.gather(
+                self._joytag_index_worker_task,
+                return_exceptions=True,
+            )
+            self._joytag_index_worker_task = None
         if self._client is not None:
             await self._client.aclose()
             self._client = None
@@ -1280,7 +1345,131 @@ class FinderService:
             },
         }
 
-    def corpus_status(self) -> dict[str, int]:
+    def _current_joytag_model_key(self) -> str:
+        return str(
+            self._joytag_model_key
+            or getattr(self.joytagger, "model_key", "")
+            or ""
+        )
+
+    def _current_joytag_dimensions(self) -> int:
+        tags = tuple(getattr(self.joytagger, "tags", ()) or ())
+        if tags:
+            return len(tags)
+        try:
+            return max(0, int(getattr(self.joytagger, "expected_tag_count", 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _joytag_coverage_with_db(
+        db: Any,
+        model_key: str,
+        dimensions: int,
+    ) -> dict[str, Any]:
+        total = int(
+            db.execute(
+                "SELECT COUNT(DISTINCT source_key) FROM finder_corpus_images"
+            ).fetchone()[0]
+        )
+        cached = 0
+        cache_entries = 0
+        cache_bytes = 0
+        if model_key and dimensions > 0:
+            cached = int(
+                db.execute(
+                    """SELECT COUNT(DISTINCT i.source_key)
+                       FROM finder_corpus_images i
+                       JOIN finder_joytag_cache c
+                         ON c.model_key = ? AND c.source_key = i.source_key
+                        AND c.dimensions = ? AND length(c.scores) = ?""",
+                    (model_key, dimensions, dimensions),
+                ).fetchone()[0]
+            )
+            cache = db.execute(
+                """SELECT COUNT(*) AS entries,
+                          COALESCE(SUM(length(scores)), 0) AS stored_bytes
+                   FROM finder_joytag_cache
+                   WHERE model_key = ? AND dimensions = ?
+                     AND length(scores) = ?""",
+                (model_key, dimensions, dimensions),
+            ).fetchone()
+            cache_entries = int(cache["entries"])
+            cache_bytes = max(0, int(cache["stored_bytes"] or 0))
+        cached = min(total, max(0, cached))
+        return {
+            "model_key": model_key,
+            "dimensions": dimensions,
+            "total_images": total,
+            "cached_images": cached,
+            "missing_images": max(0, total - cached),
+            "percent": round(100.0 if total == 0 else cached / total * 100.0, 1),
+            "cache_entries": cache_entries,
+            "cache_bytes": cache_bytes,
+        }
+
+    @staticmethod
+    def _decode_joytag_index_job(row: Any | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        job = dict(row)
+        try:
+            decoded_errors = json.loads(str(job.pop("errors_json", "[]") or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decoded_errors = []
+        if not isinstance(decoded_errors, list):
+            decoded_errors = []
+        errors = [
+            item
+            for item in decoded_errors[:MAX_JOYTAG_INDEX_ERRORS]
+            if isinstance(item, dict)
+        ]
+        for name in (
+            "dimensions",
+            "total_images",
+            "cached_images_at_start",
+            "processed_images",
+            "indexed_images",
+            "failed_images",
+        ):
+            job[name] = max(0, int(job.get(name) or 0))
+        job["cancel_requested"] = bool(job.get("cancel_requested"))
+        total = job["total_images"]
+        completed_work = min(
+            total,
+            job["cached_images_at_start"] + job["processed_images"],
+        )
+        completed = str(job.get("status") or "") in {
+            "completed",
+            "completed_with_errors",
+        }
+        job["remaining_images"] = 0 if completed else max(0, total - completed_work)
+        job["progress"] = round(
+            100.0
+            if completed or total == 0
+            else completed_work / total * 100.0,
+            1,
+        )
+        job["active"] = str(job.get("status") or "") in JOYTAG_INDEX_ACTIVE_STATUSES
+        job["errors"] = errors
+        return job
+
+    def _latest_joytag_index_job_with_db(self, db: Any) -> dict[str, Any] | None:
+        row = db.execute(
+            """SELECT * FROM finder_joytag_index_jobs
+               ORDER BY created_at DESC, id DESC LIMIT 1"""
+        ).fetchone()
+        return self._decode_joytag_index_job(row)
+
+    def joytag_index_status(self) -> dict[str, Any]:
+        model_key = self._current_joytag_model_key()
+        dimensions = self._current_joytag_dimensions()
+        with self._lock, self.database.connect() as db:
+            coverage = self._joytag_coverage_with_db(db, model_key, dimensions)
+            job = self._latest_joytag_index_job_with_db(db)
+        return {"job": job, "coverage": coverage}
+
+    def corpus_status(self) -> dict[str, Any]:
         """Summarize reusable gallery membership and descriptor storage."""
 
         with self._lock, self.database.connect() as db:
@@ -1324,6 +1513,12 @@ class FinderService:
                         (model_key,),
                     ).fetchone()[0]
                 )
+            joytag_coverage = self._joytag_coverage_with_db(
+                db,
+                self._current_joytag_model_key(),
+                self._current_joytag_dimensions(),
+            )
+            joytag_index_job = self._latest_joytag_index_job_with_db(db)
         return {
             "galleries": int(galleries["galleries"]),
             "images": images,
@@ -1334,7 +1529,118 @@ class FinderService:
             "cache_bytes": max(0, int(cache["stored_bytes"] or 0)),
             "max_cache_entries": int(self.config.finder_cache_max_entries),
             "max_cache_bytes": int(self.config.finder_cache_max_bytes),
+            "joytag": joytag_coverage,
+            "joytag_index_job": joytag_index_job,
         }
+
+    def _queued_joytag_index_job_ids(self) -> list[str]:
+        with self._lock, self.database.connect() as db:
+            return [
+                str(row["id"])
+                for row in db.execute(
+                    """SELECT id FROM finder_joytag_index_jobs
+                       WHERE status = 'queued' AND cancel_requested = 0
+                       ORDER BY created_at, id"""
+                ).fetchall()
+            ]
+
+    def create_joytag_index_job(self) -> dict[str, Any]:
+        if not self._joytag_available:
+            raise FinderUnavailable(
+                self._joytag_error or "Finder tag-search support is unavailable"
+            )
+        model_key = self._current_joytag_model_key()
+        dimensions = self._current_joytag_dimensions()
+        if not model_key:
+            raise FinderUnavailable("The JoyTag model identity is unavailable")
+        if dimensions < 1:
+            raise FinderUnavailable("The JoyTag vocabulary identity is unavailable")
+        should_queue = False
+        with self._lock, self.database.connect() as db:
+            active = db.execute(
+                """SELECT * FROM finder_joytag_index_jobs
+                   WHERE status IN ('queued', 'running', 'canceling')
+                   ORDER BY created_at DESC, id DESC LIMIT 1"""
+            ).fetchone()
+            if active is not None:
+                job = self._decode_joytag_index_job(active) or {}
+            else:
+                coverage = self._joytag_coverage_with_db(
+                    db,
+                    model_key,
+                    dimensions,
+                )
+                latest = self._latest_joytag_index_job_with_db(db)
+                if (
+                    coverage["missing_images"] == 0
+                    and latest is not None
+                    and latest.get("model_key") == model_key
+                    and int(latest.get("dimensions") or 0) == dimensions
+                    and latest.get("status")
+                    in {"completed", "completed_with_errors"}
+                ):
+                    job = latest
+                else:
+                    job_id = uuid.uuid4().hex
+                    now = utc_now()
+                    completed = coverage["missing_images"] == 0
+                    status = "completed" if completed else "queued"
+                    db.execute(
+                        """INSERT INTO finder_joytag_index_jobs(
+                               id, model_key, dimensions, status, total_images,
+                               cached_images_at_start, created_at, updated_at,
+                               finished_at
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            job_id,
+                            model_key,
+                            dimensions,
+                            status,
+                            coverage["total_images"],
+                            coverage["cached_images"],
+                            now,
+                            now,
+                            now if completed else None,
+                        ),
+                    )
+                    row = db.execute(
+                        "SELECT * FROM finder_joytag_index_jobs WHERE id = ?",
+                        (job_id,),
+                    ).fetchone()
+                    job = self._decode_joytag_index_job(row) or {}
+                    should_queue = not completed
+        if should_queue:
+            self.joytag_index_queue.put_nowait(str(job["id"]))
+        self._publish_joytag_index(job, force=True)
+        return self.joytag_index_status()
+
+    def cancel_joytag_index_job(self) -> dict[str, Any]:
+        with self._lock, self.database.connect() as db:
+            row = db.execute(
+                """SELECT * FROM finder_joytag_index_jobs
+                   WHERE status IN ('queued', 'running', 'canceling')
+                   ORDER BY created_at DESC, id DESC LIMIT 1"""
+            ).fetchone()
+            if row is None:
+                raise FinderConflict("No JoyTag corpus indexing job is active")
+            job_id = str(row["id"])
+            now = utc_now()
+            status = "canceled" if row["status"] == "queued" else "canceling"
+            db.execute(
+                """UPDATE finder_joytag_index_jobs
+                   SET status = ?, cancel_requested = 1, updated_at = ?,
+                       finished_at = CASE WHEN ? = 'canceled' THEN ? ELSE NULL END
+                   WHERE id = ?""",
+                (status, now, status, now, job_id),
+            )
+            job = self._decode_joytag_index_job(
+                db.execute(
+                    "SELECT * FROM finder_joytag_index_jobs WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+            ) or {}
+        self._publish_joytag_index(job, force=True)
+        return self.joytag_index_status()
 
     @staticmethod
     def _prune_feedback_decisions(db: Any, pose_tag_id: int) -> None:
@@ -3641,6 +3947,27 @@ class FinderService:
             }
         )
 
+    def _publish_joytag_index(
+        self,
+        job: dict[str, Any],
+        *,
+        force: bool = False,
+    ) -> None:
+        if not job:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_joytag_index_event_at < 0.5:
+            return
+        self._last_joytag_index_event_at = now
+        state = self.joytag_index_status()
+        self.events.publish(
+            {
+                "type": "finder_joytag_index",
+                "job": job,
+                "coverage": state["coverage"],
+            }
+        )
+
     def _check_control(self, scan_id: str) -> None:
         cancel, pause = self._control_flags(scan_id)
         if self._stopping or cancel:
@@ -5140,6 +5467,370 @@ class FinderService:
         demoted = min(score, POSE_MATCH_FLOOR - 1e-6)
         return 0, demoted, demoted - float(base_score)
 
+    def _update_joytag_index_job(self, job_id: str, **values: Any) -> None:
+        allowed = {
+            "status",
+            "total_images",
+            "cached_images_at_start",
+            "processed_images",
+            "indexed_images",
+            "failed_images",
+            "cursor_source_key",
+            "cancel_requested",
+            "errors_json",
+            "error",
+            "finished_at",
+        }
+        values = {key: value for key, value in values.items() if key in allowed}
+        if not values:
+            return
+        values["updated_at"] = utc_now()
+        columns = ", ".join(f"{key} = ?" for key in values)
+        with self._lock, self.database.connect() as db:
+            db.execute(
+                f"UPDATE finder_joytag_index_jobs SET {columns} WHERE id = ?",
+                [*values.values(), job_id],
+            )
+
+    def _reconcile_joytag_index_job(
+        self,
+        job_id: str,
+    ) -> dict[str, Any] | None:
+        """Recover counters when cached vectors outlive an interrupted batch.
+
+        JoyTag vectors are committed individually before the job cursor is
+        advanced. A process stop in that small window is safe for the cache, but
+        would otherwise leave the persistent counters behind. Exact
+        model/vocabulary coverage lets a resumed job account for those durable
+        writes without downloading or classifying them again.
+        """
+
+        with self._lock, self.database.connect() as db:
+            row = db.execute(
+                "SELECT * FROM finder_joytag_index_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            total = max(0, int(row["total_images"] or 0))
+            cached_at_start = min(
+                total,
+                max(0, int(row["cached_images_at_start"] or 0)),
+            )
+            capacity = max(0, total - cached_at_start)
+            coverage = self._joytag_coverage_with_db(
+                db,
+                str(row["model_key"] or ""),
+                max(0, int(row["dimensions"] or 0)),
+            )
+            durable_new = min(
+                capacity,
+                max(0, int(coverage["cached_images"]) - cached_at_start),
+            )
+            indexed = min(
+                capacity,
+                max(int(row["indexed_images"] or 0), durable_new),
+            )
+            failed = min(
+                max(0, int(row["failed_images"] or 0)),
+                max(0, capacity - indexed),
+            )
+            processed = min(
+                capacity,
+                max(int(row["processed_images"] or 0), indexed + failed),
+            )
+            if (
+                indexed != int(row["indexed_images"] or 0)
+                or failed != int(row["failed_images"] or 0)
+                or processed != int(row["processed_images"] or 0)
+            ):
+                db.execute(
+                    """UPDATE finder_joytag_index_jobs
+                       SET processed_images = ?, indexed_images = ?,
+                           failed_images = ?,
+                           updated_at = ?
+                       WHERE id = ?""",
+                    (processed, indexed, failed, utc_now(), job_id),
+                )
+                row = db.execute(
+                    "SELECT * FROM finder_joytag_index_jobs WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+            return self._decode_joytag_index_job(row)
+
+    def _claim_joytag_index_job(self, job_id: str) -> bool:
+        with self._lock, self.database.connect() as db:
+            result = db.execute(
+                """UPDATE finder_joytag_index_jobs
+                   SET status = 'running', error = '', updated_at = ?
+                   WHERE id = ? AND status = 'queued'
+                     AND cancel_requested = 0""",
+                (utc_now(), job_id),
+            )
+        return bool(result.rowcount)
+
+    def _finalize_joytag_index_job(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        error: str = "",
+    ) -> dict[str, Any] | None:
+        if status not in {"completed", "completed_with_errors", "failed"}:
+            raise ValueError("Invalid JoyTag corpus indexing terminal status")
+        now = utc_now()
+        with self._lock, self.database.connect() as db:
+            result = db.execute(
+                """UPDATE finder_joytag_index_jobs
+                   SET status = ?, error = ?, finished_at = ?, updated_at = ?
+                   WHERE id = ? AND status = 'running'
+                     AND cancel_requested = 0""",
+                (status, error[:1000], now, now, job_id),
+            )
+            if not result.rowcount:
+                # Cancellation and successful/failing finalization race under
+                # one transaction. Whichever UPDATE commits first wins.
+                db.execute(
+                    """UPDATE finder_joytag_index_jobs
+                       SET status = 'canceled', error = '', finished_at = ?,
+                           updated_at = ?
+                       WHERE id = ? AND cancel_requested = 1
+                         AND status IN ('running', 'canceling')""",
+                    (now, now, job_id),
+                )
+            return self._decode_joytag_index_job(
+                db.execute(
+                    "SELECT * FROM finder_joytag_index_jobs WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+            )
+
+    def _get_joytag_index_job(self, job_id: str) -> dict[str, Any] | None:
+        with self._lock, self.database.connect() as db:
+            return self._decode_joytag_index_job(
+                db.execute(
+                    "SELECT * FROM finder_joytag_index_jobs WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+            )
+
+    def _check_joytag_index_control(self, job_id: str) -> None:
+        with self._lock, self.database.connect() as db:
+            row = db.execute(
+                """SELECT cancel_requested FROM finder_joytag_index_jobs
+                   WHERE id = ?""",
+                (job_id,),
+            ).fetchone()
+        if row is None or bool(row["cancel_requested"]):
+            raise _JoyTagIndexCanceled("JoyTag corpus indexing canceled")
+
+    def _joytag_index_rows(
+        self,
+        *,
+        model_key: str,
+        dimensions: int,
+        after_source_key: str,
+        limit: int,
+    ) -> list[Any]:
+        with self._lock, self.database.connect() as db:
+            return db.execute(
+                """SELECT i.source_key,
+                          MIN(i.preview_remote_url) AS preview_remote_url,
+                          MIN(g.gallery_url) AS gallery_url
+                   FROM finder_corpus_images i
+                   JOIN finder_corpus_galleries g
+                     ON g.gallery_key = i.gallery_key
+                   LEFT JOIN finder_joytag_cache c
+                     ON c.model_key = ? AND c.source_key = i.source_key
+                    AND c.dimensions = ? AND length(c.scores) = ?
+                   WHERE i.source_key > ? AND c.source_key IS NULL
+                   GROUP BY i.source_key
+                   ORDER BY i.source_key
+                   LIMIT ?""",
+                (
+                    model_key,
+                    dimensions,
+                    dimensions,
+                    after_source_key,
+                    limit,
+                ),
+            ).fetchall()
+
+    @staticmethod
+    def _joytag_index_error(
+        row: Any,
+        error: BaseException | str,
+    ) -> dict[str, str]:
+        return {
+            "source_key": str(row["source_key"])[:500],
+            "preview_remote_url": str(row["preview_remote_url"] or "")[:2_000],
+            "error": str(error)[:500],
+        }
+
+    async def _run_joytag_index_job(
+        self,
+        job_id: str,
+        job: dict[str, Any],
+    ) -> None:
+        await self._ensure_joytag_ready()
+        model_key = self._current_joytag_model_key()
+        dimensions = self._current_joytag_dimensions()
+        if (
+            model_key != str(job.get("model_key") or "")
+            or dimensions != int(job.get("dimensions") or 0)
+        ):
+            raise FinderConflict(
+                "The JoyTag model changed; start a new corpus indexing job"
+            )
+        reconciled = await asyncio.to_thread(
+            self._reconcile_joytag_index_job,
+            job_id,
+        )
+        if reconciled is not None:
+            job = reconciled
+        processed = int(job.get("processed_images") or 0)
+        indexed = int(job.get("indexed_images") or 0)
+        failed = int(job.get("failed_images") or 0)
+        cursor = str(job.get("cursor_source_key") or "")
+        errors = list(job.get("errors") or [])[:MAX_JOYTAG_INDEX_ERRORS]
+        batch_size = self.config.finder_inference_batch_size
+        while True:
+            self._check_joytag_index_control(job_id)
+            rows = await asyncio.to_thread(
+                self._joytag_index_rows,
+                model_key=model_key,
+                dimensions=dimensions,
+                after_source_key=cursor,
+                limit=batch_size,
+            )
+            if not rows:
+                break
+            valid_rows: list[Any] = []
+            requests: list[tuple[str, str]] = []
+            invalid: dict[str, BaseException] = {}
+            for row in rows:
+                try:
+                    preview = canonicalize_url(str(row["preview_remote_url"] or ""))
+                    referer = validate_source_url(str(row["gallery_url"] or ""))
+                    if self._remote_source_key(preview) != str(row["source_key"]):
+                        raise ValueError(
+                            "Corpus source key does not match its preview URL"
+                        )
+                except Exception as exc:
+                    invalid[str(row["source_key"])] = exc
+                    continue
+                valid_rows.append(row)
+                requests.append((preview, referer))
+            outcomes = await self._remote_joytag_scores(requests)
+            by_source: dict[str, np.ndarray | BaseException] = {
+                str(row["source_key"]): outcome
+                for row, outcome in zip(valid_rows, outcomes, strict=True)
+            }
+            by_source.update(invalid)
+            for row in rows:
+                outcome = by_source.get(str(row["source_key"]))
+                if isinstance(outcome, BaseException) or outcome is None:
+                    failed += 1
+                    if len(errors) < MAX_JOYTAG_INDEX_ERRORS:
+                        failure = (
+                            outcome
+                            if isinstance(outcome, BaseException)
+                            else RuntimeError(
+                                "JoyTag indexing produced no result"
+                            )
+                        )
+                        errors.append(
+                            self._joytag_index_error(
+                                row,
+                                failure,
+                            )
+                        )
+                else:
+                    indexed += 1
+            processed += len(rows)
+            cursor = str(rows[-1]["source_key"])
+            self._update_joytag_index_job(
+                job_id,
+                processed_images=processed,
+                indexed_images=indexed,
+                failed_images=failed,
+                cursor_source_key=cursor,
+                errors_json=json.dumps(
+                    errors,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            )
+            update = self._get_joytag_index_job(job_id)
+            if update:
+                self._publish_joytag_index(update)
+            self._check_joytag_index_control(job_id)
+        reconciled = await asyncio.to_thread(
+            self._reconcile_joytag_index_job,
+            job_id,
+        )
+        self._finalize_joytag_index_job(
+            job_id,
+            status=(
+                "completed_with_errors"
+                if int((reconciled or {}).get("failed_images") or failed)
+                else "completed"
+            ),
+            error="",
+        )
+
+    async def _joytag_index_worker(self) -> None:
+        while not self._stopping:
+            job_id = await self.joytag_index_queue.get()
+            claimed = False
+            try:
+                claimed = self._claim_joytag_index_job(job_id)
+                if not claimed:
+                    continue
+                job = self._get_joytag_index_job(job_id)
+                if not job:
+                    continue
+                await self._run_joytag_index_job(job_id, job)
+            except asyncio.CancelledError:
+                if claimed:
+                    current = self._get_joytag_index_job(job_id)
+                    if current and current.get("status") in {
+                        "running",
+                        "canceling",
+                    }:
+                        if current.get("cancel_requested"):
+                            self._update_joytag_index_job(
+                                job_id,
+                                status="canceled",
+                                finished_at=utc_now(),
+                                error="",
+                            )
+                        else:
+                            self._update_joytag_index_job(
+                                job_id,
+                                status="queued",
+                            )
+                raise
+            except _JoyTagIndexCanceled:
+                self._update_joytag_index_job(
+                    job_id,
+                    status="canceled",
+                    cancel_requested=1,
+                    finished_at=utc_now(),
+                    error="",
+                )
+            except Exception as exc:
+                self._finalize_joytag_index_job(
+                    job_id,
+                    status="failed",
+                    error=str(exc),
+                )
+            finally:
+                self.joytag_index_queue.task_done()
+                final = self._get_joytag_index_job(job_id)
+                if final:
+                    self._publish_joytag_index(final, force=True)
+
     def _claim_scan(self, scan_id: str) -> bool:
         with self._lock, self.database.connect() as db:
             result = db.execute(
@@ -5627,29 +6318,51 @@ class FinderService:
         self,
         after: tuple[str, int, str] | None,
         *,
+        model_key: str,
+        dimensions: int,
         limit: int = 256,
     ) -> list[Any]:
         condition = ""
-        params: list[Any] = []
+        params: list[Any] = [model_key, dimensions, dimensions]
         if after is not None:
             condition = """
-                WHERE (i.gallery_key, i.ordinal, i.source_key) > (?, ?, ?)
+                AND (i.gallery_key, i.ordinal, i.source_key) > (?, ?, ?)
             """
             params.extend(after)
         params.append(limit)
         query = f"""SELECT i.gallery_key, i.source_key, i.image_url,
                            i.preview_remote_url, i.ordinal,
-                           g.gallery_url, g.title, g.thumbnail_remote_url
+                           g.gallery_url, g.title, g.thumbnail_remote_url,
+                           c.scores
                     FROM finder_corpus_images i
                          INDEXED BY idx_finder_corpus_images_scan
                     CROSS JOIN finder_corpus_galleries g
+                    CROSS JOIN finder_joytag_cache c
+                    WHERE g.gallery_key = i.gallery_key
+                      AND c.model_key = ?
+                      AND c.source_key = i.source_key
+                      AND c.dimensions = ?
+                      AND length(c.scores) = ?
                     {condition}
-                      {"AND" if condition else "WHERE"}
-                      g.gallery_key = i.gallery_key
                     ORDER BY i.gallery_key, i.ordinal, i.source_key
                     LIMIT ?"""
         with self._lock, self.database.connect() as db:
             return db.execute(query, params).fetchall()
+
+    def _touch_joytag_cache_sources(
+        self,
+        model_key: str,
+        source_keys: list[str],
+    ) -> None:
+        if not source_keys:
+            return
+        now = utc_now()
+        with self._lock, self.database.connect() as db:
+            db.executemany(
+                """UPDATE finder_joytag_cache SET last_used_at = ?
+                   WHERE model_key = ? AND source_key = ?""",
+                [(now, model_key, source_key) for source_key in source_keys],
+            )
 
     async def _search_joytag_corpus(
         self,
@@ -5673,6 +6386,8 @@ class FinderService:
         active_images = 0
         images_scored = 0
         galleries_scored = 0
+        model_key = self._joytag_model_key
+        dimensions = self._current_joytag_dimensions()
 
         def save_active() -> None:
             nonlocal active_card, active_matches, active_images, galleries_scored
@@ -5704,25 +6419,26 @@ class FinderService:
 
         while True:
             self._check_control(scan["id"])
-            rows = await asyncio.to_thread(self._corpus_joytag_rows, after)
+            rows = await asyncio.to_thread(
+                self._corpus_joytag_rows,
+                after,
+                model_key=model_key,
+                dimensions=dimensions,
+            )
             if not rows:
                 break
-            batch_size = self.config.finder_inference_batch_size
-            outcomes: list[np.ndarray | BaseException] = []
-            for start in range(0, len(rows), batch_size):
-                chunk = rows[start : start + batch_size]
-                outcomes.extend(
-                    await self._remote_joytag_scores(
-                        [
-                            (
-                                str(row["preview_remote_url"]),
-                                str(row["gallery_url"]),
-                            )
-                            for row in chunk
-                        ],
-                        scan_id=scan["id"],
-                    )
+            await asyncio.to_thread(
+                self._touch_joytag_cache_sources,
+                model_key,
+                list(dict.fromkeys(str(row["source_key"]) for row in rows)),
+            )
+            outcomes = [
+                np.frombuffer(bytes(row["scores"]), dtype=np.uint8).astype(
+                    np.float32
                 )
+                / 255.0
+                for row in rows
+            ]
             for row, outcome in zip(rows, outcomes, strict=True):
                 self._check_control(scan["id"])
                 gallery = str(row["gallery_key"])
@@ -5737,8 +6453,6 @@ class FinderService:
                             row["thumbnail_remote_url"] or ""
                         ),
                     }
-                if isinstance(outcome, BaseException):
-                    continue
                 active_images += 1
                 images_scored += 1
                 match = self._joytag_match(outcome, query)

@@ -562,8 +562,13 @@ async def test_finder_reuses_persistent_corpus_without_media_or_candidate_infere
             "cache_bytes": corpus["cache_bytes"],
             "max_cache_entries": config.finder_cache_max_entries,
             "max_cache_bytes": config.finder_cache_max_bytes,
+            "joytag": corpus["joytag"],
+            "joytag_index_job": None,
         }
         assert corpus["cache_bytes"] > 0
+        assert corpus["joytag"]["total_images"] == 3
+        assert corpus["joytag"]["cached_images"] == 0
+        assert corpus["joytag"]["missing_images"] == 3
         with database.connect() as connection:
             connection.execute(
                 """UPDATE finder_embedding_cache SET last_used_at = '2000-01-01'

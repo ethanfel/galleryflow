@@ -186,6 +186,11 @@ def build_visual_app(
     finder_race_state = {"review": "pending", "results_calls": 0, "selected": []}
     finder_continue_state = {"scan_calls": 0, "continue_calls": 0}
     finder_tag_state: dict[str, object] = {"created": False, "payload": None}
+    finder_tag_index_state = {
+        "status": "idle",
+        "post_calls": 0,
+        "delete_calls": 0,
+    }
     if finder_race:
         finder_scan["status"] = "running"
 
@@ -210,8 +215,51 @@ def build_visual_app(
             },
         }
 
-    async def fake_finder_corpus(**kwargs: object) -> dict:
+    def fake_finder_joytag_coverage() -> dict:
+        cached = 1790 if finder_tag_index_state["status"] != "idle" else 1200
         return {
+            "model_key": "joytag-visual-smoke",
+            "total_images": 8420,
+            "cached_images": cached,
+            "missing_images": 8420 - cached,
+            "percent": round(cached / 8420 * 100, 1),
+            "cache_entries": cached,
+            "cache_bytes": cached * 5813,
+        }
+
+    def fake_finder_joytag_index_job() -> dict | None:
+        status = str(finder_tag_index_state["status"])
+        if status == "idle":
+            return None
+        return {
+            "id": "visual-joytag-index",
+            "status": status,
+            "model_key": "joytag-visual-smoke",
+            "total_images": 8420,
+            "cached_images_at_start": 1200,
+            "processed_images": 600,
+            "indexed_images": 590,
+            "failed_images": 10,
+            "remaining_images": 6620,
+            "progress": 21.4,
+            "cancel_requested": status in {"canceling", "canceled"},
+            "error": "",
+            "errors": [],
+            "created_at": "2026-07-24T12:00:00+00:00",
+            "updated_at": "2026-07-24T12:00:01+00:00",
+            "finished_at": (
+                "2026-07-24T12:00:02+00:00" if status == "canceled" else None
+            ),
+        }
+
+    def fake_finder_joytag_index_response() -> dict:
+        return {
+            "job": fake_finder_joytag_index_job(),
+            "coverage": fake_finder_joytag_coverage(),
+        }
+
+    async def fake_finder_corpus(**kwargs: object) -> dict:
+        result = {
             "galleries": 418,
             "images": 8420,
             "complete": 374,
@@ -221,7 +269,23 @@ def build_visual_app(
             "cache_bytes": 367001600,
             "max_cache_entries": 50000,
             "max_cache_bytes": 2147483648,
+            "joytag": fake_finder_joytag_coverage(),
+            "joytag_index_job": fake_finder_joytag_index_job(),
         }
+        return result
+
+    async def fake_finder_joytag_index_get(**kwargs: object) -> dict:
+        return fake_finder_joytag_index_response()
+
+    async def fake_finder_joytag_index_start(**kwargs: object) -> dict:
+        finder_tag_index_state["post_calls"] += 1
+        finder_tag_index_state["status"] = "running"
+        return fake_finder_joytag_index_response()
+
+    async def fake_finder_joytag_index_cancel(**kwargs: object) -> dict:
+        finder_tag_index_state["delete_calls"] += 1
+        finder_tag_index_state["status"] = "canceled"
+        return fake_finder_joytag_index_response()
 
     async def fake_finder_feedback(**kwargs: object) -> dict:
         return {
@@ -350,6 +414,9 @@ def build_visual_app(
                 float(values.get("joytag_reject_threshold") or 0) - 0.55
             )
             < 1e-9
+            and finder_tag_index_state["post_calls"] == 1
+            and finder_tag_index_state["delete_calls"] == 1
+            and finder_tag_index_state["status"] == "canceled"
             and values.get("reference_fingerprint") == "a" * 64
             and abs(float(values.get("minimum_score") or 0) - 0.35) < 1e-9
         )
@@ -716,6 +783,7 @@ localStorage.setItem('galleryflow:finder-mode', JSON.stringify('joytag'));
 localStorage.setItem('galleryflow:finder-scan', JSON.stringify(''));
 window.addEventListener('load', () => {
   let phase = 'configure';
+  let indexOk = false;
   let resultOk = false;
   const folderValue = 'sorted_outpaint/mating press - backview/selected_target_upscaled';
   const requiredChips = () => document.querySelectorAll(
@@ -725,12 +793,115 @@ window.addEventListener('load', () => {
     '#finder-joytag-excluded-tags .finder-joytag-query-chip'
   );
   const poll = setInterval(() => {
+    document.documentElement.dataset.finderTagPhase = phase;
     const folder = document.querySelector('#finder-folder');
     const analyze = document.querySelector('#finder-analyze-references');
     if (phase === 'configure' && folder && analyze && !analyze.hidden) {
-      folder.value = folderValue;
-      folder.dispatchEvent(new Event('input', { bubbles: true }));
-      if (!analyze.disabled) {
+      if (folder.value !== folderValue) {
+        folder.value = folderValue;
+        folder.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      const panel = document.querySelector('#finder-corpus-joytag');
+      const start = document.querySelector('#finder-corpus-index-start');
+      const cached = Number(
+        document.querySelector('#finder-corpus-joytag-cached')
+          ?.textContent.replace(/\\D/g, '')
+      );
+      const total = Number(
+        document.querySelector('#finder-corpus-joytag-total')
+          ?.textContent.replace(/\\D/g, '')
+      );
+      const policy = document.querySelector(
+        '.finder-corpus-index-policy'
+      )?.textContent || '';
+      const ordinaryCopy = document.querySelector(
+        '#finder-corpus-copy'
+      )?.textContent || '';
+      document.documentElement.dataset.finderTagDebug = [
+        panel?.hidden,
+        start?.disabled,
+        cached,
+        total,
+        policy.includes('Ordinary Tag searches do not index'),
+        policy.includes('cached local images only'),
+        policy.includes('go straight to the Source URL'),
+        ordinaryCopy.includes('never fill missing cache entries'),
+      ].join('|');
+      if (
+        panel
+        && !panel.hidden
+        && start
+        && !start.disabled
+        && cached === 1200
+        && total === 8420
+        && policy.includes('Ordinary Tag searches do not index')
+        && policy.includes('cached local images only')
+        && policy.includes('go straight to the Source URL')
+        && ordinaryCopy.includes('never fill missing cache entries')
+      ) {
+        start.click();
+        phase = 'index-running';
+      }
+    } else if (phase === 'index-running') {
+      const cancel = document.querySelector('#finder-corpus-index-cancel');
+      const progress = Number(
+        document.querySelector('#finder-corpus-index-progress')
+          ?.getAttribute('aria-valuenow')
+      );
+      const progressCopy = document.querySelector(
+        '#finder-corpus-index-progress-copy'
+      )?.textContent || '';
+      const state = document.querySelector(
+        '#finder-corpus-joytag-state'
+      )?.textContent;
+      document.documentElement.dataset.finderTagDebug = [
+        cancel?.hidden,
+        cancel?.disabled,
+        progress,
+        state,
+        progressCopy.includes('600 processed'),
+        progressCopy.includes('590 cached'),
+        progressCopy.includes('10 failed'),
+        progressCopy.includes('6,620 remaining'),
+      ].join('|');
+      if (
+        cancel
+        && !cancel.hidden
+        && !cancel.disabled
+        && progress === 21.4
+        && state === 'Indexing'
+        && progressCopy.includes('600 processed')
+        && progressCopy.includes('590 cached')
+        && progressCopy.includes('10 failed')
+        && progressCopy.includes('6,620 remaining')
+      ) {
+        indexOk = true;
+        cancel.click();
+        phase = 'index-canceled';
+      }
+    } else if (phase === 'index-canceled') {
+      const start = document.querySelector('#finder-corpus-index-start');
+      const state = document.querySelector(
+        '#finder-corpus-joytag-state'
+      )?.textContent;
+      const cached = Number(
+        document.querySelector('#finder-corpus-joytag-cached')
+          ?.textContent.replace(/\\D/g, '')
+      );
+      const progressCopy = document.querySelector(
+        '#finder-corpus-index-progress-copy'
+      )?.textContent || '';
+      if (
+        indexOk
+        && state === 'Canceled'
+        && start
+        && !start.hidden
+        && !start.disabled
+        && cached === 1790
+        && progressCopy.includes('stopped safely')
+        && progressCopy.includes('6,630')
+        && !analyze.disabled
+      ) {
         analyze.click();
         phase = 'analysis';
       }
@@ -854,6 +1025,8 @@ window.addEventListener('load', () => {
         && !copy.includes('Pose match')
       );
       resultOk = (
+        indexOk
+        &&
         oneMatch
         && rangeOk
         && queryEvidence
@@ -903,6 +1076,9 @@ window.addEventListener('load', () => {
           === '0.55'
       );
       if (restored) {
+        document.querySelector('#finder-joytag-analysis')?.removeAttribute(
+          'open'
+        );
         document.documentElement.dataset.finderTag = resultOk
           ? 'pass'
           : 'fail';
@@ -956,6 +1132,30 @@ window.addEventListener('load', () => {
         elif open_finder and getattr(route, "path", None) == "/api/finder/status":
             route.endpoint = fake_finder_status
             route.dependant.call = fake_finder_status
+        elif (
+            finder_tag
+            and getattr(route, "path", None)
+            == "/api/finder/corpus/joytag-index"
+            and "POST" in getattr(route, "methods", set())
+        ):
+            route.endpoint = fake_finder_joytag_index_start
+            route.dependant.call = fake_finder_joytag_index_start
+        elif (
+            finder_tag
+            and getattr(route, "path", None)
+            == "/api/finder/corpus/joytag-index"
+            and "DELETE" in getattr(route, "methods", set())
+        ):
+            route.endpoint = fake_finder_joytag_index_cancel
+            route.dependant.call = fake_finder_joytag_index_cancel
+        elif (
+            finder_tag
+            and getattr(route, "path", None)
+            == "/api/finder/corpus/joytag-index"
+            and "GET" in getattr(route, "methods", set())
+        ):
+            route.endpoint = fake_finder_joytag_index_get
+            route.dependant.call = fake_finder_joytag_index_get
         elif open_finder and getattr(route, "path", None) == "/api/finder/corpus":
             route.endpoint = fake_finder_corpus
             route.dependant.call = fake_finder_corpus
@@ -1030,6 +1230,25 @@ window.addEventListener('load', () => {
             fake_finder_continue,
             methods=["POST"],
         )
+    if finder_tag and not any(
+        getattr(route, "path", None) == "/api/finder/corpus/joytag-index"
+        for route in app.routes
+    ):
+        app.add_api_route(
+            "/api/finder/corpus/joytag-index",
+            fake_finder_joytag_index_get,
+            methods=["GET"],
+        )
+        app.add_api_route(
+            "/api/finder/corpus/joytag-index",
+            fake_finder_joytag_index_start,
+            methods=["POST"],
+        )
+        app.add_api_route(
+            "/api/finder/corpus/joytag-index",
+            fake_finder_joytag_index_cancel,
+            methods=["DELETE"],
+        )
     return app
 
 
@@ -1065,7 +1284,9 @@ def main() -> None:
         or args.finder_tag
     )
     suffix = (
-        "finder-tag"
+        "finder-tag-mobile"
+        if args.finder_tag and args.mobile
+        else "finder-tag"
         if args.finder_tag
         else "finder-pagination"
         if args.finder_pagination
@@ -1121,6 +1342,8 @@ def main() -> None:
         if args.mobile and finder_mode
         else "390,844"
         if args.mobile
+        else "1440,1350"
+        if args.finder_tag
         else "1920,969"
         if args.gallery or args.lightbox or args.pose
         else "1440,1100"
@@ -1242,8 +1465,15 @@ def main() -> None:
                 "Finder pagination did not load page two with global result ranks"
             )
         if args.finder_tag and 'data-finder-tag="pass"' not in completed.stdout:
+            phase = completed.stdout.partition(
+                'data-finder-tag-phase="'
+            )[2].partition('"')[0]
+            debug = completed.stdout.partition(
+                'data-finder-tag-debug="'
+            )[2].partition('"')[0]
             raise AssertionError(
-                "Tag Finder analysis, tag selection, scan payload, or result rendering failed"
+                "Tag Finder corpus indexing, analysis, scan payload, or result "
+                f"rendering failed (phase={phase or 'unknown'}, debug={debug or 'none'})"
             )
         server.should_exit = True
         thread.join(timeout=5)

@@ -73,6 +73,10 @@
     finderStatus: null,
     finderCorpus: null,
     finderCorpusSupported: null,
+    finderJoytagIndexSupported: null,
+    finderJoytagIndexBusy: false,
+    finderJoytagIndexRequest: 0,
+    finderJoytagIndexTimer: null,
     finderFeedback: null,
     finderFeedbackSupported: null,
     finderFeedbackLoading: false,
@@ -439,6 +443,13 @@
     const refreshFinderCorpusFromEvent = () => loadFinderCorpus({ quiet: true });
     source.addEventListener('finder_corpus', refreshFinderCorpusFromEvent);
     source.addEventListener('finder_index', refreshFinderCorpusFromEvent);
+    source.addEventListener('finder_joytag_index', event => {
+      try {
+        applyFinderJoytagIndexPayload(JSON.parse(event.data || '{}'));
+      } catch (_) {
+        loadFinderJoytagIndex({ quiet: true, force: true });
+      }
+    });
     source.addEventListener('settings', () => loadSettings());
   }
 
@@ -2137,6 +2148,80 @@
     return 0;
   }
 
+  function finderCorpusPercent(value, fallback = 0) {
+    const number = Number(value);
+    return Number.isFinite(number)
+      ? Math.max(0, Math.min(100, number))
+      : Math.max(0, Math.min(100, Number(fallback) || 0));
+  }
+
+  function normalizeFinderJoytagCoverage(item) {
+    const coverage = item?.coverage && typeof item.coverage === 'object'
+      ? item.coverage
+      : item;
+    if (!coverage || typeof coverage !== 'object' || Array.isArray(coverage)) return null;
+    const recognized = [
+      'model_key', 'total_images', 'cached_images', 'missing_images', 'percent',
+      'cache_entries', 'cache_bytes'
+    ].some(key => coverage[key] !== undefined);
+    if (!recognized) return null;
+    const totalImages = finderCorpusCount(coverage.total_images);
+    const cachedImages = finderCorpusCount(coverage.cached_images);
+    const missingImages = coverage.missing_images === undefined
+      ? Math.max(0, totalImages - cachedImages)
+      : finderCorpusCount(coverage.missing_images);
+    const derivedPercent = totalImages
+      ? (Math.min(totalImages, cachedImages) / totalImages) * 100
+      : 0;
+    return {
+      modelKey: String(coverage.model_key || ''),
+      totalImages,
+      cachedImages,
+      missingImages,
+      percent: finderCorpusPercent(coverage.percent, derivedPercent),
+      cacheEntries: finderCorpusCount(coverage.cache_entries),
+      cacheBytes: finderCorpusCount(coverage.cache_bytes)
+    };
+  }
+
+  function normalizeFinderJoytagIndexJob(item) {
+    const job = item?.job && typeof item.job === 'object' ? item.job : item;
+    if (!job || typeof job !== 'object' || Array.isArray(job)) return null;
+    const status = String(job.status || '').trim().toLowerCase();
+    if (!status) return null;
+    const errors = Array.isArray(job.errors)
+      ? job.errors.map(value => (
+          typeof value === 'string'
+            ? value
+            : value && typeof value === 'object'
+              ? String(value.error || value.message || value.detail || '')
+              : ''
+        )).filter(Boolean)
+      : [];
+    return {
+      id: String(job.id || ''),
+      status,
+      modelKey: String(job.model_key || ''),
+      totalImages: finderCorpusCount(job.total_images),
+      cachedImagesAtStart: finderCorpusCount(job.cached_images_at_start),
+      processedImages: finderCorpusCount(job.processed_images),
+      indexedImages: finderCorpusCount(job.indexed_images),
+      failedImages: finderCorpusCount(job.failed_images),
+      remainingImages: finderCorpusCount(job.remaining_images),
+      progress: finderCorpusPercent(job.progress),
+      cancelRequested: Boolean(job.cancel_requested),
+      error: String(job.error || ''),
+      errors,
+      createdAt: String(job.created_at || ''),
+      updatedAt: String(job.updated_at || ''),
+      finishedAt: String(job.finished_at || '')
+    };
+  }
+
+  function finderJoytagIndexIsActive(job = state.finderCorpus?.joytagIndexJob) {
+    return Boolean(job && ['queued', 'running', 'canceling'].includes(job.status));
+  }
+
   function normalizeFinderCorpus(item) {
     if (!item || typeof item !== 'object') return null;
     const wrapped = item.corpus && typeof item.corpus === 'object'
@@ -2146,7 +2231,8 @@
         : item.finder?.corpus && typeof item.finder.corpus === 'object' ? item.finder.corpus : item;
     const recognized = [
       'galleries', 'gallery_count', 'images', 'image_count', 'complete',
-      'partial', 'ready', 'cache_entries', 'cache_bytes', 'storage_bytes'
+      'partial', 'ready', 'cache_entries', 'cache_bytes', 'storage_bytes',
+      'joytag', 'joytag_index_job'
     ].some(key => wrapped[key] !== undefined);
     if (!recognized) return null;
     const galleries = finderCorpusCount(wrapped.galleries, wrapped.gallery_count, wrapped.indexed_galleries);
@@ -2163,7 +2249,9 @@
       cacheEntries: finderCorpusCount(wrapped.cache_entries, wrapped.cached_images, wrapped.entries),
       cacheBytes: finderCorpusCount(wrapped.cache_bytes, wrapped.storage_bytes, wrapped.size_bytes, wrapped.bytes),
       maxCacheEntries: finderCorpusCount(wrapped.max_cache_entries, wrapped.cache_entry_limit, wrapped.max_entries),
-      maxCacheBytes: finderCorpusCount(wrapped.max_cache_bytes, wrapped.cache_byte_limit, wrapped.max_bytes)
+      maxCacheBytes: finderCorpusCount(wrapped.max_cache_bytes, wrapped.cache_byte_limit, wrapped.max_bytes),
+      joytag: normalizeFinderJoytagCoverage(wrapped.joytag),
+      joytagIndexJob: normalizeFinderJoytagIndexJob(wrapped.joytag_index_job)
     };
   }
 
@@ -2947,6 +3035,7 @@
     $('p', welcome).textContent = joytag
       ? 'Analyze a reference folder, require one or more signals, and optionally exclude common false-positive tags.'
       : 'Select an examples folder and pose tag. High-precision pose matches rank ahead of visual fallbacks, and every review decision is remembered.';
+    renderFinderCorpus();
   }
 
   function setFinderMode(value, { persist = true } = {}) {
@@ -3512,9 +3601,138 @@
     $('#finder-model-state').textContent = model?.error ? 'Retry available' : model?.modelReady ? 'Ready' : model?.ready ? 'Available' : model ? model.status.replaceAll('_', ' ') : 'Offline';
   }
 
+  function renderFinderJoytagIndex() {
+    const panel = $('#finder-corpus-joytag');
+    const joytagMode = finderConfigUsesJoyTag();
+    panel.hidden = !joytagMode;
+    if (!joytagMode) return;
+    const coverage = state.finderCorpus?.joytag || null;
+    const savedJob = state.finderCorpus?.joytagIndexJob || null;
+    const active = finderJoytagIndexIsActive(savedJob);
+    const job = active
+      || !savedJob?.modelKey
+      || !coverage?.modelKey
+      || savedJob.modelKey === coverage.modelKey
+      ? savedJob
+      : null;
+    const complete = Boolean(
+      coverage
+      && coverage.totalImages > 0
+      && coverage.missingImages === 0
+    );
+    const failed = Boolean(
+      job
+      && ['failed', 'completed_with_errors'].includes(job.status)
+    );
+    panel.classList.toggle('is-running', active);
+    panel.classList.toggle('is-complete', complete);
+    panel.classList.toggle('is-failed', failed);
+    panel.setAttribute('aria-busy', String(active || state.finderJoytagIndexBusy));
+    $('#finder-corpus-joytag-cached').textContent = coverage
+      ? formatNumber(coverage.cachedImages)
+      : '—';
+    $('#finder-corpus-joytag-total').textContent = coverage
+      ? formatNumber(coverage.totalImages)
+      : '—';
+
+    const progress = active
+      ? finderCorpusPercent(job?.progress)
+      : finderCorpusPercent(coverage?.percent);
+    const progressElement = $('#finder-corpus-index-progress');
+    progressElement.setAttribute('aria-valuenow', String(progress));
+    progressElement.setAttribute(
+      'aria-valuetext',
+      active && job
+        ? `${formatNumber(job.processedImages)} processed, ${formatNumber(job.indexedImages)} indexed, ${formatNumber(job.failedImages)} failed`
+        : coverage
+          ? `${formatNumber(coverage.cachedImages)} of ${formatNumber(coverage.totalImages)} local images cached`
+          : 'JoyTag local coverage unavailable'
+    );
+    $('#finder-corpus-index-progress-bar').style.width = `${progress}%`;
+
+    const stateLabel = state.finderJoytagIndexSupported === false
+      ? 'Unavailable'
+      : active
+        ? job.status === 'queued'
+          ? 'Queued'
+          : job.status === 'canceling' || job.cancelRequested ? 'Canceling' : 'Indexing'
+        : job?.status === 'completed_with_errors'
+          ? 'Completed with errors'
+          : job?.status === 'canceled'
+            ? 'Canceled'
+            : job?.status === 'failed'
+              ? 'Failed'
+              : complete
+                ? 'Complete'
+                : coverage
+                  ? coverage.totalImages
+                    ? coverage.cachedImages ? 'Partial' : 'Not indexed'
+                    : 'Empty'
+                  : 'Checking';
+    $('#finder-corpus-joytag-state').textContent = stateLabel;
+
+    const progressCopy = $('#finder-corpus-index-progress-copy');
+    if (active && job) {
+      progressCopy.textContent = job.status === 'queued'
+        ? `Waiting to index ${formatNumber(job.remainingImages)} uncached local images.`
+        : `${formatNumber(job.processedImages)} processed · ${formatNumber(job.indexedImages)} cached · ${formatNumber(job.failedImages)} failed · ${formatNumber(job.remainingImages)} remaining`;
+    } else if (!coverage) {
+      progressCopy.textContent = state.finderJoytagIndexSupported === false
+        ? 'This server does not expose explicit JoyTag corpus indexing.'
+        : 'Checking cached image coverage…';
+    } else if (!coverage.totalImages) {
+      progressCopy.textContent = 'The Local Gallery Index does not contain any images yet.';
+    } else if (complete) {
+      progressCopy.textContent = `All ${formatNumber(coverage.totalImages)} local images are cached for this JoyTag model.`;
+    } else if (job?.status === 'canceled') {
+      progressCopy.textContent = `Indexing stopped safely. ${formatNumber(coverage.missingImages)} local images remain uncached.`;
+    } else if (job?.status === 'failed') {
+      progressCopy.textContent = `Indexing stopped after ${formatNumber(job.processedImages)} images. ${formatNumber(coverage.missingImages)} remain uncached.`;
+    } else {
+      progressCopy.textContent = `${formatNumber(coverage.cachedImages)} cached · ${formatNumber(coverage.missingImages)} uncached local images can be indexed.`;
+    }
+
+    const start = $('#finder-corpus-index-start');
+    const cancel = $('#finder-corpus-index-cancel');
+    start.hidden = active;
+    cancel.hidden = !active;
+    start.disabled = state.finderJoytagIndexBusy
+      || state.finderJoytagIndexSupported === false
+      || !coverage
+      || coverage.missingImages === 0
+      || state.finderStatus?.joytagAvailable === false;
+    $('span', start).textContent = complete
+      ? 'Local corpus indexed'
+      : coverage?.cachedImages
+        ? `Index ${formatNumber(coverage.missingImages)} remaining`
+        : 'Index local corpus';
+    start.title = state.finderJoytagIndexSupported === false
+      ? 'Explicit JoyTag indexing is unavailable on this server'
+      : state.finderStatus?.joytagAvailable === false
+        ? state.finderStatus?.joytagError || 'JoyTag is unavailable'
+        : !coverage
+          ? 'Waiting for local corpus coverage'
+          : !coverage.totalImages
+            ? 'Add galleries to the Local Gallery Index first'
+            : complete ? 'Every local image is already cached for this JoyTag model' : '';
+    cancel.disabled = state.finderJoytagIndexBusy
+      || Boolean(job?.cancelRequested)
+      || job?.status === 'canceling';
+    cancel.title = cancel.disabled && active ? 'Cancellation is already requested' : '';
+
+    const error = $('#finder-corpus-index-error');
+    const errorDetails = job?.error
+      || (job?.errors?.length
+        ? `${job.errors[0]}${job.errors.length > 1 ? ` · ${formatNumber(job.errors.length - 1)} more` : ''}`
+        : '');
+    error.hidden = !failed || !errorDetails;
+    error.textContent = errorDetails;
+  }
+
   function renderFinderCorpus() {
     const card = $('#finder-corpus-card');
     const corpus = state.finderCorpus;
+    renderFinderJoytagIndex();
     card.classList.remove('is-ready', 'is-building', 'is-unavailable');
     const setCopy = (lead, detail) => {
       const copy = $('#finder-corpus-copy');
@@ -3533,7 +3751,9 @@
         state.finderCorpusSupported === false ? 'Index status unavailable.' : 'Saved in /data.',
         state.finderCorpusSupported === false
           ? 'This server does not expose Local Gallery Index statistics.'
-          : 'Every new scan searches all indexed galleries first—not only the selected source—then explores that Source URL for more.'
+          : finderConfigUsesJoyTag()
+            ? 'Tag searches use cached local JoyTag vectors only, skip uncached images, then go directly to the Source URL.'
+            : 'Every new scan searches all indexed galleries first—not only the selected source—then explores that Source URL for more.'
       );
       return;
     }
@@ -3558,9 +3778,11 @@
     $('#finder-corpus-coverage').hidden = !corpus.complete && !corpus.partial;
     setCopy(
       'Saved in /data.',
-      hasIndex
-        ? 'Every new scan searches all indexed galleries first—not only the selected source—then explores that Source URL for more.'
-        : 'Your first scan will build the index; later poses can search it before exploring their Source URL.'
+      finderConfigUsesJoyTag()
+        ? 'Ordinary Tag searches use cached local images only and never fill missing cache entries automatically.'
+        : hasIndex
+          ? 'Every new scan searches all indexed galleries first—not only the selected source—then explores that Source URL for more.'
+          : 'Your first scan will build the index; later poses can search it before exploring their Source URL.'
     );
   }
 
@@ -4158,7 +4380,8 @@
     const canExtend = finderScanCanExtend(scan);
     const canContinue = finderScanCanContinue(scan);
     const atPageCap = finderScanAtPageCap(scan);
-    const finderReady = finderScanUsesJoyTag(scan)
+    const joytagScan = finderScanUsesJoyTag(scan);
+    const finderReady = joytagScan
       ? state.finderStatus?.joytagAvailable !== false
       : Boolean(state.finderStatus?.ready);
     const finderMutationPending = state.finderFeedbackBusy || finderFeedbackIsSaving();
@@ -4192,15 +4415,25 @@
       $('#finder-local-progress-state').textContent = corpusComplete
         ? corpusHadRows ? 'Done' : 'No data'
         : corpusStopped ? 'Incomplete' : corpusPaused ? 'Paused' : 'Searching';
-      $('#finder-local-progress-copy').textContent = corpusComplete
-        ? corpusHadRows
-          ? 'All saved galleries searched before live exploration'
-          : 'No reusable indexed images were available for this scan'
-        : corpusStopped
-          ? 'Local index search stopped before completion'
-          : corpusPaused
-            ? 'Local index search is paused'
-            : 'Searching every indexed gallery—not only this source';
+      $('#finder-local-progress-copy').textContent = joytagScan
+        ? corpusComplete
+          ? corpusHadRows
+            ? 'Cached local JoyTag images searched before source exploration'
+            : 'No cached JoyTag images; uncached local images were skipped'
+          : corpusStopped
+            ? 'Cached local JoyTag search stopped before completion'
+            : corpusPaused
+              ? 'Cached local JoyTag search is paused'
+              : 'Searching cached local JoyTag images; uncached images are skipped'
+        : corpusComplete
+          ? corpusHadRows
+            ? 'All saved galleries searched before live exploration'
+            : 'No reusable indexed images were available for this scan'
+          : corpusStopped
+            ? 'Local index search stopped before completion'
+            : corpusPaused
+              ? 'Local index search is paused'
+              : 'Searching every indexed gallery—not only this source';
     }
     if (canExtend) {
       updateFinderExtendSummary({ commit: true });
@@ -4218,7 +4451,9 @@
       && scan.pagesScanned === 0;
     $('#finder-progress-wrap').classList.toggle('is-source-exhausted', sourceExhausted);
     $('#finder-source-progress-copy').textContent = waitingForCorpus
-      ? 'Starts after the Local Gallery Index search'
+      ? joytagScan
+        ? 'Starts immediately after the cached local JoyTag search'
+        : 'Starts after the Local Gallery Index search'
       : sourceExhausted
         ? 'The selected Source URL has no more pages'
         : `Exploring ${displayHost(scan.sourceUrl)} for new galleries`;
@@ -4667,6 +4902,163 @@
     }
   }
 
+  function applyFinderJoytagIndexPayload(payload) {
+    if (!payload || typeof payload !== 'object') return false;
+    const coverage = normalizeFinderJoytagCoverage(payload.coverage);
+    const hasJob = Object.prototype.hasOwnProperty.call(payload, 'job');
+    const job = hasJob ? normalizeFinderJoytagIndexJob(payload.job) : null;
+    if (!coverage && !hasJob) return false;
+    const previousJob = state.finderCorpus?.joytagIndexJob || null;
+    const previousActive = finderJoytagIndexIsActive(previousJob);
+    state.finderCorpus = {
+      galleries: 0,
+      images: 0,
+      complete: 0,
+      partial: 0,
+      ready: 0,
+      cacheEntries: 0,
+      cacheBytes: 0,
+      maxCacheEntries: 0,
+      maxCacheBytes: 0,
+      ...(state.finderCorpus || {}),
+      joytag: coverage || state.finderCorpus?.joytag || null,
+      joytagIndexJob: hasJob ? job : previousJob
+    };
+    state.finderCorpusSupported = true;
+    state.finderJoytagIndexSupported = true;
+    renderFinderCorpus();
+    scheduleFinderJoytagIndexPoll();
+    if (
+      previousActive
+      && !finderJoytagIndexIsActive(state.finderCorpus.joytagIndexJob)
+    ) {
+      loadFinderCorpus({ quiet: true, force: true });
+    }
+    return true;
+  }
+
+  function scheduleFinderJoytagIndexPoll(delay = 1200) {
+    window.clearTimeout(state.finderJoytagIndexTimer);
+    state.finderJoytagIndexTimer = null;
+    if (!finderJoytagIndexIsActive()) return;
+    state.finderJoytagIndexTimer = window.setTimeout(() => {
+      state.finderJoytagIndexTimer = null;
+      loadFinderJoytagIndex({ quiet: true, force: true });
+    }, delay);
+  }
+
+  async function loadFinderJoytagIndex({ quiet = false, force = false } = {}) {
+    if (!force && state.finderJoytagIndexSupported === false) return;
+    const request = ++state.finderJoytagIndexRequest;
+    try {
+      const data = await api('/api/finder/corpus/joytag-index');
+      if (request !== state.finderJoytagIndexRequest) return;
+      if (!applyFinderJoytagIndexPayload(data)) {
+        throw new ApiError('The server returned invalid JoyTag corpus index status.');
+      }
+    } catch (error) {
+      if (request !== state.finderJoytagIndexRequest) return;
+      if (error.status === 404) {
+        state.finderJoytagIndexSupported = false;
+        window.clearTimeout(state.finderJoytagIndexTimer);
+        state.finderJoytagIndexTimer = null;
+      }
+      renderFinderCorpus();
+      if (!quiet && error.status !== 404) {
+        toast('Could not refresh JoyTag indexing', errorMessage(error), 'error');
+      }
+    }
+  }
+
+  async function startFinderJoytagIndex() {
+    const coverage = state.finderCorpus?.joytag || null;
+    if (
+      !finderConfigUsesJoyTag()
+      || state.finderJoytagIndexBusy
+      || state.finderJoytagIndexSupported === false
+      || finderJoytagIndexIsActive()
+      || !coverage
+      || coverage.missingImages === 0
+      || state.finderStatus?.joytagAvailable === false
+    ) return;
+    const button = $('#finder-corpus-index-start');
+    state.finderJoytagIndexBusy = true;
+    state.finderJoytagIndexRequest += 1;
+    setButtonBusy(button, true, 'Starting…');
+    renderFinderJoytagIndex();
+    try {
+      const data = await api('/api/finder/corpus/joytag-index', {
+        method: 'POST'
+      });
+      if (!applyFinderJoytagIndexPayload(data)) {
+        throw new ApiError('The server did not return JoyTag indexing status.');
+      }
+      const job = state.finderCorpus?.joytagIndexJob;
+      if (finderJoytagIndexIsActive(job)) {
+        toast(
+          'Local JoyTag indexing started',
+          `${formatNumber(job.remainingImages)} uncached local images are queued. Ordinary Tag searches can still use the existing cache.`,
+          'success'
+        );
+        announce('Local JoyTag corpus indexing started.');
+      } else {
+        toast(
+          'Local JoyTag cache is complete',
+          'Every indexed local image is already cached for this JoyTag model.',
+          'success'
+        );
+        loadFinderCorpus({ quiet: true, force: true });
+      }
+    } catch (error) {
+      toast('Could not start JoyTag indexing', errorMessage(error), 'error');
+    } finally {
+      state.finderJoytagIndexBusy = false;
+      setButtonBusy(button, false);
+      renderFinderCorpus();
+      scheduleFinderJoytagIndexPoll();
+    }
+  }
+
+  async function cancelFinderJoytagIndex() {
+    if (state.finderJoytagIndexBusy || !finderJoytagIndexIsActive()) return;
+    const button = $('#finder-corpus-index-cancel');
+    state.finderJoytagIndexBusy = true;
+    state.finderJoytagIndexRequest += 1;
+    setButtonBusy(button, true, 'Canceling…');
+    renderFinderJoytagIndex();
+    try {
+      const data = await api('/api/finder/corpus/joytag-index', {
+        method: 'DELETE'
+      });
+      if (!applyFinderJoytagIndexPayload(data)) {
+        throw new ApiError('The server did not return JoyTag cancellation status.');
+      }
+      const stillActive = finderJoytagIndexIsActive();
+      toast(
+        stillActive ? 'JoyTag indexing is stopping' : 'JoyTag indexing canceled',
+        'Already cached vectors are kept; you can index the remaining images later.',
+        'info'
+      );
+      announce(
+        stillActive
+          ? 'Local JoyTag corpus indexing cancellation requested.'
+          : 'Local JoyTag corpus indexing canceled.'
+      );
+    } catch (error) {
+      if (error.status === 409) {
+        await loadFinderJoytagIndex({ quiet: true, force: true });
+        toast('JoyTag indexing already stopped', 'The latest corpus status has been loaded.', 'info');
+      } else {
+        toast('Could not cancel JoyTag indexing', errorMessage(error), 'error');
+      }
+    } finally {
+      state.finderJoytagIndexBusy = false;
+      setButtonBusy(button, false);
+      renderFinderCorpus();
+      scheduleFinderJoytagIndexPoll();
+    }
+  }
+
   async function loadFinderCorpus({ quiet = false, force = false } = {}) {
     if (!force && state.finderCorpusSupported === false) return;
     try {
@@ -4675,10 +5067,13 @@
       if (!corpus) throw new ApiError('The server returned invalid Local Gallery Index statistics.');
       state.finderCorpus = corpus;
       state.finderCorpusSupported = true;
+      state.finderJoytagIndexSupported = Boolean(corpus.joytag);
       renderFinderCorpus();
+      scheduleFinderJoytagIndexPoll();
     } catch (error) {
       if (error.status === 404) {
         state.finderCorpusSupported = false;
+        state.finderJoytagIndexSupported = false;
         if (!state.finderStatus?.corpus) state.finderCorpus = null;
       }
       renderFinderCorpus();
@@ -4756,12 +5151,17 @@
     if (corpusResult.status === 'fulfilled') {
       state.finderCorpus = normalizeFinderCorpus(corpusResult.value);
       state.finderCorpusSupported = Boolean(state.finderCorpus);
+      state.finderJoytagIndexSupported = state.finderCorpus
+        ? Boolean(state.finderCorpus.joytag)
+        : null;
     } else if (state.finderStatus?.corpus) {
       state.finderCorpus = state.finderStatus.corpus;
       state.finderCorpusSupported = true;
+      state.finderJoytagIndexSupported = Boolean(state.finderCorpus.joytag);
     } else {
       state.finderCorpus = null;
       state.finderCorpusSupported = corpusResult.reason?.status === 404 ? false : null;
+      state.finderJoytagIndexSupported = corpusResult.reason?.status === 404 ? false : null;
     }
     if (tagsResult.status === 'fulfilled') state.finderTags = apiItems(tagsResult.value).map(normalizePoseTag).filter(tag => tag.id !== undefined && tag.label);
     if (scansResult.status === 'fulfilled') state.finderScans = apiItems(scansResult.value, 'scans').map(normalizeFinderScan).filter(scan => scan?.id);
@@ -4775,6 +5175,7 @@
       storage.set('finder-scan', state.finderScanId);
     }
     renderFinderWorkspace();
+    scheduleFinderJoytagIndexPoll();
     state.finderLoading = false;
     syncFinderConfigAvailability();
     if (selected?.id) await loadFinderScan({ quiet: true, applyConfig: !preserveConfig });
@@ -5887,6 +6288,8 @@
     $('#finder-pose-tag').addEventListener('input', () => scheduleFinderFeedbackLoad());
     $('#finder-pose-tag').addEventListener('change', () => loadFinderFeedback({ quiet: true, force: true }));
     $('#finder-feedback-reset').addEventListener('click', resetFinderFeedback);
+    $('#finder-corpus-index-start').addEventListener('click', startFinderJoytagIndex);
+    $('#finder-corpus-index-cancel').addEventListener('click', cancelFinderJoytagIndex);
     $('#finder-min-similarity').addEventListener('input', event => {
       $('#finder-min-output').textContent = Number(event.currentTarget.value).toFixed(2);
     });

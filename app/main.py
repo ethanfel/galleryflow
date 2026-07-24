@@ -485,6 +485,18 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
     async def finder_corpus() -> dict:
         return await asyncio.to_thread(finder.corpus_status)
 
+    @app.get("/api/finder/corpus/joytag-index")
+    async def finder_joytag_index_status() -> dict:
+        return await asyncio.to_thread(finder.joytag_index_status)
+
+    @app.post("/api/finder/corpus/joytag-index", status_code=202)
+    async def start_finder_joytag_index() -> dict:
+        return finder.create_joytag_index_job()
+
+    @app.delete("/api/finder/corpus/joytag-index")
+    async def cancel_finder_joytag_index() -> dict:
+        return finder.cancel_joytag_index_job()
+
     @app.get("/api/finder/feedback/{pose_tag_id}")
     async def finder_feedback(pose_tag_id: int) -> dict:
         return {
