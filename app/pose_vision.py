@@ -466,6 +466,36 @@ class RTMOPoseEstimator:
             raise PoseInferenceError("RTMO-L ONNX inference failed") from exc
         return self._decode_outputs(outputs, transform)
 
+    def infer_many_bytes(
+        self, data_items: Sequence[bytes | bytearray | memoryview]
+    ) -> list[PoseFrame]:
+        """Estimate poses for many images in one dynamic-batch inference."""
+
+        if isinstance(data_items, (bytes, bytearray, memoryview)) or not isinstance(
+            data_items, Sequence
+        ):
+            raise TypeError("data_items must be a sequence of bytes-like images")
+        if not data_items:
+            return []
+
+        tensors: list[np.ndarray] = []
+        transforms: list[_ImageTransform] = []
+        for data in data_items:
+            if not isinstance(data, (bytes, bytearray, memoryview)):
+                raise TypeError("each data_items entry must be bytes-like")
+            image = self._decode_image(data)
+            tensor, transform = self._preprocess(image)
+            tensors.append(tensor[0])
+            transforms.append(transform)
+        batch = np.ascontiguousarray(np.stack(tensors), dtype=np.float32)
+
+        session, input_name = self._get_session()
+        try:
+            outputs = session.run(None, {input_name: batch})
+        except Exception as exc:
+            raise PoseInferenceError("RTMO-L ONNX batch inference failed") from exc
+        return self._decode_many_outputs(outputs, transforms)
+
     async def _download_archive(self, url: str, destination: Path) -> None:
         timeout = httpx.Timeout(connect=30, read=300, write=30, pool=30)
         try:
@@ -749,6 +779,31 @@ class RTMOPoseEstimator:
             model_key=self.model_key,
             provider=self._active_provider,
         )
+
+    def _decode_many_outputs(
+        self,
+        outputs: Sequence[Any],
+        transforms: Sequence[_ImageTransform],
+    ) -> list[PoseFrame]:
+        if len(outputs) < 2:
+            raise PoseInferenceError("RTMO-L returned fewer than two tensors")
+        dets = np.asarray(outputs[0], dtype=np.float32)
+        keypoints = np.asarray(outputs[1], dtype=np.float32)
+        batch_size = len(transforms)
+        if (
+            dets.ndim != 3
+            or dets.shape[0] != batch_size
+            or keypoints.ndim != 4
+            or keypoints.shape[0] != batch_size
+        ):
+            raise PoseInferenceError(
+                "Unexpected RTMO-L batch output shapes: "
+                f"{dets.shape}, {keypoints.shape}"
+            )
+        return [
+            self._decode_outputs((dets[index], keypoints[index]), transform)
+            for index, transform in enumerate(transforms)
+        ]
 
     @staticmethod
     def _class_agnostic_nms(

@@ -104,6 +104,33 @@ class SpatialFakeEncoder(FakeEncoder):
         return {"global": embeddings, "spatial": embeddings}
 
 
+class BatchSpatialFakeEncoder(SpatialFakeEncoder):
+    def __init__(self) -> None:
+        super().__init__()
+        self.batch_calls: list[tuple[int, bool]] = []
+
+    def describe_many_bytes(
+        self, data_items: list[bytes], *, include_mirror: bool = False
+    ) -> list[dict[str, np.ndarray]]:
+        self.batch_calls.append((len(data_items), include_mirror))
+        return [
+            self.describe_bytes(data, include_mirror=include_mirror)
+            for data in data_items
+        ]
+
+
+class FailingBatchSpatialFakeEncoder(SpatialFakeEncoder):
+    def __init__(self) -> None:
+        super().__init__()
+        self.batch_calls: list[int] = []
+
+    def describe_many_bytes(
+        self, data_items: list[bytes], *, include_mirror: bool = False
+    ) -> list[dict[str, np.ndarray]]:
+        self.batch_calls.append(len(data_items))
+        raise RuntimeError("synthetic batch allocation failure")
+
+
 class FakePoseEstimator:
     model_key = "fake-rtmo-pose-v1"
 
@@ -118,8 +145,7 @@ class FakePoseEstimator:
     def provider_status(self) -> dict[str, object]:
         return {"requested": "cpu", "active": "CPUExecutionProvider"}
 
-    def infer_bytes(self, _: bytes) -> PoseFrame:
-        self.infer_calls += 1
+    def _frame(self) -> PoseFrame:
         keypoints = np.zeros((1, 17, 2), dtype=np.float32)
         keypoints[0, :, 0] = np.linspace(0.25, 0.75, 17)
         keypoints[0, :, 1] = 0.25 + np.sin(np.linspace(0, np.pi, 17)) * 0.5
@@ -132,6 +158,20 @@ class FakePoseEstimator:
             model_key=self.model_key,
             provider="CPUExecutionProvider",
         )
+
+    def infer_bytes(self, _: bytes) -> PoseFrame:
+        self.infer_calls += 1
+        return self._frame()
+
+
+class BatchFakePoseEstimator(FakePoseEstimator):
+    def __init__(self) -> None:
+        super().__init__()
+        self.batch_calls: list[int] = []
+
+    def infer_many_bytes(self, data_items: list[bytes]) -> list[PoseFrame]:
+        self.batch_calls.append(len(data_items))
+        return [self._frame() for _ in data_items]
 
 
 class FakeScraper:
@@ -294,6 +334,112 @@ def pose_first_match(
         "exact_score": exact,
         **diagnostics,
     }
+
+
+@pytest.mark.asyncio
+async def test_finder_batches_reference_and_live_candidate_inference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(finder_module, "validate_public_media_url", lambda value: value)
+    config, database, tag_id = configured(tmp_path)
+    config.finder_inference_batch_size = 3
+    config.finder_network_workers = 1
+    config.finder_request_delay = 0.001
+    for index, color in enumerate(("blue", "lime", "black", "white"), start=2):
+        (config.finder_examples_root / "pose" / f"example-{index}.png").write_bytes(
+            image_bytes(color)
+        )
+    encoder = BatchSpatialFakeEncoder()
+    pose = BatchFakePoseEstimator()
+    service = FinderService(
+        config,
+        database,
+        TopMatchScraper(),
+        EventBroker(),
+        encoder=encoder,
+        pose_estimator=pose,
+        media_fetcher=top_match_media,
+    )
+    await service.start()
+    try:
+        assert service.status()["inference_batch"] == {
+            "configured": 3,
+            "appearance": 3,
+            "pose": 3,
+        }
+        first = service.create_scan(
+            example_directory="pose",
+            pose_tag_id=tag_id,
+            source_url=ROOT,
+            page_limit=1,
+            minimum_score=0,
+        )
+        await asyncio.wait_for(service.queue.join(), 30)
+
+        completed = service.get_scan(first["id"])
+        assert completed and completed["status"] == "completed"
+        # Five references and four candidates use configured groups of three.
+        # Candidate batches remain larger than finder_network_workers=1 even
+        # though request starts are globally staggered.
+        assert encoder.batch_calls == [
+            (3, True),
+            (2, True),
+            (3, False),
+            (1, False),
+        ]
+        assert pose.batch_calls == [3, 2, 3]
+        assert pose.infer_calls == 1
+
+        calls_after_first = list(encoder.batch_calls)
+        second = service.create_scan(
+            example_directory="pose",
+            pose_tag_id=tag_id,
+            source_url=ROOT,
+            page_limit=1,
+            minimum_score=0,
+        )
+        await asyncio.wait_for(service.queue.join(), 30)
+
+        assert service.get_scan(second["id"])["status"] == "completed"
+        assert encoder.batch_calls == calls_after_first
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_finder_batch_failure_falls_back_per_image_and_caches(
+    tmp_path: Path,
+) -> None:
+    config, database, _ = configured(tmp_path)
+    encoder = FailingBatchSpatialFakeEncoder()
+    service = FinderService(
+        config,
+        database,
+        FakeScraper(),
+        EventBroker(),
+        encoder=encoder,
+    )
+    await service.start()
+    try:
+        assert service.status()["inference_batch"]["pose"] is None
+        await service._ensure_encoder_ready()
+        items = [
+            (image_bytes("red"), "sha256:first"),
+            (image_bytes("blue"), "sha256:second"),
+        ]
+        first = await service._describe_many_bytes(items, include_mirror=False)
+
+        assert all(isinstance(item, finder_module._ImageDescriptor) for item in first)
+        assert encoder.batch_calls == [2]
+        assert encoder.describe_calls == 2
+
+        second = await service._describe_many_bytes(items, include_mirror=False)
+
+        assert all(isinstance(item, finder_module._ImageDescriptor) for item in second)
+        assert encoder.batch_calls == [2]
+        assert encoder.describe_calls == 2
+    finally:
+        await service.stop()
 
 
 @pytest.mark.asyncio

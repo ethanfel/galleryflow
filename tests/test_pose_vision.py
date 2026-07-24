@@ -20,6 +20,7 @@ from app.pose_vision import (
     RTMO_L_MODEL_SHA256,
     PoseFrame,
     PoseInferenceError,
+    PoseInvalidImageError,
     PoseModelIntegrityError,
     PoseModelPreparationError,
     RTMOPoseEstimator,
@@ -84,6 +85,32 @@ class FakeSession:
         assert output_names is None
         self.feeds.append(input_feed["input"].copy())
         return [self.dets, self.keypoints]
+
+
+class DynamicBatchSession(FakeSession):
+    """Mimic the pinned model's batch-dynamic input and output axes."""
+
+    def run(
+        self, output_names: list[str] | None, input_feed: dict[str, np.ndarray]
+    ) -> list[np.ndarray]:
+        assert output_names is None
+        batch = np.asarray(input_feed["input"])
+        self.feeds.append(batch.copy())
+        batch_size = batch.shape[0]
+        dets = np.tile(
+            np.asarray([20, 20, 230, 220, 0.9], dtype=np.float32),
+            (batch_size, 1, 1),
+        )
+        keypoints = np.zeros(
+            (batch_size, 1, 17, 3), dtype=np.float32
+        )
+        for joint in range(17):
+            keypoints[:, 0, joint, :] = (
+                50 + joint * 8,
+                40 + joint * 8,
+                0.9,
+            )
+        return [dets, keypoints]
 
 
 def test_official_rtmo_l_artifact_is_fully_pinned() -> None:
@@ -322,6 +349,102 @@ def test_inference_maps_back_to_original_and_filters_unreliable_people(
     assert session.feeds[0][0, 0, 320, 160] < 30
     # Official RTMO parity: portrait padding is to the right, not centered.
     assert np.all(session.feeds[0][0, :, 320, 500] == 114)
+
+
+def test_infer_many_runs_one_dynamic_batch_and_matches_single_results(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "model.onnx"
+    path.write_bytes(b"injected")
+    payloads = [
+        encoded_image((100, 200)),
+        encoded_image((200, 100)),
+        encoded_image((120, 120)),
+    ]
+    batch_session = DynamicBatchSession()
+    estimator = RTMOPoseEstimator(
+        path,
+        available_providers=lambda: ["CPUExecutionProvider"],
+        session_factory=lambda *_: batch_session,
+    )
+
+    frames = estimator.infer_many_bytes(payloads)
+
+    assert len(batch_session.feeds) == 1
+    assert batch_session.feeds[0].shape == (3, 3, 640, 640)
+    assert [frame.image_size for frame in frames] == [
+        (100, 200),
+        (200, 100),
+        (120, 120),
+    ]
+
+    single_session = DynamicBatchSession()
+    single_estimator = RTMOPoseEstimator(
+        path,
+        available_providers=lambda: ["CPUExecutionProvider"],
+        session_factory=lambda *_: single_session,
+    )
+    expected = [single_estimator.infer_bytes(payload) for payload in payloads]
+    for actual, single in zip(frames, expected, strict=True):
+        np.testing.assert_allclose(actual.keypoints, single.keypoints)
+        np.testing.assert_allclose(actual.confidences, single.confidences)
+        np.testing.assert_allclose(actual.boxes, single.boxes)
+        np.testing.assert_allclose(actual.person_scores, single.person_scores)
+        assert actual.image_size == single.image_size
+        assert actual.provider == single.provider
+
+
+def test_infer_many_validates_inputs_before_session_creation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "model.onnx"
+    path.write_bytes(b"injected")
+    session = DynamicBatchSession()
+    factory_calls = 0
+
+    def factory(*_: Any) -> DynamicBatchSession:
+        nonlocal factory_calls
+        factory_calls += 1
+        return session
+
+    estimator = RTMOPoseEstimator(
+        path,
+        available_providers=lambda: ["CPUExecutionProvider"],
+        session_factory=factory,
+    )
+    valid = encoded_image()
+
+    assert estimator.infer_many_bytes([]) == []
+    with pytest.raises(TypeError, match="sequence"):
+        estimator.infer_many_bytes(valid)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="bytes-like"):
+        estimator.infer_many_bytes([valid, object()])  # type: ignore[list-item]
+    with pytest.raises(PoseInvalidImageError):
+        estimator.infer_many_bytes([valid, b"not-an-image"])
+    assert factory_calls == 0
+    assert session.feeds == []
+
+
+def test_infer_many_rejects_wrong_batch_output_size(tmp_path: Path) -> None:
+    class ShortBatchSession(DynamicBatchSession):
+        def run(
+            self,
+            output_names: list[str] | None,
+            input_feed: dict[str, np.ndarray],
+        ) -> list[np.ndarray]:
+            dets, keypoints = super().run(output_names, input_feed)
+            return [dets[:-1], keypoints]
+
+    path = tmp_path / "model.onnx"
+    path.write_bytes(b"injected")
+    estimator = RTMOPoseEstimator(
+        path,
+        available_providers=lambda: ["CPUExecutionProvider"],
+        session_factory=lambda *_: ShortBatchSession(),
+    )
+
+    with pytest.raises(PoseInferenceError, match="batch output shapes"):
+        estimator.infer_many_bytes([encoded_image(), encoded_image()])
 
 
 def test_class_agnostic_nms_removes_duplicate_person_proposals(tmp_path: Path) -> None:

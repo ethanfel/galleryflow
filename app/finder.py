@@ -131,6 +131,11 @@ class FinderService:
         self._client: httpx.AsyncClient | None = None
         self._network_semaphore = asyncio.Semaphore(config.finder_network_workers)
         self._embedding_semaphore = asyncio.Semaphore(1)
+        # A gallery may have hundreds of previews and several galleries can be
+        # explored concurrently. Admit only one bounded group of downloaded
+        # cache misses at a time so batching cannot multiply memory usage by the
+        # number of active galleries.
+        self._inference_batch_gate = asyncio.Semaphore(1)
         self._prepare_lock = asyncio.Lock()
         self._rate_lock = asyncio.Lock()
         self._next_request_at = 0.0
@@ -882,6 +887,20 @@ class FinderService:
             )
             if value
         ]
+        appearance_batch = (
+            self.config.finder_inference_batch_size
+            if callable(getattr(self.encoder, "describe_many_bytes", None))
+            else 1
+        )
+        pose_batch: int | None
+        if self.pose_estimator is None or (self._pose_error and not self._pose_ready):
+            pose_batch = None
+        else:
+            pose_batch = (
+                self.config.finder_inference_batch_size
+                if callable(getattr(self.pose_estimator, "infer_many_bytes", None))
+                else 1
+            )
         return {
             "available": self._available,
             "model_ready": self._ready,
@@ -908,6 +927,11 @@ class FinderService:
             "queue_depth": self.queue.qsize(),
             "active": sum(counts.get(item, 0) for item in ACTIVE_STATUSES),
             "paused": counts.get("paused", 0),
+            "inference_batch": {
+                "configured": self.config.finder_inference_batch_size,
+                "appearance": appearance_batch,
+                "pose": pose_batch,
+            },
         }
 
     def corpus_status(self) -> dict[str, int]:
@@ -2719,7 +2743,9 @@ class FinderService:
                     return FinderService._normalized_embeddings(value)
         raise ValueError("Vision encoder description has no spatial appearance")
 
-    def _descriptor_metadata(self, data: bytes, descriptor_kind: str) -> dict[str, Any]:
+    def _descriptor_metadata_without_pose(
+        self, data: bytes, descriptor_kind: str
+    ) -> dict[str, Any]:
         metadata: dict[str, Any] = {
             "analyzer_version": ANALYZER_VERSION,
             "descriptor_kind": descriptor_kind,
@@ -2743,15 +2769,59 @@ class FinderService:
                 and 0 <= value < 1 << 64
             ):
                 metadata["phash64"] = f"{value:016x}"
-        if self._pose_ready and self.pose_estimator is not None:
-            try:
-                frame = self.pose_estimator.infer_bytes(data)
-                metadata["pose"] = frame.as_dict()
-                metadata["person_count"] = frame.person_count
-            except Exception as exc:
-                # One difficult image must not make its entire gallery fail.
-                metadata["pose_error"] = str(exc)[:300]
         return metadata
+
+    @staticmethod
+    def _apply_pose_metadata(metadata: dict[str, Any], outcome: Any) -> None:
+        if isinstance(outcome, BaseException):
+            metadata["pose_error"] = str(outcome)[:300]
+            return
+        try:
+            metadata["pose"] = outcome.as_dict()
+            metadata["person_count"] = outcome.person_count
+        except Exception as exc:
+            metadata["pose_error"] = str(exc)[:300]
+
+    def _descriptor_metadata_many(
+        self,
+        data_items: list[bytes],
+        descriptor_kinds: list[str],
+    ) -> list[dict[str, Any]]:
+        if len(data_items) != len(descriptor_kinds):
+            raise ValueError("Finder metadata inputs do not align")
+        metadata = [
+            self._descriptor_metadata_without_pose(data, descriptor_kind)
+            for data, descriptor_kind in zip(data_items, descriptor_kinds, strict=True)
+        ]
+        if not metadata or not self._pose_ready or self.pose_estimator is None:
+            return metadata
+
+        outcomes: list[Any] | None = None
+        infer_many = getattr(self.pose_estimator, "infer_many_bytes", None)
+        if len(data_items) > 1 and callable(infer_many):
+            try:
+                batch_outcomes = list(infer_many(data_items))
+                if len(batch_outcomes) == len(data_items):
+                    outcomes = batch_outcomes
+            except Exception:
+                # A provider can advertise a dynamic input while rejecting a
+                # particular batch at runtime. Preserve the established
+                # per-image behavior rather than losing the whole gallery.
+                outcomes = None
+        if outcomes is None:
+            outcomes = []
+            for data in data_items:
+                try:
+                    outcomes.append(self.pose_estimator.infer_bytes(data))
+                except Exception as exc:
+                    # One difficult image must not make its entire gallery fail.
+                    outcomes.append(exc)
+        for item, outcome in zip(metadata, outcomes, strict=True):
+            self._apply_pose_metadata(item, outcome)
+        return metadata
+
+    def _descriptor_metadata(self, data: bytes, descriptor_kind: str) -> dict[str, Any]:
+        return self._descriptor_metadata_many([data], [descriptor_kind])[0]
 
     def _cache_key(self, source_key: str, include_mirror: bool) -> str:
         raw = f"{self._model_key}\0{int(include_mirror)}\0{source_key}"
@@ -2938,6 +3008,19 @@ class FinderService:
                 removed += len(keys)
         return removed
 
+    def _describe_uncached_one(
+        self,
+        data: bytes,
+        *,
+        include_mirror: bool,
+    ) -> tuple[np.ndarray, str]:
+        describe = getattr(self.encoder, "describe_bytes", None)
+        if callable(describe):
+            value = describe(data, include_mirror=include_mirror)
+            return self._spatial_appearance(value), "spatial"
+        value = self.encoder.embed_bytes(data, include_mirror=include_mirror)
+        return self._normalized_embeddings(value), "legacy-global"
+
     async def _describe_bytes(
         self, data: bytes, source_key: str, *, include_mirror: bool
     ) -> _ImageDescriptor:
@@ -2949,19 +3032,11 @@ class FinderService:
             cached = self._cached_descriptor(source_key, include_mirror)
             if cached is not None:
                 return cached
-            describe = getattr(self.encoder, "describe_bytes", None)
-            if callable(describe):
-                value = await asyncio.to_thread(
-                    describe, data, include_mirror=include_mirror
-                )
-                appearance = self._spatial_appearance(value)
-                descriptor_kind = "spatial"
-            else:
-                value = await asyncio.to_thread(
-                    self.encoder.embed_bytes, data, include_mirror=include_mirror
-                )
-                appearance = self._normalized_embeddings(value)
-                descriptor_kind = "legacy-global"
+            appearance, descriptor_kind = await asyncio.to_thread(
+                self._describe_uncached_one,
+                data,
+                include_mirror=include_mirror,
+            )
             metadata = await asyncio.to_thread(
                 self._descriptor_metadata, data, descriptor_kind
             )
@@ -2971,6 +3046,149 @@ class FinderService:
         if prune_due:
             await asyncio.to_thread(self._prune_embedding_cache)
         return _ImageDescriptor(appearance, metadata)
+
+    async def _describe_many_bytes(
+        self,
+        items: list[tuple[bytes, str]],
+        *,
+        include_mirror: bool,
+    ) -> list[_ImageDescriptor | BaseException]:
+        """Analyze an ordered, bounded group while preserving item-level errors."""
+
+        if not items:
+            return []
+        describe_many = getattr(self.encoder, "describe_many_bytes", None)
+        if not callable(describe_many):
+            outcomes: list[_ImageDescriptor | BaseException] = []
+            for data, source_key in items:
+                try:
+                    outcomes.append(
+                        await self._describe_bytes(
+                            data,
+                            source_key,
+                            include_mirror=include_mirror,
+                        )
+                    )
+                except Exception as exc:
+                    outcomes.append(exc)
+            return outcomes
+
+        outcomes: list[_ImageDescriptor | BaseException | None] = [None] * len(items)
+        pending: list[int] = []
+        for index, (_, source_key) in enumerate(items):
+            cached = self._cached_descriptor(source_key, include_mirror)
+            if cached is not None:
+                outcomes[index] = cached
+            else:
+                pending.append(index)
+        if not pending:
+            return [item for item in outcomes if item is not None]
+
+        prune_due = False
+        async with self._embedding_semaphore:
+            uncached: list[int] = []
+            for index in pending:
+                data, source_key = items[index]
+                cached = self._cached_descriptor(source_key, include_mirror)
+                if cached is not None:
+                    outcomes[index] = cached
+                    continue
+                try:
+                    self._validate_image_bytes(data)
+                except Exception as exc:
+                    outcomes[index] = exc
+                    continue
+                uncached.append(index)
+
+            descriptions: list[Any] | None = None
+            if uncached:
+                payloads = [items[index][0] for index in uncached]
+                try:
+                    values = await asyncio.to_thread(
+                        describe_many,
+                        payloads,
+                        include_mirror=include_mirror,
+                    )
+                    descriptions = list(values)
+                    if len(descriptions) != len(payloads):
+                        descriptions = None
+                except Exception:
+                    descriptions = None
+
+                # A batch can fail because of one image, a transient allocation,
+                # or a provider that reported a capability it cannot execute.
+                # Retry item-by-item to retain the pre-batching failure boundary.
+                if descriptions is None:
+                    descriptions = []
+                    for data in payloads:
+                        try:
+                            description = await asyncio.to_thread(
+                                self._describe_uncached_one,
+                                data,
+                                include_mirror=include_mirror,
+                            )
+                        except Exception as exc:
+                            descriptions.append(exc)
+                        else:
+                            descriptions.append(description)
+
+                valid_indices: list[int] = []
+                appearances: list[np.ndarray] = []
+                descriptor_kinds: list[str] = []
+                for index, description in zip(uncached, descriptions, strict=True):
+                    if isinstance(description, BaseException):
+                        outcomes[index] = description
+                        continue
+                    try:
+                        if (
+                            isinstance(description, tuple)
+                            and len(description) == 2
+                            and isinstance(description[1], str)
+                        ):
+                            appearance = self._normalized_embeddings(description[0])
+                            descriptor_kind = description[1]
+                        else:
+                            appearance = self._spatial_appearance(description)
+                            descriptor_kind = "spatial"
+                    except Exception as exc:
+                        outcomes[index] = exc
+                        continue
+                    valid_indices.append(index)
+                    appearances.append(appearance)
+                    descriptor_kinds.append(descriptor_kind)
+
+                if valid_indices:
+                    metadata_items = await asyncio.to_thread(
+                        self._descriptor_metadata_many,
+                        [items[index][0] for index in valid_indices],
+                        descriptor_kinds,
+                    )
+                    for index, appearance, metadata in zip(
+                        valid_indices,
+                        appearances,
+                        metadata_items,
+                        strict=True,
+                    ):
+                        _, source_key = items[index]
+                        prune_due = (
+                            self._store_embedding(
+                                source_key,
+                                include_mirror,
+                                appearance,
+                                metadata=metadata,
+                            )
+                            or prune_due
+                        )
+                        outcomes[index] = _ImageDescriptor(appearance, metadata)
+
+        if prune_due:
+            await asyncio.to_thread(self._prune_embedding_cache)
+        return [
+            item
+            if item is not None
+            else RuntimeError("Finder batch produced no descriptor")
+            for item in outcomes
+        ]
 
     async def _embed_bytes(
         self, data: bytes, source_key: str, *, include_mirror: bool
@@ -3052,6 +3270,88 @@ class FinderService:
             return cached
         data = await self._fetch_media(canonical, referer)
         return await self._describe_bytes(data, source_key, include_mirror=False)
+
+    async def _remote_descriptors(
+        self,
+        requests: list[tuple[str, str]],
+        *,
+        scan_id: str | None = None,
+    ) -> list[_ImageDescriptor | BaseException]:
+        """Fetch and analyze cache misses as one bounded inference group."""
+
+        if not requests:
+            return []
+        if len(requests) > self.config.finder_inference_batch_size:
+            raise ValueError("Finder inference group exceeds the configured batch size")
+        resolved = [(canonicalize_url(url), referer) for url, referer in requests]
+        outcomes: list[_ImageDescriptor | BaseException | None] = [None] * len(resolved)
+        missing: dict[str, tuple[str, str, list[int]]] = {}
+        for index, (canonical, referer) in enumerate(resolved):
+            source_key = self._remote_source_key(canonical)
+            cached = self._cached_descriptor(source_key, False)
+            if cached is not None:
+                outcomes[index] = cached
+                continue
+            entry = missing.get(source_key)
+            if entry is None:
+                missing[source_key] = (canonical, referer, [index])
+            else:
+                entry[2].append(index)
+        if not missing:
+            return [item for item in outcomes if item is not None]
+
+        async with self._inference_batch_gate:
+            if scan_id is not None:
+                self._check_control(scan_id)
+            fetches: list[tuple[str, str, str, list[int]]] = []
+            for source_key, (canonical, referer, indices) in missing.items():
+                cached = self._cached_descriptor(source_key, False)
+                if cached is not None:
+                    for index in indices:
+                        outcomes[index] = cached
+                else:
+                    fetches.append((source_key, canonical, referer, indices))
+
+            fetched: list[Any] = []
+            if fetches:
+                fetched = list(
+                    await asyncio.gather(
+                        *(
+                            self._fetch_media(canonical, referer)
+                            for _, canonical, referer, _ in fetches
+                        ),
+                        return_exceptions=True,
+                    )
+                )
+                if scan_id is not None:
+                    self._check_control(scan_id)
+
+            describe_items: list[tuple[bytes, str]] = []
+            describe_fetches: list[tuple[str, str, str, list[int]]] = []
+            for fetch, result in zip(fetches, fetched, strict=True):
+                source_key, _, _, indices = fetch
+                if isinstance(result, BaseException):
+                    for index in indices:
+                        outcomes[index] = result
+                    continue
+                describe_items.append((result, source_key))
+                describe_fetches.append(fetch)
+            described = await self._describe_many_bytes(
+                describe_items,
+                include_mirror=False,
+            )
+            if scan_id is not None:
+                self._check_control(scan_id)
+            for fetch, result in zip(describe_fetches, described, strict=True):
+                for index in fetch[3]:
+                    outcomes[index] = result
+
+        return [
+            item
+            if item is not None
+            else RuntimeError("Finder batch produced no remote descriptor")
+            for item in outcomes
+        ]
 
     async def _remote_embedding(self, url: str, referer: str) -> np.ndarray:
         descriptor = await self._remote_descriptor(url, referer)
@@ -3148,39 +3448,63 @@ class FinderService:
             self._update_scan(
                 scan["id"], reference_fingerprint=fingerprint_value, status="preparing"
             )
-        for path, relative, digest in manifest:
-            self._check_control(scan["id"])
-            data = await asyncio.to_thread(self._read_example_file, path)
-            if hashlib.sha256(data).hexdigest() != digest:
-                raise FinderConflict("Example images changed while preparing the scan")
-            descriptor = await self._describe_bytes(
-                data, f"sha256:{digest}", include_mirror=True
-            )
-            with self._lock, self.database.connect() as db:
-                for mirror_index, vector in enumerate(descriptor.appearance):
-                    metadata = {
-                        **descriptor.metadata,
-                        "view_index": mirror_index,
-                        "mirrored": bool(mirror_index),
-                    }
-                    db.execute(
-                        """INSERT INTO finder_scan_references(
-                               scan_id, example_key, mirror_index, embedding,
-                               dimensions, metadata_json
-                           ) VALUES (?, ?, ?, ?, ?, ?)
-                           ON CONFLICT(scan_id, example_key, mirror_index) DO UPDATE SET
-                               embedding = excluded.embedding,
-                               dimensions = excluded.dimensions,
-                               metadata_json = excluded.metadata_json""",
-                        (
-                            scan["id"],
-                            f"{relative}:{digest}",
-                            mirror_index,
-                            vector.astype("<f4", copy=False).tobytes(),
-                            int(vector.shape[0]),
-                            json.dumps(metadata, separators=(",", ":"), sort_keys=True),
-                        ),
-                    )
+        reference_batch_size = (
+            self.config.finder_inference_batch_size
+            if callable(getattr(self.encoder, "describe_many_bytes", None))
+            else 1
+        )
+        for start in range(0, len(manifest), reference_batch_size):
+            async with self._inference_batch_gate:
+                prepared: list[tuple[str, str, bytes]] = []
+                for path, relative, digest in manifest[
+                    start : start + reference_batch_size
+                ]:
+                    self._check_control(scan["id"])
+                    data = await asyncio.to_thread(self._read_example_file, path)
+                    if hashlib.sha256(data).hexdigest() != digest:
+                        raise FinderConflict(
+                            "Example images changed while preparing the scan"
+                        )
+                    prepared.append((relative, digest, data))
+                described = await self._describe_many_bytes(
+                    [(data, f"sha256:{digest}") for _, digest, data in prepared],
+                    include_mirror=True,
+                )
+                for (relative, digest, _), outcome in zip(
+                    prepared, described, strict=True
+                ):
+                    if isinstance(outcome, BaseException):
+                        raise outcome
+                    with self._lock, self.database.connect() as db:
+                        for mirror_index, vector in enumerate(outcome.appearance):
+                            metadata = {
+                                **outcome.metadata,
+                                "view_index": mirror_index,
+                                "mirrored": bool(mirror_index),
+                            }
+                            db.execute(
+                                """INSERT INTO finder_scan_references(
+                                       scan_id, example_key, mirror_index, embedding,
+                                       dimensions, metadata_json
+                                   ) VALUES (?, ?, ?, ?, ?, ?)
+                                   ON CONFLICT(scan_id, example_key, mirror_index)
+                                   DO UPDATE SET
+                                       embedding = excluded.embedding,
+                                       dimensions = excluded.dimensions,
+                                       metadata_json = excluded.metadata_json""",
+                                (
+                                    scan["id"],
+                                    f"{relative}:{digest}",
+                                    mirror_index,
+                                    vector.astype("<f4", copy=False).tobytes(),
+                                    int(vector.shape[0]),
+                                    json.dumps(
+                                        metadata,
+                                        separators=(",", ":"),
+                                        sort_keys=True,
+                                    ),
+                                ),
+                            )
         references = self._load_scan_references(scan["id"])
         self._update_scan(
             scan["id"],
@@ -4270,18 +4594,12 @@ class FinderService:
                 images,
             )
 
-            async def score_image(image: dict) -> dict[str, Any] | None:
-                self._check_control(scan["id"])
+            def score_candidate(
+                image: dict,
+                candidate: _ImageDescriptor,
+            ) -> dict[str, Any]:
                 preview = str(image.get("preview_remote_url") or "")
                 original = str(image.get("url") or "")
-                await asyncio.to_thread(validate_public_media_url, preview)
-                await asyncio.to_thread(validate_public_media_url, original)
-                try:
-                    candidate = await self._remote_descriptor(preview, gallery_url)
-                except (_FinderPaused, _FinderCanceled):
-                    raise
-                except Exception:
-                    return None
                 vector = candidate.appearance[0]
                 raw_score = float(np.max(references @ vector))
                 spatial = candidate.metadata.get("descriptor_kind") == "spatial"
@@ -4322,22 +4640,66 @@ class FinderService:
                     **pose,
                 }
 
-            scored: list[dict[str, Any]] = []
-            batch_size = self.config.finder_network_workers
-            for start in range(0, len(images), batch_size):
+            async def score_image(image: dict) -> dict[str, Any] | None:
                 self._check_control(scan["id"])
-                outcomes = await asyncio.gather(
-                    *(
-                        score_image(image)
-                        for image in images[start : start + batch_size]
-                    ),
-                    return_exceptions=True,
-                )
-                for outcome in outcomes:
-                    if isinstance(outcome, (_FinderPaused, _FinderCanceled)):
-                        raise outcome
-                    if isinstance(outcome, dict):
-                        scored.append(outcome)
+                preview = str(image.get("preview_remote_url") or "")
+                original = str(image.get("url") or "")
+                await asyncio.to_thread(validate_public_media_url, preview)
+                await asyncio.to_thread(validate_public_media_url, original)
+                try:
+                    candidate = await self._remote_descriptor(preview, gallery_url)
+                except (_FinderPaused, _FinderCanceled):
+                    raise
+                except Exception:
+                    return None
+                return score_candidate(image, candidate)
+
+            scored: list[dict[str, Any]] = []
+            if callable(getattr(self.encoder, "describe_many_bytes", None)):
+                batch_size = self.config.finder_inference_batch_size
+                for start in range(0, len(images), batch_size):
+                    self._check_control(scan["id"])
+                    batch: list[dict] = []
+                    requests: list[tuple[str, str]] = []
+                    for image in images[start : start + batch_size]:
+                        preview = str(image.get("preview_remote_url") or "")
+                        original = str(image.get("url") or "")
+                        try:
+                            await asyncio.to_thread(validate_public_media_url, preview)
+                            await asyncio.to_thread(validate_public_media_url, original)
+                        except Exception:
+                            continue
+                        batch.append(image)
+                        requests.append((preview, gallery_url))
+                    outcomes = await self._remote_descriptors(
+                        requests,
+                        scan_id=scan["id"],
+                    )
+                    for image, outcome in zip(batch, outcomes, strict=True):
+                        if isinstance(outcome, (_FinderPaused, _FinderCanceled)):
+                            raise outcome
+                        if isinstance(outcome, BaseException):
+                            continue
+                        try:
+                            scored.append(score_candidate(image, outcome))
+                        except Exception:
+                            continue
+            else:
+                batch_size = self.config.finder_network_workers
+                for start in range(0, len(images), batch_size):
+                    self._check_control(scan["id"])
+                    outcomes = await asyncio.gather(
+                        *(
+                            score_image(image)
+                            for image in images[start : start + batch_size]
+                        ),
+                        return_exceptions=True,
+                    )
+                    for outcome in outcomes:
+                        if isinstance(outcome, (_FinderPaused, _FinderCanceled)):
+                            raise outcome
+                        if isinstance(outcome, dict):
+                            scored.append(outcome)
             if not scored:
                 raise ValueError("No gallery preview image could be scored")
             top_matches = self._normalized_top_matches(

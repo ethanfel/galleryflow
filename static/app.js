@@ -2201,6 +2201,19 @@
     };
   }
 
+  function normalizeFinderInferenceBatch(item) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+    const normalizeSize = value => Number.isSafeInteger(value) && value >= 0
+      ? Math.max(1, value)
+      : null;
+    const normalized = {
+      configured: normalizeSize(item.configured),
+      appearance: normalizeSize(item.appearance),
+      pose: normalizeSize(item.pose)
+    };
+    return Object.values(normalized).some(value => value !== null) ? normalized : null;
+  }
+
   function normalizeFinderStatus(item) {
     const data = item?.finder || item || {};
     const model = data.model && typeof data.model === 'object' ? data.model : {};
@@ -2239,7 +2252,8 @@
       detail: details.join(' · ') || (modelReady ? 'Ready to compare images' : ready ? 'Model downloads automatically on the first scan' : 'Model unavailable'),
       defaultSourceUrl: String(data.default_source_url || data.source_url || ''),
       folderRoot: String(data.folder_root || model.folder_root || ''),
-      corpus: normalizeFinderCorpus(data.corpus || model.corpus)
+      corpus: normalizeFinderCorpus(data.corpus || model.corpus),
+      inferenceBatch: normalizeFinderInferenceBatch(data.inference_batch ?? model.inference_batch)
     };
   }
 
@@ -2785,7 +2799,30 @@
     card.classList.toggle('is-ready', Boolean(model?.ready && !model.error));
     card.classList.toggle('is-error', Boolean(model && (!model.ready || model.error)));
     $('#finder-model-name').textContent = model?.name || 'Model unavailable';
-    $('#finder-model-detail').textContent = model?.detail || 'Could not read model status';
+    const appearanceBatch = model?.inferenceBatch?.appearance;
+    const poseBatch = model?.inferenceBatch?.pose;
+    const hasAppearanceBatch = Number.isSafeInteger(appearanceBatch);
+    const hasPoseBatch = Number.isSafeInteger(poseBatch);
+    let batchDetail = '';
+    if (hasAppearanceBatch && hasPoseBatch) {
+      batchDetail = appearanceBatch === poseBatch
+        ? appearanceBatch > 1
+          ? `Vision batches up to ${appearanceBatch} images`
+          : 'Single-image inference'
+        : `Appearance batches up to ${appearanceBatch} · Pose batches up to ${poseBatch}`;
+    } else if (hasAppearanceBatch) {
+      batchDetail = appearanceBatch > 1
+        ? `Appearance batches up to ${appearanceBatch} images`
+        : 'Appearance uses single-image inference';
+    } else if (hasPoseBatch) {
+      batchDetail = poseBatch > 1
+        ? `Pose batches up to ${poseBatch} images`
+        : 'Pose uses single-image inference';
+    }
+    $('#finder-model-detail').textContent = [
+      model?.detail || 'Could not read model status',
+      batchDetail
+    ].filter(Boolean).join(' · ');
     $('#finder-model-state').textContent = model?.error ? 'Retry available' : model?.modelReady ? 'Ready' : model?.ready ? 'Available' : model ? model.status.replaceAll('_', ' ') : 'Offline';
     const root = model?.folderRoot;
     const normalizedRoot = root ? root.replace(/\/+$/, '') || '/' : '';

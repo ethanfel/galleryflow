@@ -92,6 +92,13 @@ class AppConfig:
     finder_network_workers: int = max(
         1, min(8, int(os.getenv("PORNPIC_WEBUI_FINDER_NETWORK_WORKERS", "3")))
     )
+    finder_inference_batch_size: int = max(
+        1,
+        min(
+            64,
+            int(os.getenv("PORNPIC_WEBUI_FINDER_INFERENCE_BATCH_SIZE", "8")),
+        ),
+    )
     finder_request_delay: float = max(
         0.0, float(os.getenv("PORNPIC_WEBUI_FINDER_REQUEST_DELAY", "0.15"))
     )
@@ -141,6 +148,9 @@ class AppConfig:
     sqlite_vfs: str | None = field(default_factory=_sqlite_vfs)
 
     def __post_init__(self) -> None:
+        self.finder_inference_batch_size = max(
+            1, min(64, int(self.finder_inference_batch_size))
+        )
         if self.finder_execution_provider not in {"auto", "cuda", "cpu"}:
             raise ValueError(
                 "PORNPIC_WEBUI_FINDER_EXECUTION_PROVIDER must be auto, cuda, or cpu"

@@ -84,6 +84,47 @@ class SpatialFakeSession(FakeSession):
         return [output]
 
 
+class ContentSpatialFakeSession(FakeSession):
+    """Return descriptors determined by pixels, not batch position."""
+
+    def run(
+        self, output_names: list[str] | None, input_feed: dict[str, np.ndarray]
+    ) -> list[np.ndarray]:
+        assert output_names is None
+        batch = np.asarray(input_feed[self.input_name])
+        self.batches.append(batch.copy())
+        rows = batch.shape[2] // 14
+        columns = batch.shape[3] // 14
+        output = np.zeros(
+            (
+                batch.shape[0],
+                rows * columns + 1,
+                DINOV2_EMBEDDING_DIMENSION,
+            ),
+            dtype=np.float32,
+        )
+        summaries = batch.mean(axis=(2, 3), dtype=np.float32)
+        for view in range(batch.shape[0]):
+            output[view, 0, :4] = (
+                3.0,
+                summaries[view, 0] + 3.0,
+                summaries[view, 1] + 3.0,
+                summaries[view, 2] + 3.0,
+            )
+            for row in range(rows):
+                for column in range(columns):
+                    token = 1 + row * columns + column
+                    output[view, token, :6] = (
+                        2.0,
+                        (row + 1) / rows,
+                        (column + 1) / columns,
+                        summaries[view, 0] + 3.0,
+                        summaries[view, 1] + 3.0,
+                        summaries[view, 2] + 3.0,
+                    )
+        return [output]
+
+
 def image_bytes(
     size: tuple[int, int],
     *,
@@ -322,6 +363,105 @@ def test_describe_builds_versioned_spatial_pyramid_in_one_inference(
     assert not np.allclose(
         description.spatial_embeddings[0], description.spatial_embeddings[1]
     )
+
+
+def test_describe_many_groups_shapes_preserves_order_and_matches_single(
+    tmp_path: Path,
+) -> None:
+    payloads = [
+        image_bytes((80, 160), color=(220, 20, 30)),
+        image_bytes((180, 90), color=(20, 210, 40)),
+        image_bytes((70, 140), color=(30, 50, 230)),
+        image_bytes((100, 100), color=(180, 90, 20)),
+    ]
+    batch_root = tmp_path / "batch"
+    batch_root.mkdir()
+    batch_session = ContentSpatialFakeSession()
+    encoder, _, _ = encoder_with_fake_session(
+        batch_root, session=batch_session
+    )
+
+    descriptions = encoder.describe_many_bytes(payloads, include_mirror=True)
+
+    assert [batch.shape for batch in batch_session.batches] == [
+        (4, 3, 336, 224),
+        (2, 3, 224, 336),
+        (2, 3, 280, 280),
+    ]
+    assert len(descriptions) == len(payloads)
+    assert all(
+        description.global_embeddings.shape == (2, DINOV2_EMBEDDING_DIMENSION)
+        and description.spatial_embeddings.shape
+        == (2, DINOV2_SPATIAL_DIMENSION)
+        for description in descriptions
+    )
+
+    single_root = tmp_path / "single"
+    single_root.mkdir()
+    single_encoder, _, _ = encoder_with_fake_session(
+        single_root, session=ContentSpatialFakeSession()
+    )
+    expected = [
+        single_encoder.describe_bytes(payload, include_mirror=True)
+        for payload in payloads
+    ]
+    for actual, single in zip(descriptions, expected, strict=True):
+        np.testing.assert_allclose(
+            actual.global_embeddings, single.global_embeddings
+        )
+        np.testing.assert_allclose(
+            actual.spatial_embeddings, single.spatial_embeddings
+        )
+        assert actual.global_embeddings.flags.c_contiguous
+        assert actual.spatial_embeddings.flags.c_contiguous
+    assert not np.allclose(
+        descriptions[0].global_embeddings,
+        descriptions[2].global_embeddings,
+    )
+
+
+def test_describe_many_validates_all_images_before_inference(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "validation"
+    root.mkdir()
+    encoder, session, calls = encoder_with_fake_session(
+        root, session=ContentSpatialFakeSession()
+    )
+    valid = image_bytes((80, 160))
+
+    assert encoder.describe_many_bytes([]) == []
+    assert calls == []
+    with pytest.raises(TypeError, match="sequence"):
+        encoder.describe_many_bytes(valid)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="bytes-like"):
+        encoder.describe_many_bytes([valid, object()])  # type: ignore[list-item]
+    with pytest.raises(InvalidImageError):
+        encoder.describe_many_bytes([valid, b"not-an-image"])
+    assert session.batches == []
+    assert calls == []
+
+
+def test_describe_many_rejects_wrong_batch_output_size(tmp_path: Path) -> None:
+    class ShortBatchSession(ContentSpatialFakeSession):
+        def run(
+            self,
+            output_names: list[str] | None,
+            input_feed: dict[str, np.ndarray],
+        ) -> list[np.ndarray]:
+            output = super().run(output_names, input_feed)[0]
+            return [output[:-1]]
+
+    root = tmp_path / "wrong-batch"
+    root.mkdir()
+    encoder, _, _ = encoder_with_fake_session(
+        root, session=ShortBatchSession()
+    )
+
+    with pytest.raises(VisionInferenceError, match="output shape"):
+        encoder.describe_many_bytes(
+            [image_bytes((80, 160)), image_bytes((90, 180))]
+        )
 
 
 def test_embed_spatial_bytes_uses_region_order_and_normalization(

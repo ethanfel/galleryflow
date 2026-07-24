@@ -201,6 +201,8 @@ Open **Finder**, type or paste the path of any example folder inside the configu
 
 Finder opens every listed gallery and compares every preview image against all examples, including mirrored examples. It ranks evidence in four fixed tiers: exact source-image match, reliable RTMO pose match, DINOv2 visual-layout fallback when pose detection is uncertain, then reliable pose mismatch. A higher tier always ranks before a lower tier, regardless of its numeric score. Within the reliable pose tiers, the displayed score is joint geometry; within the fallback tier, it is DINOv2 layout similarity. The minimum score filter is applied inside each evidence tier.
 
+New reference and preview analyses are submitted to the vision models in batches of 8 by default. Set `PORNPIC_WEBUI_FINDER_INFERENCE_BATCH_SIZE=1` to disable inference batching, or raise it up to 64 when the GPU has enough memory; larger CUDA batches use more GPU memory. Descriptor cache hits bypass model inference entirely. `PORNPIC_WEBUI_FINDER_NETWORK_WORKERS` is separate and controls concurrent preview downloads, not the inference batch size.
+
 A gallery is flagged when its strongest image crosses the threshold, and its three strongest images are retained using the same tier-first order. Each result labels the evidence tier and shows visual-layout, pose, and exact-match diagnostics, detected person count, and a skeleton overlay when pose output is reliable. Scores are calibrated ranking signals, not statistical probabilities, and images within a gallery are never averaged together.
 
 Results remain ordinary galleries. Pending and **Maybe** results open with the scanner suggestions highlighted in Pose dataset mode. Accepted and rejected results open in **Finder review**, where the saved feedback subset can be edited against the complete gallery. Accepted results also provide **Prepare controls & targets**, which carries the selected targets and pose tag into Pose dataset mode without assigning anything automatically. You can then find the related solo, couple, or group control in the same gallery and explicitly apply or export the pair. Check one thumbnail and press **Set solo control**, **Set couple control**, or **Set group control** to assign it directly; the full-size viewer is optional. Accepting, rejecting, or marking a Finder result Maybe never downloads, globally ignores, or silently tags a gallery.
@@ -236,6 +238,7 @@ Environment variables:
 | `PORNPIC_WEBUI_FINDER_POSE_ENABLED` | `true` | Enable RTMO pose diagnostics and geometry scoring |
 | `PORNPIC_WEBUI_FINDER_WORKERS` | `1` | Concurrent background Finder scans (maximum 2) |
 | `PORNPIC_WEBUI_FINDER_NETWORK_WORKERS` | `3` | Concurrent Finder preview requests (maximum 8) |
+| `PORNPIC_WEBUI_FINDER_INFERENCE_BATCH_SIZE` | `8` | Maximum new Finder images submitted together to batch-capable vision models (maximum 64) |
 | `PORNPIC_WEBUI_FINDER_REQUEST_DELAY` | `0.15` | Minimum delay between Finder network requests in seconds |
 | `PORNPIC_WEBUI_FINDER_MAX_EXAMPLES` | `500` | Maximum reference images in one example folder |
 | `PORNPIC_WEBUI_FINDER_MAX_GALLERY_IMAGES` | `2000` | Maximum images scored in one source gallery |

@@ -193,6 +193,11 @@ def build_visual_app(
             "model_name": "RTMO-L + visual verifier",
             "device": "CUDA",
             "folder_root": "/library",
+            "inference_batch": {
+                "configured": 8,
+                "appearance": 8,
+                "pose": 8,
+            },
         }
 
     async def fake_finder_corpus(**kwargs: object) -> dict:

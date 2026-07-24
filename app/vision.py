@@ -9,7 +9,7 @@ import re
 import threading
 import uuid
 import warnings
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -382,6 +382,64 @@ class DinoV2Encoder:
             spatial_embeddings=self._spatial_embeddings(hidden_state, patch_grid),
         )
 
+    def describe_many_bytes(
+        self,
+        data_items: Sequence[bytes | bytearray | memoryview],
+        *,
+        include_mirror: bool = False,
+    ) -> list[DinoV2Description]:
+        """Describe images in shape-compatible ONNX batches.
+
+        Portrait, landscape, and square canvases have different tensor shapes,
+        so each shape is submitted as one independent batch. Results retain the
+        caller's image order, and each item has the same view ordering and array
+        shapes as :meth:`describe_bytes`.
+        """
+
+        if isinstance(data_items, (bytes, bytearray, memoryview)) or not isinstance(
+            data_items, Sequence
+        ):
+            raise TypeError("data_items must be a sequence of bytes-like images")
+        if not data_items:
+            return []
+
+        grouped: dict[tuple[int, int, int], list[tuple[int, np.ndarray]]] = {}
+        for index, data in enumerate(data_items):
+            image = self._decode_image(data)
+            tensor = self._preprocess_image(image)
+            grouped.setdefault(tuple(tensor.shape), []).append((index, tensor))
+
+        descriptions: list[DinoV2Description | None] = [None] * len(data_items)
+        views_per_image = 2 if include_mirror else 1
+        for entries in grouped.values():
+            views: list[np.ndarray] = []
+            for _, tensor in entries:
+                views.append(tensor)
+                if include_mirror:
+                    views.append(np.ascontiguousarray(tensor[:, :, ::-1]))
+            batch = np.ascontiguousarray(np.stack(views), dtype=np.float32)
+            hidden_state, patch_grid = self._run_hidden_state_batch(batch)
+            global_embeddings = self._class_embeddings(hidden_state)
+            spatial_embeddings = self._spatial_embeddings(hidden_state, patch_grid)
+
+            for group_index, (original_index, _) in enumerate(entries):
+                start = group_index * views_per_image
+                stop = start + views_per_image
+                descriptions[original_index] = DinoV2Description(
+                    global_embeddings=np.ascontiguousarray(
+                        global_embeddings[start:stop]
+                    ),
+                    spatial_embeddings=np.ascontiguousarray(
+                        spatial_embeddings[start:stop]
+                    ),
+                )
+
+        if any(description is None for description in descriptions):
+            raise VisionInferenceError("DINOv2 batch result ordering failed")
+        return [
+            description for description in descriptions if description is not None
+        ]
+
     def provider_status(self) -> dict[str, Any]:
         """Describe the requested and currently active ONNX providers."""
 
@@ -412,6 +470,12 @@ class DinoV2Encoder:
         if include_mirror:
             views.append(np.ascontiguousarray(tensor[:, :, ::-1]))
         batch = np.ascontiguousarray(np.stack(views), dtype=np.float32)
+        return self._run_hidden_state_batch(batch)
+
+    def _run_hidden_state_batch(
+        self, batch: np.ndarray
+    ) -> tuple[np.ndarray, tuple[int, int]]:
+        """Run and validate one shape-compatible view batch."""
 
         session, input_name = self._get_session()
         try:
