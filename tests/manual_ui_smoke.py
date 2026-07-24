@@ -40,6 +40,7 @@ def build_visual_app(
     finder_continue: bool = False,
     finder_pagination: bool = False,
     finder_tag: bool = False,
+    finder_retry: bool = False,
     finder_modal_review: bool = False,
 ):
     finder_source_exhausted = finder_exhausted or finder_continue
@@ -229,6 +230,7 @@ def build_visual_app(
     }
     finder_race_state = {"review": "pending", "results_calls": 0, "selected": []}
     finder_continue_state = {"scan_calls": 0, "continue_calls": 0}
+    finder_retry_state = {"retry_calls": 0}
     finder_tag_state: dict[str, object] = {"created": False, "payload": None}
     finder_tag_index_state = {
         "status": "idle",
@@ -250,6 +252,31 @@ def build_visual_app(
     }
     if finder_race:
         finder_scan["status"] = "running"
+    if finder_retry:
+        finder_scan.update(
+            {
+                "status": "failed",
+                "search_mode": "joytag",
+                "joytag_tag": "1girl",
+                "joytag_required_tags": ["1girl", "pov"],
+                "joytag_excluded_tags": ["solo"],
+                "reference_fingerprint": "b" * 64,
+                "ranking_version": "joytag-v1",
+                "source_url": "https://www.pornpics.com/?q=pov+footjob",
+                "next_url": "https://www.pornpics.com/?q=pov+footjob",
+                "page_limit": 50,
+                "pages_completed": 0,
+                "processed_galleries": 0,
+                "processed_images": 0,
+                "corpus_search_complete": True,
+                "corpus_galleries_scored": 7,
+                "corpus_images_scored": 124,
+                "candidate_count": 124,
+                "minimum_score": 0.4,
+                "progress_percent": 0,
+                "error": "Could not reach PornPics: temporary upstream failure",
+            }
+        )
     if finder_modal_review:
         finder_scan["status"] = "running"
         finder_scan["candidate_count"] = 3
@@ -549,6 +576,32 @@ def build_visual_app(
             }
         )
         return {"scan": finder_scan}
+
+    async def fake_finder_retry(scan_id: str, **kwargs: object) -> dict:
+        if scan_id != finder_scan["id"] or finder_scan["status"] != "failed":
+            raise HTTPException(
+                status_code=409,
+                detail="Only the failed visual Finder scan can be retried",
+            )
+        finder_retry_state["retry_calls"] += 1
+        finder_scan.update(
+            {
+                "status": "queued",
+                "error": "",
+                "progress_percent": 0,
+            }
+        )
+        return {"scan": dict(finder_scan)}
+
+    async def fake_finder_retry_state() -> dict:
+        return {
+            "retry_calls": finder_retry_state["retry_calls"],
+            "scan_id": finder_scan["id"],
+            "source_url": finder_scan["source_url"],
+            "next_url": finder_scan["next_url"],
+            "candidate_count": finder_scan["candidate_count"],
+            "corpus_search_complete": finder_scan["corpus_search_complete"],
+        }
 
     def finder_modal_review_result(result_id: str) -> dict:
         result_number = int(result_id.rsplit("-", 1)[-1])
@@ -1174,6 +1227,87 @@ def build_visual_app(
             script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const modal=document.querySelector('#gallery-modal');const button=document.querySelector('[data-gallery-mode=pose]');const image=document.querySelector('.image-option:not(.skeleton-image)');if(modal?.open&&button&&image){button.click();clearInterval(poll)}},50)});"
         if open_finder and not finder_tag:
             script += "localStorage.setItem('galleryflow:finder-scan', JSON.stringify('visual-finder'));window.addEventListener('load',()=>{const poll=setInterval(()=>{const button=document.querySelector('.finder-overlay-toggle:not([hidden])');if(button){button.click();clearInterval(poll)}},50)});"
+        if finder_retry:
+            script += """
+window.addEventListener('load', () => {
+  let phase = 'failed';
+  let statePending = false;
+  const poll = setInterval(() => {
+    document.documentElement.dataset.finderRetryPhase = phase;
+    const button = document.querySelector('#finder-resume');
+    const session = document.querySelector('#finder-session-label')?.textContent || '';
+    const error = document.querySelector('#finder-scan-error');
+    const candidates = document.querySelector('#finder-candidates-found')?.textContent || '';
+    const localState = document.querySelector('#finder-local-progress-state')?.textContent || '';
+    const cards = document.querySelectorAll('#finder-result-grid .finder-card').length;
+    document.documentElement.dataset.finderRetryDebug = [
+      button?.hidden,
+      button?.disabled,
+      button?.textContent?.trim(),
+      session,
+      error?.hidden,
+      candidates,
+      localState,
+      cards,
+    ].join('|');
+    if (
+      phase === 'failed'
+      && button
+      && !button.hidden
+      && !button.disabled
+      && button.textContent.includes('Retry search')
+      && session.includes('JoyTag')
+      && session.includes('failed')
+      && error
+      && !error.hidden
+      && error.textContent.includes('Could not reach PornPics')
+      && candidates === '124'
+      && localState === 'Done'
+      && cards > 0
+    ) {
+      button.click();
+      phase = 'retried';
+      return;
+    }
+    if (
+      phase === 'retried'
+      && button?.hidden
+      && session.includes('queued')
+      && error?.hidden
+      && candidates === '124'
+      && localState === 'Done'
+      && cards > 0
+      && !statePending
+    ) {
+      statePending = true;
+      fetch('/manual/finder-retry/state')
+        .then(response => response.json())
+        .then(data => {
+          const passed = data.retry_calls === 1
+            && data.scan_id === 'visual-finder'
+            && data.source_url === 'https://www.pornpics.com/?q=pov+footjob'
+            && data.next_url === data.source_url
+            && data.candidate_count === 124
+            && data.corpus_search_complete === true;
+          document.documentElement.dataset.finderRetry = passed ? 'pass' : 'fail';
+          phase = passed ? 'complete' : 'state-invalid';
+          clearInterval(poll);
+        })
+        .catch(() => {
+          document.documentElement.dataset.finderRetry = 'fail';
+          phase = 'state-failed';
+          clearInterval(poll);
+        });
+    }
+  }, 50);
+  setTimeout(() => {
+    if (!document.documentElement.dataset.finderRetry) {
+      document.documentElement.dataset.finderRetry = 'fail';
+      clearInterval(poll);
+    }
+  }, 5500);
+});
+"""
         if finder_tag:
             script += """
 localStorage.setItem('galleryflow:finder-mode', JSON.stringify('joytag'));
@@ -2379,6 +2513,12 @@ window.addEventListener('load', () => {
             route.endpoint = fake_finder_continue
             route.dependant.call = fake_finder_continue
         elif (
+            finder_retry
+            and getattr(route, "path", None) == "/api/finder/scans/{scan_id}/retry"
+        ):
+            route.endpoint = fake_finder_retry
+            route.dependant.call = fake_finder_retry
+        elif (
             open_finder
             and getattr(route, "path", None) == "/api/finder/scans/{scan_id}/results"
         ):
@@ -2428,6 +2568,12 @@ window.addEventListener('load', () => {
             fake_finder_joytag_index_cancel,
             methods=["DELETE"],
         )
+    if finder_retry:
+        app.add_api_route(
+            "/manual/finder-retry/state",
+            fake_finder_retry_state,
+            methods=["GET"],
+        )
     if finder_modal_review:
         app.add_api_route(
             "/manual/finder-modal-review/boundary",
@@ -2470,6 +2616,7 @@ def main() -> None:
     parser.add_argument("--finder-continue", action="store_true")
     parser.add_argument("--finder-pagination", action="store_true")
     parser.add_argument("--finder-tag", action="store_true")
+    parser.add_argument("--finder-retry", action="store_true")
     parser.add_argument("--finder-modal-review", action="store_true")
     args = parser.parse_args()
     finder_mode = (
@@ -2483,6 +2630,7 @@ def main() -> None:
         or args.finder_continue
         or args.finder_pagination
         or args.finder_tag
+        or args.finder_retry
         or args.finder_modal_review
     )
     suffix = (
@@ -2494,6 +2642,10 @@ def main() -> None:
         if args.finder_tag and args.mobile
         else "finder-tag"
         if args.finder_tag
+        else "finder-retry-mobile"
+        if args.finder_retry and args.mobile
+        else "finder-retry"
+        if args.finder_retry
         else "finder-pagination"
         if args.finder_pagination
         else "finder-continue-mobile"
@@ -2573,6 +2725,7 @@ def main() -> None:
                     finder_continue=args.finder_continue,
                     finder_pagination=args.finder_pagination,
                     finder_tag=args.finder_tag,
+                    finder_retry=args.finder_retry,
                     finder_modal_review=args.finder_modal_review,
                 ),
                 host="127.0.0.1",
@@ -2605,7 +2758,7 @@ def main() -> None:
             "--disable-sync",
             "--force-prefers-reduced-motion",
             "--no-first-run",
-            f"--virtual-time-budget={18000 if args.finder_modal_review else 8500 if args.finder_tag else 7500 if args.finder_unusable_save or args.finder_continue else 6500 if args.finder_direct_assign else 4500 if args.finder_race else 4000 if args.finder_pose_flow else 3000 if args.lightbox or args.pose else 2000 if finder_mode else 1000}",
+            f"--virtual-time-budget={18000 if args.finder_modal_review else 8500 if args.finder_tag else 7500 if args.finder_unusable_save or args.finder_continue else 6500 if args.finder_direct_assign else 6000 if args.finder_retry else 4500 if args.finder_race else 4000 if args.finder_pose_flow else 3000 if args.lightbox or args.pose else 2000 if finder_mode else 1000}",
             f"--user-data-dir={Path(directory) / 'chrome-profile'}",
             f"--window-size={viewport}",
             f"--screenshot={output}",
@@ -2618,6 +2771,7 @@ def main() -> None:
             or args.finder_continue
             or args.finder_pagination
             or args.finder_tag
+            or args.finder_retry
             or args.finder_modal_review
         ):
             command.insert(1, "--dump-dom")
@@ -2632,6 +2786,7 @@ def main() -> None:
                 or args.finder_continue
                 or args.finder_pagination
                 or args.finder_tag
+                or args.finder_retry
                 or args.finder_modal_review
             ),
             text=(
@@ -2641,6 +2796,7 @@ def main() -> None:
                 or args.finder_continue
                 or args.finder_pagination
                 or args.finder_tag
+                or args.finder_retry
                 or args.finder_modal_review
             ),
         )
@@ -2684,6 +2840,17 @@ def main() -> None:
             raise AssertionError(
                 "Tag Finder corpus indexing, analysis, scan payload, or result "
                 f"rendering failed (phase={phase or 'unknown'}, debug={debug or 'none'})"
+            )
+        if args.finder_retry and 'data-finder-retry="pass"' not in completed.stdout:
+            phase = completed.stdout.partition(
+                'data-finder-retry-phase="'
+            )[2].partition('"')[0]
+            debug = completed.stdout.partition(
+                'data-finder-retry-debug="'
+            )[2].partition('"')[0]
+            raise AssertionError(
+                "failed Finder retry did not preserve its scan, cursor, local "
+                f"candidates, or UI state (phase={phase or 'unknown'}, debug={debug or 'none'})"
             )
         if (
             args.finder_modal_review

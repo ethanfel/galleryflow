@@ -2784,6 +2784,58 @@ class FinderService:
         self._publish(scan, force=True)
         return scan
 
+    def retry(self, scan_id: str) -> dict[str, Any]:
+        """Requeue a failed current-ranking scan from its durable cursor."""
+
+        with self._lock, self.database.connect() as db:
+            row = db.execute(
+                """SELECT status, ranking_version, cancel_requested
+                   FROM finder_scans WHERE id = ?""",
+                (scan_id,),
+            ).fetchone()
+            if not row:
+                raise FinderNotFound("Finder scan not found")
+            if row["status"] != "failed":
+                raise FinderConflict("Only a failed Finder scan can be retried")
+            if row["ranking_version"] not in CURRENT_RANKING_VERSIONS:
+                raise FinderConflict(
+                    "A legacy-ranked Finder scan cannot be retried; start a new scan"
+                )
+            if bool(row["cancel_requested"]):
+                raise FinderConflict("A canceled Finder scan cannot be retried")
+            if (
+                row["ranking_version"] == JOYTAG_RANKING_VERSION
+                and not self._joytag_available
+            ):
+                raise FinderUnavailable(
+                    self._joytag_error
+                    or "Finder tag-search support is unavailable"
+                )
+            if (
+                row["ranking_version"] != JOYTAG_RANKING_VERSION
+                and not self._available
+            ):
+                raise FinderUnavailable(
+                    self._prepare_error or "Finder vision support is unavailable"
+                )
+            updated = db.execute(
+                """UPDATE finder_scans
+                   SET pause_requested = 0, cancel_requested = 0,
+                       status = 'queued', error = '', finished_at = NULL,
+                       updated_at = ?
+                   WHERE id = ? AND status = 'failed'
+                     AND cancel_requested = 0""",
+                (utc_now(), scan_id),
+            )
+            if not updated.rowcount:
+                raise FinderConflict(
+                    "This Finder scan changed before it could be retried"
+                )
+        self.queue.put_nowait(scan_id)
+        scan = self.get_scan(scan_id) or {}
+        self._publish(scan, force=True)
+        return scan
+
     def extend(self, scan_id: str, *, additional_pages: int) -> dict[str, Any]:
         """Extend a scan from its durable pagination cursor.
 

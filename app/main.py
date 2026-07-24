@@ -588,6 +588,10 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
     async def resume_finder_scan(scan_id: str) -> dict:
         return {"scan": finder.resume(scan_id)}
 
+    @app.post("/api/finder/scans/{scan_id}/retry", status_code=202)
+    async def retry_finder_scan(scan_id: str) -> dict:
+        return {"scan": finder.retry(scan_id)}
+
     @app.post("/api/finder/scans/{scan_id}/extend", status_code=202)
     async def extend_finder_scan(scan_id: str, payload: FinderScanExtend) -> dict:
         return {

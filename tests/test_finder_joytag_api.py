@@ -226,3 +226,47 @@ async def test_joytag_corpus_index_api_contract(
     ) as client:
         conflict = await client.delete("/api/finder/corpus/joytag-index")
     assert conflict.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_failed_finder_scan_retry_api_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig(
+        data_dir=tmp_path / "data",
+        download_root=tmp_path / "downloads",
+        sqlite_vfs=None,
+    )
+    app = create_app(config)
+    retried: list[str] = []
+
+    def fake_retry(scan_id: str) -> dict[str, object]:
+        retried.append(scan_id)
+        return {
+            "id": scan_id,
+            "status": "queued",
+            "source_url": "https://www.pornpics.com/",
+            "next_url": "https://www.pornpics.com/",
+            "pages_completed": 0,
+            "candidate_count": 1,
+        }
+
+    monkeypatch.setattr(app.state.finder, "retry", fake_retry)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post("/api/finder/scans/failed-tag-scan/retry")
+
+    assert response.status_code == 202
+    assert response.json()["scan"] == {
+        "id": "failed-tag-scan",
+        "status": "queued",
+        "source_url": "https://www.pornpics.com/",
+        "next_url": "https://www.pornpics.com/",
+        "pages_completed": 0,
+        "candidate_count": 1,
+    }
+    assert retried == ["failed-tag-scan"]

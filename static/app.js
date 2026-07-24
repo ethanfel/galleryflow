@@ -5187,7 +5187,14 @@
     $('#finder-progress-wrap').hidden = !hasScan;
     $('#finder-local-progress').hidden = !hasCorpusProgress;
     $('#finder-pause').hidden = !finderScanIsRunning(scan);
-    $('#finder-resume').hidden = scan?.status !== 'paused' || legacyRanking;
+    const finderRetry = scan?.status === 'failed' && !legacyRanking;
+    const finderResume = scan?.status === 'paused' && !legacyRanking;
+    $('#finder-resume').hidden = !finderRetry && !finderResume;
+    $('span', $('#finder-resume')).textContent = finderRetry ? 'Retry search' : 'Resume';
+    $('use', $('#finder-resume')).setAttribute('href', finderRetry ? '#i-refresh' : '#i-play');
+    $('#finder-resume').title = finderRetry
+      ? 'Retry this scan from its saved source position'
+      : 'Resume this scan from its saved progress';
     $('#finder-cancel').hidden = !hasScan || finderScanIsTerminal(scan) || scan?.status === 'canceling';
     $('#finder-ranking-note').hidden = !legacyRanking;
     ['finder-pause', 'finder-resume', 'finder-cancel'].forEach(id => { $(`#${id}`).disabled = state.finderBusy; });
@@ -6167,18 +6174,35 @@
 
   async function performFinderScanAction(action, button) {
     const scan = state.finderScan;
-    if (!scan?.id || state.finderBusy || !['pause', 'resume'].includes(action)) return;
+    if (!scan?.id || state.finderBusy || !['pause', 'resume', 'retry'].includes(action)) return;
+    const retrying = action === 'retry';
     invalidateFinderScanLoads();
     state.finderBusy = true;
-    setButtonBusy(button, true, action === 'pause' ? 'Pausing…' : 'Resuming…');
+    setButtonBusy(button, true, action === 'pause' ? 'Pausing…' : retrying ? 'Retrying…' : 'Resuming…');
     try {
       const data = await api(`/api/finder/scans/${encodeURIComponent(scan.id)}/${action}`, { method: 'POST' });
       const updated = normalizeFinderScan(data?.scan || data);
-      if (updated?.id) state.finderScan = updated;
-      else await loadFinderScan({ quiet: true });
-      toast(action === 'pause' ? 'Finder paused' : 'Finder resumed', action === 'pause' ? 'Ranked results remain available for review.' : 'The server will continue from its saved progress.', 'info');
+      if (updated?.id) {
+        state.finderScan = updated;
+        const existing = state.finderScans.findIndex(item => String(item.id) === String(updated.id));
+        if (existing >= 0) state.finderScans[existing] = updated;
+        else state.finderScans.unshift(updated);
+      } else await loadFinderScan({ quiet: true });
+      toast(
+        action === 'pause' ? 'Finder paused' : retrying ? 'Finder retry started' : 'Finder resumed',
+        action === 'pause'
+          ? 'Ranked results remain available for review.'
+          : retrying
+            ? 'Retrying the saved source position. Existing candidates and reviews remain in this scan.'
+            : 'The server will continue from its saved progress.',
+        'info'
+      );
     } catch (error) {
-      toast(action === 'pause' ? 'Could not pause Finder' : 'Could not resume Finder', errorMessage(error), 'error');
+      toast(
+        action === 'pause' ? 'Could not pause Finder' : retrying ? 'Could not retry Finder' : 'Could not resume Finder',
+        errorMessage(error),
+        'error'
+      );
     } finally {
       invalidateFinderScanLoads();
       state.finderBusy = false;
@@ -7424,7 +7448,9 @@
     });
     $('#finder-continue-button').addEventListener('click', continueFinderScan);
     $('#finder-pause').addEventListener('click', event => performFinderScanAction('pause', event.currentTarget));
-    $('#finder-resume').addEventListener('click', event => performFinderScanAction('resume', event.currentTarget));
+    $('#finder-resume').addEventListener('click', event => {
+      performFinderScanAction(state.finderScan?.status === 'failed' ? 'retry' : 'resume', event.currentTarget);
+    });
     $('#finder-cancel').addEventListener('click', cancelFinderScan);
     $$('[data-finder-review]').forEach(button => button.addEventListener('click', () => {
       if (button.dataset.finderReview === state.finderReview) return;

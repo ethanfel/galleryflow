@@ -504,6 +504,145 @@ async def test_joytag_local_corpus_is_cache_only_and_explicit_index_reuses_vecto
 
 
 @pytest.mark.asyncio
+async def test_failed_joytag_live_browse_retries_in_place_with_local_results(
+    tmp_path: Path,
+) -> None:
+    config, database, pose_tag_id = configured(tmp_path)
+
+    class FailOnceBrowseScraper:
+        def __init__(self) -> None:
+            self.browse_calls: list[tuple[str, int]] = []
+
+        async def browse(self, **values: object) -> dict:
+            call = (str(values["url"]), int(values["page"]))
+            self.browse_calls.append(call)
+            if len(self.browse_calls) == 1:
+                raise RuntimeError("temporary browse failure")
+            return {"items": [], "next_url": None}
+
+        async def gallery(self, url: str) -> dict:
+            raise AssertionError(f"Retry should not open {url}")
+
+    scraper = FailOnceBrowseScraper()
+    joytag = FakeJoyTag()
+    service = FinderService(
+        config,
+        database,
+        scraper,
+        EventBroker(),
+        encoder=FakeEncoder(),
+        joytagger=joytag,
+        media_fetcher=fake_media,
+    )
+    await service.start()
+    try:
+        seed_corpus_gallery(
+            database,
+            GALLERY,
+            ["https://cdni.pornpics.com/preview/blue.png"],
+            title="Retained local candidate",
+        )
+        service.create_joytag_index_job()
+        await asyncio.wait_for(service.joytag_index_queue.join(), 10)
+        analysis = await service.analyze_reference_directory("one-reference")
+        calls_after_setup = list(joytag.batch_calls)
+
+        scan = service.create_scan(
+            example_directory="one-reference",
+            pose_tag_id=pose_tag_id,
+            source_url=ROOT,
+            page_limit=1,
+            minimum_score=0.7,
+            mode="joytag",
+            joytag_tag="target_tag",
+            reference_fingerprint=analysis["fingerprint"],
+        )
+        await asyncio.wait_for(service.queue.join(), 10)
+        failed = service.get_scan(scan["id"])
+        assert failed["status"] == "failed"
+        assert "temporary browse failure" in failed["error"]
+        assert failed["source_url"] == ROOT
+        assert failed["next_url"] == ROOT
+        assert failed["pages_completed"] == 0
+        assert failed["progress"] == 0.0
+        assert failed["corpus_search_complete"] is True
+        assert failed["corpus_images_scored"] == 1
+        assert failed["corpus_galleries_scored"] == 1
+        assert failed["candidate_count"] == 1
+
+        local_results, total = service.results(
+            scan["id"],
+            review="all",
+            min_score=None,
+            limit=20,
+            offset=0,
+        )
+        assert total == 1
+        local = local_results[0]
+        assert local["gallery_url"] == GALLERY
+        assert local["online_scanned"] is False
+        accepted = service.set_review(scan["id"], local["id"], "accepted")
+        assert accepted["review"] == "accepted"
+
+        retried = service.retry(scan["id"])
+        assert retried["id"] == scan["id"]
+        assert retried["status"] == "queued"
+        assert retried["error"] == ""
+        assert retried["finished_at"] is None
+        assert retried["source_url"] == ROOT
+        assert retried["next_url"] == ROOT
+        assert retried["pages_completed"] == 0
+        assert retried["page_limit"] == 1
+        assert retried["progress"] == 0.0
+        assert retried["corpus_search_complete"] is True
+        assert retried["corpus_images_scored"] == 1
+        assert retried["corpus_galleries_scored"] == 1
+        assert retried["candidate_count"] == 1
+        assert retried["accepted_count"] == 1
+        with pytest.raises(FinderConflict, match="failed Finder scan"):
+            service.retry(scan["id"])
+
+        queued_results, queued_total = service.results(
+            scan["id"],
+            review="all",
+            min_score=None,
+            limit=20,
+            offset=0,
+        )
+        assert queued_total == 1
+        assert queued_results[0]["id"] == local["id"]
+        assert queued_results[0]["review"] == "accepted"
+
+        await asyncio.wait_for(service.queue.join(), 10)
+        completed = service.get_scan(scan["id"])
+        assert completed["id"] == scan["id"]
+        assert completed["status"] == "completed"
+        assert completed["source_url"] == ROOT
+        assert completed["pages_completed"] == 1
+        assert completed["next_url"] is None
+        assert completed["progress"] == 100.0
+        assert completed["corpus_images_scored"] == 1
+        assert completed["corpus_galleries_scored"] == 1
+        assert scraper.browse_calls == [(ROOT, 1), (ROOT, 1)]
+        assert joytag.batch_calls == calls_after_setup
+
+        final_results, final_total = service.results(
+            scan["id"],
+            review="all",
+            min_score=None,
+            limit=20,
+            offset=0,
+        )
+        assert final_total == 1
+        assert final_results[0]["id"] == local["id"]
+        assert final_results[0]["review"] == "accepted"
+        assert final_results[0]["score"] == local["score"]
+        assert final_results[0]["online_scanned"] is False
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
 async def test_joytag_corpus_index_deduplicates_shared_source_keys(
     tmp_path: Path,
 ) -> None:
