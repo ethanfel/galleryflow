@@ -129,8 +129,24 @@ def build_visual_app(
         }
 
     app.state.scraper.browse = fake_browse
+    gallery_detail_calls: dict[str, int] = {}
+    gallery_preview_calls: dict[str, int] = {}
+    gallery_detail_concurrency = {"active": 0, "peak": 0}
+    prefetch_neighbor_urls = {
+        galleries[2]["url"],
+        galleries[4]["url"],
+    }
 
     async def fake_gallery(url: str) -> dict:
+        gallery_detail_calls[url] = gallery_detail_calls.get(url, 0) + 1
+        background_prefetch = finder_modal_review and url in prefetch_neighbor_urls
+        if background_prefetch:
+            gallery_detail_concurrency["active"] += 1
+            gallery_detail_concurrency["peak"] = max(
+                gallery_detail_concurrency["peak"],
+                gallery_detail_concurrency["active"],
+            )
+            await asyncio.sleep(0.04)
         boundary_marker = "/galleries/manual-boundary-"
         if boundary_marker in url:
             boundary_name = url.split(boundary_marker, 1)[1].split("/", 1)[0]
@@ -150,22 +166,30 @@ def build_visual_app(
             gallery = next(
                 (item for item in galleries if item["url"] == url), galleries[0]
             )
-        return {
+        preview_marker = gallery["url"].rstrip("/").rsplit("/", 1)[-1]
+        detail = {
             **gallery,
             "images": [
                 {
                     "url": f"https://cdni.pornpics.com/1280/manual/{index:03d}.jpg",
-                    "preview_remote_url": f"https://cdni.pornpics.com/460/manual/{index:03d}.jpg",
+                    "preview_remote_url": (
+                        "https://cdni.pornpics.com/460/manual/"
+                        f"{preview_marker}/{index:03d}.jpg"
+                    ),
                     "filename": f"manual-{index:03d}.jpg",
                     "ordinal": index,
                 }
                 for index in range(1, 22)
             ],
         }
+        if background_prefetch:
+            gallery_detail_concurrency["active"] -= 1
+        return detail
 
     app.state.scraper.gallery = fake_gallery
 
     async def fake_media(request=None, url: str = "", token: str = "") -> Response:
+        gallery_preview_calls[url] = gallery_preview_calls.get(url, 0) + 1
         if "overlay" in url:
             svg = b"""<svg xmlns='http://www.w3.org/2000/svg' width='800' height='1100'><g fill='none' stroke='#63f2bd' stroke-width='18' stroke-linecap='round' stroke-linejoin='round'><circle cx='400' cy='190' r='58'/><path d='m400 250-20 245m20-180-150 145m150-145 145 110M380 495 245 760m135-265 190 245'/></g><g fill='#ffcf67' stroke='#101017' stroke-width='7'><circle cx='400' cy='250' r='17'/><circle cx='400' cy='315' r='17'/><circle cx='250' cy='460' r='17'/><circle cx='545' cy='425' r='17'/><circle cx='380' cy='495' r='17'/><circle cx='245' cy='760' r='17'/><circle cx='570' cy='740' r='17'/></g></svg>"""
         else:
@@ -1041,6 +1065,33 @@ def build_visual_app(
             )
         }
 
+    async def fake_finder_modal_prefetch_state() -> dict:
+        adjacent = {
+            f"result_{index}": galleries[index + 1]["url"]
+            for index in range(1, 4)
+        }
+        return {
+            "detail_calls": {
+                key: gallery_detail_calls.get(url, 0)
+                for key, url in adjacent.items()
+            },
+            "preview_calls": {
+                key: sum(
+                    count
+                    for url, count in gallery_preview_calls.items()
+                    if url.rstrip("/").rsplit("/", 2)[-2]
+                    == gallery_url.rstrip("/").rsplit("/", 1)[-1]
+                )
+                for key, gallery_url in adjacent.items()
+            },
+            "preview_urls": dict(gallery_preview_calls),
+            "preview_markers": {
+                key: gallery_url.rstrip("/").rsplit("/", 1)[-1]
+                for key, gallery_url in adjacent.items()
+            },
+            "background_detail_peak": gallery_detail_concurrency["peak"],
+        }
+
     async def fake_events(request=None) -> Response:
         return Response(status_code=204)
 
@@ -1380,6 +1431,9 @@ window.addEventListener('load', () => {
 window.addEventListener('load', () => {
   let phase = 'open-first';
   let refreshAt = 0;
+  let prefetchRequestPending = false;
+  let previewBaseline = {};
+  let prefetchDiagnostics = '';
   const optionAt = index =>
     document.querySelectorAll('#image-grid .image-option')[index];
   const optionInput = index => optionAt(index)?.querySelector('input');
@@ -1432,6 +1486,7 @@ window.addEventListener('load', () => {
       document.querySelector('#finder-scan-select')?.disabled,
       document.querySelector('#finder-result-grid')?.getAttribute('aria-busy'),
       document.querySelector('#finder-result-threshold')?.value,
+      prefetchDiagnostics,
     ].join('|');
 
     if (phase === 'open-first') {
@@ -1441,10 +1496,186 @@ window.addEventListener('load', () => {
       if (
         cards.length === 3
         && document.querySelector('#finder-pending-count')?.textContent === '3'
+        && !prefetchRequestPending
       ) {
-        cards[0].querySelector('.finder-open')?.click();
-        setPhase('open-feedback');
+        prefetchRequestPending = true;
+        setPhase('prefetch-snapshotting');
+        fetch('/manual/finder-modal-review/prefetch-state')
+          .then(response => response.json())
+          .then(data => {
+            previewBaseline = { ...(data.preview_urls || {}) };
+            prefetchRequestPending = false;
+            cards[1].querySelector('.finder-open')?.click();
+            setPhase('prefetch-middle');
+          })
+          .catch(() => {
+            prefetchRequestPending = false;
+            setPhase('prefetch-baseline-failed');
+          });
       }
+      return;
+    }
+
+    if (
+      phase === 'prefetch-middle'
+      && modal?.open
+      && title === 'Soft focus summer collection'
+      && position === '2 of 3'
+      && document.querySelector('#image-grid')?.getAttribute('aria-busy')
+        === 'false'
+      && optionAt(20)
+      && !prefetchRequestPending
+    ) {
+      prefetchRequestPending = true;
+      fetch('/manual/finder-modal-review/prefetch-state')
+        .then(response => response.json())
+        .then(data => {
+          prefetchRequestPending = false;
+          const calls = data.detail_calls || {};
+          const previewUrls = data.preview_urls || {};
+          const markers = data.preview_markers || {};
+          const deltasFor = key => Object.entries(previewUrls)
+            .filter(([url]) => url.includes(
+              `/460/manual/${markers[key]}/`
+            ))
+            .map(([url, count]) => ({
+              url,
+              count: Math.max(
+                0,
+                Number(count || 0) - Number(previewBaseline[url] || 0)
+              ),
+            }))
+            .filter(item => item.count > 0);
+          const previousPreviewDeltas = deltasFor('result_1');
+          const nextPreviewDeltas = deltasFor('result_3');
+          const previousPreviewCount = previousPreviewDeltas.reduce(
+            (total, item) => total + item.count,
+            0
+          );
+          const nextPreviewCount = nextPreviewDeltas.reduce(
+            (total, item) => total + item.count,
+            0
+          );
+          const previewCount = previousPreviewCount + nextPreviewCount;
+          const previewsReady = (
+            previousPreviewDeltas.length > 0
+            && nextPreviewDeltas.length > 0
+          );
+          const previewBoundsOk = (
+            previousPreviewDeltas.length <= 3
+            && nextPreviewDeltas.length <= 3
+            && previousPreviewCount <= 3
+            && nextPreviewCount <= 3
+            && previewCount <= 6
+            && [...previousPreviewDeltas, ...nextPreviewDeltas]
+              .every(item => item.count === 1)
+          );
+          const backgroundPeak = Number(data.background_detail_peak || 0);
+          prefetchDiagnostics = [
+            `detail:${calls.result_1}/${calls.result_2}/${calls.result_3}`,
+            `preview:${previousPreviewCount}/${nextPreviewCount}`,
+            `urls:${previousPreviewDeltas.length}/${nextPreviewDeltas.length}`,
+            `peak:${backgroundPeak}`,
+          ].join(',');
+          if (Object.values(calls).some(count => count > 1)) {
+            setPhase('prefetch-detail-duplicated-before-navigation');
+            return;
+          }
+          if (!previewsReady) return;
+          if (!previewBoundsOk) {
+            setPhase('prefetch-preview-bounds-failed');
+            return;
+          }
+          if (backgroundPeak < 1 || backgroundPeak > 2) {
+            setPhase('prefetch-concurrency-bound-failed');
+            return;
+          }
+          if (
+            calls.result_1 === 1
+            && calls.result_2 === 1
+            && calls.result_3 === 1
+          ) {
+            const next = document.querySelector('#gallery-review-next');
+            if (next && !next.disabled) {
+              next.click();
+              setPhase('prefetch-next');
+            }
+          }
+        })
+        .catch(() => {
+          prefetchRequestPending = false;
+          setPhase('prefetch-state-failed');
+        });
+      return;
+    }
+
+    if (
+      phase === 'prefetch-next'
+      && title === 'Classic monochrome session'
+      && position === '3 of 3'
+      && !prefetchRequestPending
+    ) {
+      prefetchRequestPending = true;
+      fetch('/manual/finder-modal-review/prefetch-state')
+        .then(response => response.json())
+        .then(data => {
+          prefetchRequestPending = false;
+          if (data.detail_calls?.result_3 !== 1) {
+            setPhase('prefetch-next-refetched-detail');
+            return;
+          }
+          const previous = document.querySelector('#gallery-review-previous');
+          if (previous && !previous.disabled) {
+            previous.click();
+            setPhase('prefetch-middle-return');
+          }
+        })
+        .catch(() => {
+          prefetchRequestPending = false;
+          setPhase('prefetch-state-failed');
+        });
+      return;
+    }
+
+    if (
+      phase === 'prefetch-middle-return'
+      && title === 'Soft focus summer collection'
+      && position === '2 of 3'
+    ) {
+      const previous = document.querySelector('#gallery-review-previous');
+      if (previous && !previous.disabled) {
+        previous.click();
+        setPhase('prefetch-first');
+      }
+      return;
+    }
+
+    if (
+      phase === 'prefetch-first'
+      && title === 'After-hours city gallery'
+      && position === '1 of 3'
+      && !prefetchRequestPending
+    ) {
+      prefetchRequestPending = true;
+      fetch('/manual/finder-modal-review/prefetch-state')
+        .then(response => response.json())
+        .then(data => {
+          prefetchRequestPending = false;
+          const calls = data.detail_calls || {};
+          if (
+            calls.result_1 === 1
+            && calls.result_2 === 1
+            && calls.result_3 === 1
+          ) {
+            setPhase('open-feedback');
+          } else {
+            setPhase('prefetch-previous-refetched-detail');
+          }
+        })
+        .catch(() => {
+          prefetchRequestPending = false;
+          setPhase('prefetch-state-failed');
+        });
       return;
     }
 
@@ -2036,6 +2267,11 @@ window.addEventListener('load', () => {
         app.add_api_route(
             "/manual/finder-modal-review/state",
             fake_finder_modal_boundary_state,
+            methods=["GET"],
+        )
+        app.add_api_route(
+            "/manual/finder-modal-review/prefetch-state",
+            fake_finder_modal_prefetch_state,
             methods=["GET"],
         )
     return app

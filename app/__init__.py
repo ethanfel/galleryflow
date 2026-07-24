@@ -1,3 +1,3 @@
 """GalleryFlow application package."""
 
-__version__ = "2.13.3"
+__version__ = "2.13.4"

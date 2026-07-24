@@ -26,6 +26,8 @@
     query: '',
     profiles: [],
     activeProfile: storage.get('active-profile', ''),
+    profileChangeRequest: 0,
+    historyRequest: 0,
     historyUrls: new Set(),
     jobs: [],
     jobFilter: 'all',
@@ -36,6 +38,15 @@
     finderFeedbackGallerySaving: false,
     galleryReviewBusy: false,
     galleryDetailRequest: 0,
+    galleryDetailCache: new Map(),
+    galleryDetailPrefetches: new Map(),
+    galleryDetailPrefetchQueue: [],
+    galleryDetailPrefetchQueued: new Map(),
+    galleryDetailPrefetchActive: 0,
+    galleryDetailGlobalRevision: 0,
+    galleryDetailRevisions: new Map(),
+    galleryPreviewWarmups: new Map(),
+    galleryPreviewWarmGeneration: 0,
     galleryNavigationRequest: 0,
     galleryMode: 'download',
     poseSelectedImages: new Set(),
@@ -138,6 +149,11 @@
   const FINDER_RESULTS_PAGE_SIZE = 24;
   const FINDER_JOYTAG_QUERY_LIMIT = 16;
   const FINDER_JOYTAG_CATALOG_RENDER_LIMIT = 80;
+  const GALLERY_DETAIL_CACHE_LIMIT = 8;
+  const GALLERY_DETAIL_CACHE_TTL = 60_000;
+  const GALLERY_DETAIL_PREFETCH_CONCURRENCY = 2;
+  const GALLERY_PREVIEW_WARM_LIMIT = 3;
+  const GALLERY_PREVIEW_CACHE_LIMIT = 24;
   const FINDER_RANKING_VERSION = 'pose-precision-v2';
   const FINDER_JOYTAG_RANKING_VERSION = 'joytag-v1';
   const poseRoleLabel = role => ({ solo: 'Solo', couple: 'Couple', group: 'Group' }[role] || 'Solo');
@@ -246,7 +262,7 @@
     return '';
   }
 
-  function normalizeGallery(item) {
+  function normalizeGallery(item, { useHistory = true } = {}) {
     const gallery = { ...item };
     const serverState = String(item.state || '').toLowerCase();
     gallery.id = item.id ?? item.gallery_id ?? item.url;
@@ -256,7 +272,13 @@
     gallery.imageCount = Number(item.total_images || item.image_count || item.count || (Array.isArray(item.images) ? item.images.length : 0));
     gallery.downloadedImages = Number(item.downloaded_images || 0);
     gallery.serverState = serverState || 'new';
-    gallery.saved = Boolean(item.saved || item.downloaded || serverState === 'complete' || serverState === 'saved' || state.historyUrls.has(normalizeHistoryUrl(gallery.url)));
+    gallery.saved = Boolean(
+      item.saved
+      || item.downloaded
+      || serverState === 'complete'
+      || serverState === 'saved'
+      || (useHistory && state.historyUrls.has(normalizeHistoryUrl(gallery.url)))
+    );
     gallery.partial = Boolean(item.partial || serverState === 'partial' || (gallery.downloadedImages && !gallery.saved));
     gallery.ignored = Boolean(item.ignored || serverState === 'ignored');
     gallery.queued = serverState === 'queued' || state.jobs.some(job => !isTerminalJob(job) && (
@@ -267,7 +289,7 @@
   }
 
   function normalizeDetail(item) {
-    const gallery = normalizeGallery(item || {});
+    const gallery = normalizeGallery(item || {}, { useHistory: false });
     gallery.images = apiItems(item?.images || []).map((image, index) => {
       if (typeof image === 'string') return { url: image, previewUrl: image, fullUrl: image, filename: `Image ${index + 1}` };
       return {
@@ -426,9 +448,13 @@
         const change = JSON.parse(event.data || '{}');
         const gallery = state.galleries.find(item => normalizeHistoryUrl(item.url) === normalizeHistoryUrl(change.url));
         if (gallery && typeof change.ignored === 'boolean') {
+          invalidateGalleryDetailCache(gallery.id);
           gallery.ignored = change.ignored;
           renderGalleries();
-        } else if (state.view === 'discover') loadGalleries({ quiet: true });
+        } else {
+          invalidateGalleryDetailByUrl(change.url);
+          if (state.view === 'discover') loadGalleries({ quiet: true });
+        }
       } catch (_) { /* the next refresh will reconcile state */ }
     });
     const refreshFinderFromEvent = event => {
@@ -517,17 +543,36 @@
     } finally { setButtonBusy(button, false); }
   }
 
+  function commitActiveProfile(name) {
+    const next = String(name || '');
+    if (next === state.activeProfile) return false;
+    state.activeProfile = next;
+    storage.set('active-profile', next);
+    state.profileChangeRequest += 1;
+    state.galleryDetailRequest += 1;
+    invalidateGalleryDetailCache(null, { abortForeground: true });
+    return true;
+  }
+
   async function loadProfiles({ quiet = false } = {}) {
     try {
+      const previousProfile = state.activeProfile;
       const data = await api('/api/profiles');
       state.profiles = apiItems(data, 'profiles').map(normalizeProfile);
       if (state.profiles.length && !state.profiles.some(profile => profile.name === state.activeProfile)) {
-        state.activeProfile = data?.default_profile || state.settings.default_profile || state.profiles[0].name;
-        storage.set('active-profile', state.activeProfile);
+        commitActiveProfile(data?.default_profile || state.settings.default_profile || state.profiles[0].name);
       }
-      if (!state.profiles.length) state.activeProfile = '';
+      if (!state.profiles.length) commitActiveProfile('');
       renderProfileSelectors();
       renderProfiles();
+      if (
+        previousProfile !== state.activeProfile
+        && $('#gallery-modal').open
+        && state.gallery
+      ) {
+        await loadHistory();
+        await refreshOpenGalleryDetail(state.activeProfile);
+      }
     } catch (error) {
       state.profiles = [];
       renderProfileSelectors();
@@ -562,36 +607,60 @@
         return;
       }
     }
-    state.activeProfile = name;
-    storage.set('active-profile', name);
+    commitActiveProfile(name);
+    const profileRequest = state.profileChangeRequest;
     renderProfileSelectors();
     $('#active-profile').value = name;
     $('#modal-profile-select').value = name;
     renderProfiles();
-    if ($('#gallery-modal').open && state.gallery) {
+    const galleryOpen = $('#gallery-modal').open && state.gallery;
+    if (galleryOpen) {
       state.poseLoadedKey = '';
       state.poseDraft = { revision: 0, controls: { solo: '', couple: '', group: '' }, targets: [] };
       state.poseSelectedImages = new Set();
       renderImages();
+    }
+    await loadHistory(name);
+    if (
+      profileRequest !== state.profileChangeRequest
+      || name !== state.activeProfile
+    ) return;
+    if (galleryOpen) {
+      await refreshOpenGalleryDetail(name);
+      if (
+        profileRequest !== state.profileChangeRequest
+        || name !== state.activeProfile
+      ) return;
       if (state.galleryMode === 'pose') loadPoseWorkspace();
     }
     if (reload) {
-      await Promise.all([loadHistory(), loadGalleries({ quiet: true })]);
+      await loadGalleries({ quiet: true });
       toast('Profile changed', `New downloads will be saved to “${name}”.`, 'info');
     }
   }
 
-  async function loadHistory() {
-    if (!state.activeProfile) {
-      state.historyUrls = new Set();
+  async function loadHistory(profile = state.activeProfile) {
+    const requestedProfile = String(profile || '');
+    const historyRequest = ++state.historyRequest;
+    if (!requestedProfile) {
+      if (historyRequest === state.historyRequest && !state.activeProfile) {
+        state.historyUrls = new Set();
+      }
       return;
     }
     try {
-      const data = await api(withParams('/api/history', { profile: state.activeProfile }));
+      const data = await api(withParams('/api/history', { profile: requestedProfile }));
+      if (
+        historyRequest !== state.historyRequest
+        || requestedProfile !== state.activeProfile
+      ) return;
       const entries = apiItems(data, 'downloads');
       state.historyUrls = new Set(entries.map(entry => normalizeHistoryUrl(typeof entry === 'string' ? entry : entry.url || entry.gallery_url)));
     } catch (_) {
-      state.historyUrls = new Set();
+      if (
+        historyRequest === state.historyRequest
+        && requestedProfile === state.activeProfile
+      ) state.historyUrls = new Set();
     }
   }
 
@@ -646,8 +715,7 @@
       if (oldName) {
         await api(`/api/profiles/${encodeURIComponent(oldName)}`, { method: 'PATCH', body: { new_name: name } });
         if (state.activeProfile === oldName) {
-          state.activeProfile = name;
-          storage.set('active-profile', name);
+          commitActiveProfile(name);
         }
         toast('Profile renamed', `“${oldName}” is now “${name}”.`);
       } else {
@@ -655,11 +723,14 @@
         toast('Profile created', `“${name}” is ready for downloads.`);
       }
       if ($('#profile-default').checked || !state.activeProfile) {
-        state.activeProfile = name;
-        storage.set('active-profile', name);
+        commitActiveProfile(name);
       }
       $('#profile-modal').close();
       await loadProfiles();
+      if ($('#gallery-modal').open && state.gallery) {
+        await loadHistory();
+        await refreshOpenGalleryDetail(state.activeProfile);
+      }
     } catch (error) {
       toast(oldName ? 'Could not rename profile' : 'Could not create profile', errorMessage(error), 'error');
     } finally { setButtonBusy(button, false); }
@@ -669,10 +740,13 @@
     if (!window.confirm(`Delete the “${profile.name}” profile? Existing files will not be removed.`)) return;
     try {
       await api(`/api/profiles/${encodeURIComponent(profile.name)}`, { method: 'DELETE' });
-      if (state.activeProfile === profile.name) state.activeProfile = '';
+      if (state.activeProfile === profile.name) commitActiveProfile('');
       toast('Profile deleted', `“${profile.name}” was removed.`, 'info');
       await loadProfiles();
       await Promise.all([loadHistory(), loadGalleries({ quiet: true })]);
+      if ($('#gallery-modal').open && state.gallery) {
+        await refreshOpenGalleryDetail(state.activeProfile);
+      }
     } catch (error) { toast('Could not delete profile', errorMessage(error), 'error'); }
   }
 
@@ -924,6 +998,7 @@
   async function toggleIgnore(gallery, button = null) {
     const nextValue = !gallery.ignored;
     if (button) button.disabled = true;
+    invalidateGalleryDetailCache(gallery.id);
     gallery.ignored = nextValue;
     renderGalleries();
     if (state.gallery && String(state.gallery.id) === String(gallery.id)) {
@@ -1092,6 +1167,410 @@
     return true;
   }
 
+  function galleryDetailCacheKey(id, profile = state.activeProfile) {
+    return JSON.stringify([String(profile || ''), String(id ?? '')]);
+  }
+
+  function cachedGalleryDetail(id, profile = state.activeProfile) {
+    const key = galleryDetailCacheKey(id, profile);
+    const entry = state.galleryDetailCache.get(key);
+    if (!entry) return null;
+    if (Date.now() - entry.cachedAt > GALLERY_DETAIL_CACHE_TTL) {
+      state.galleryDetailCache.delete(key);
+      return null;
+    }
+    state.galleryDetailCache.delete(key);
+    state.galleryDetailCache.set(key, entry);
+    return entry.data;
+  }
+
+  function storeGalleryDetail(id, profile, data) {
+    const key = galleryDetailCacheKey(id, profile);
+    state.galleryDetailCache.delete(key);
+    state.galleryDetailCache.set(key, {
+      id: String(id ?? ''),
+      profile: String(profile || ''),
+      cachedAt: Date.now(),
+      data
+    });
+    while (state.galleryDetailCache.size > GALLERY_DETAIL_CACHE_LIMIT) {
+      state.galleryDetailCache.delete(state.galleryDetailCache.keys().next().value);
+    }
+    return data;
+  }
+
+  function invalidateGalleryDetailCache(id = null, { abortForeground = false } = {}) {
+    const target = id === null || id === undefined ? null : String(id);
+    if (id === null || id === undefined) {
+      state.galleryDetailGlobalRevision += 1;
+      state.galleryDetailCache.clear();
+    } else {
+      state.galleryDetailRevisions.set(
+        target,
+        Number(state.galleryDetailRevisions.get(target) || 0) + 1
+      );
+      [...state.galleryDetailCache.entries()].forEach(([key, entry]) => {
+        if (entry.id === target) state.galleryDetailCache.delete(key);
+      });
+    }
+    [...state.galleryDetailPrefetchQueued.entries()].forEach(([key, task]) => {
+      if (target !== null && task.id !== target) return;
+      task.cancelled = true;
+      state.galleryDetailPrefetchQueued.delete(key);
+      const error = new Error('Gallery detail prefetch invalidated');
+      error.name = 'AbortError';
+      task.reject(error);
+    });
+    state.galleryDetailPrefetches.forEach(entry => {
+      if (
+        (target === null || entry.id === target)
+        && (entry.background || abortForeground)
+      ) entry.controller.abort();
+    });
+    drainGalleryDetailPrefetchQueue();
+  }
+
+  function invalidateGalleryDetailByUrl(url) {
+    const targetUrl = normalizeHistoryUrl(url);
+    if (!targetUrl) return;
+    const ids = new Set();
+    state.galleryDetailCache.forEach(entry => {
+      if (normalizeHistoryUrl(entry.data?.url || entry.data?.gallery_url) === targetUrl) {
+        ids.add(entry.id);
+      }
+    });
+    const current = state.gallery;
+    if (current && normalizeHistoryUrl(current.url) === targetUrl) {
+      ids.add(String(current.id));
+    }
+    ids.forEach(id => invalidateGalleryDetailCache(id));
+  }
+
+  function startGalleryDetailRequest(id, profile, { background = false } = {}) {
+    const key = galleryDetailCacheKey(id, profile);
+    const target = String(id ?? '');
+    const globalRevision = state.galleryDetailGlobalRevision;
+    const detailRevision = Number(state.galleryDetailRevisions.get(target) || 0);
+    const controller = new AbortController();
+    const entry = {
+      id: target,
+      profile: String(profile || ''),
+      controller,
+      background,
+      promise: null
+    };
+    entry.promise = api(
+      withParams(`/api/galleries/${encodeURIComponent(id)}`, { profile }),
+      { signal: controller.signal }
+    )
+      .then(data => {
+        if (controller.signal.aborted) {
+          const error = new Error('Gallery detail request aborted');
+          error.name = 'AbortError';
+          throw error;
+        }
+        if (
+          globalRevision !== state.galleryDetailGlobalRevision
+          || detailRevision !== Number(state.galleryDetailRevisions.get(target) || 0)
+        ) {
+          const error = new Error('Gallery detail changed while loading');
+          error.name = 'StaleGalleryDetailError';
+          throw error;
+        }
+        return storeGalleryDetail(id, profile, data);
+      })
+      .finally(() => {
+        if (state.galleryDetailPrefetches.get(key) === entry) {
+          state.galleryDetailPrefetches.delete(key);
+        }
+      });
+    state.galleryDetailPrefetches.set(key, entry);
+    return entry.promise;
+  }
+
+  function drainGalleryDetailPrefetchQueue() {
+    while (
+      state.galleryDetailPrefetchActive < GALLERY_DETAIL_PREFETCH_CONCURRENCY
+      && state.galleryDetailPrefetchQueue.length
+    ) {
+      const task = state.galleryDetailPrefetchQueue.shift();
+      if (
+        task.cancelled
+        || state.galleryDetailPrefetchQueued.get(task.key) !== task
+      ) continue;
+      state.galleryDetailPrefetchQueued.delete(task.key);
+      state.galleryDetailPrefetchActive += 1;
+      startGalleryDetailRequest(task.id, task.profile, { background: true })
+        .then(task.resolve, task.reject)
+        .finally(() => {
+          state.galleryDetailPrefetchActive = Math.max(
+            0,
+            state.galleryDetailPrefetchActive - 1
+          );
+          drainGalleryDetailPrefetchQueue();
+        });
+    }
+  }
+
+  function queueGalleryDetailPrefetch(id, profile) {
+    const key = galleryDetailCacheKey(id, profile);
+    const existing = state.galleryDetailPrefetchQueued.get(key);
+    if (existing) return existing.promise;
+    let resolve;
+    let reject;
+    const promise = new Promise((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise;
+      reject = rejectPromise;
+    });
+    const task = {
+      key,
+      id: String(id ?? ''),
+      profile: String(profile || ''),
+      promise,
+      resolve,
+      reject,
+      cancelled: false
+    };
+    state.galleryDetailPrefetchQueued.set(key, task);
+    state.galleryDetailPrefetchQueue.push(task);
+    drainGalleryDetailPrefetchQueue();
+    return promise;
+  }
+
+  function retryInvalidatedGalleryDetail(request, id, profile, retryInvalidated) {
+    if (!retryInvalidated) return request;
+    return request.catch(error => {
+      if (error.name !== 'StaleGalleryDetailError') throw error;
+      return loadGalleryDetail(id, profile, {
+        prefetch: false,
+        retryInvalidated: false
+      });
+    });
+  }
+
+  function loadGalleryDetail(
+    id,
+    profile = state.activeProfile,
+    { prefetch = false, retryInvalidated = true } = {}
+  ) {
+    const cached = cachedGalleryDetail(id, profile);
+    if (cached) return Promise.resolve(cached);
+    const key = galleryDetailCacheKey(id, profile);
+    const inFlight = state.galleryDetailPrefetches.get(key);
+    if (inFlight) {
+      if (!prefetch) inFlight.background = false;
+      return prefetch
+        ? inFlight.promise
+        : retryInvalidatedGalleryDetail(
+          inFlight.promise,
+          id,
+          profile,
+          retryInvalidated
+        );
+    }
+    const queued = state.galleryDetailPrefetchQueued.get(key);
+    if (prefetch) return queued?.promise || queueGalleryDetailPrefetch(id, profile);
+    if (queued) {
+      queued.cancelled = true;
+      state.galleryDetailPrefetchQueued.delete(key);
+      const request = startGalleryDetailRequest(id, profile);
+      request.then(queued.resolve, queued.reject);
+      return retryInvalidatedGalleryDetail(
+        request,
+        id,
+        profile,
+        retryInvalidated
+      );
+    }
+    return retryInvalidatedGalleryDetail(
+      startGalleryDetailRequest(id, profile),
+      id,
+      profile,
+      retryInvalidated
+    );
+  }
+
+  function cancelAdjacentGalleryPrefetches({ includeForeground = false } = {}) {
+    state.galleryPreviewWarmGeneration += 1;
+    [...state.galleryDetailPrefetchQueued.values()].forEach(task => {
+      task.cancelled = true;
+      const error = new Error('Adjacent gallery prefetch cancelled');
+      error.name = 'AbortError';
+      task.reject(error);
+    });
+    state.galleryDetailPrefetchQueued.clear();
+    state.galleryDetailPrefetches.forEach(entry => {
+      if (entry.background || includeForeground) entry.controller.abort();
+    });
+    drainGalleryDetailPrefetchQueue();
+  }
+
+  function cancelForegroundGalleryDetailRequests() {
+    state.galleryDetailPrefetches.forEach(entry => {
+      if (!entry.background) entry.controller.abort();
+    });
+  }
+
+  function retainAdjacentGalleryPrefetches(galleryIds, profile) {
+    const desired = new Set(galleryIds.map(id => galleryDetailCacheKey(id, profile)));
+    [...state.galleryDetailPrefetchQueued.entries()].forEach(([key, task]) => {
+      if (desired.has(key)) return;
+      task.cancelled = true;
+      state.galleryDetailPrefetchQueued.delete(key);
+      const error = new Error('Adjacent gallery prefetch superseded');
+      error.name = 'AbortError';
+      task.reject(error);
+    });
+    state.galleryDetailPrefetches.forEach((entry, key) => {
+      if (entry.background && !desired.has(key)) entry.controller.abort();
+    });
+    drainGalleryDetailPrefetchQueue();
+  }
+
+  function warmGalleryPreviews(data, result = null) {
+    if (!data) return;
+    const connection = navigator.connection;
+    if (
+      document.visibilityState !== 'visible'
+      || connection?.saveData
+      || ['slow-2g', '2g'].includes(connection?.effectiveType)
+    ) return;
+    const detail = normalizeDetail(data);
+    const preferredImages = (result?.matches || []).map(match => {
+      const matchUrl = String(match.imageUrl || '');
+      return detail.images.find(image => (
+        matchUrl
+        && [image.url, image.fullUrl, image.previewUrl].includes(matchUrl)
+      ));
+    }).filter(Boolean);
+    const urls = [...new Set(
+      [...preferredImages, ...detail.images]
+        .map(image => safeUrl(image.previewUrl))
+        .filter(Boolean)
+    )].slice(0, GALLERY_PREVIEW_WARM_LIMIT);
+    urls.forEach(url => {
+      const existing = state.galleryPreviewWarmups.get(url);
+      if (existing) {
+        state.galleryPreviewWarmups.delete(url);
+        state.galleryPreviewWarmups.set(url, existing);
+        return;
+      }
+      const image = new Image();
+      image.decoding = 'async';
+      image.fetchPriority = 'low';
+      image.src = url;
+      state.galleryPreviewWarmups.set(url, image);
+      while (state.galleryPreviewWarmups.size > GALLERY_PREVIEW_CACHE_LIMIT) {
+        state.galleryPreviewWarmups.delete(state.galleryPreviewWarmups.keys().next().value);
+      }
+    });
+  }
+
+  function scheduleGalleryPreviewWarm(data, result, generation) {
+    const warm = () => {
+      if (generation === state.galleryPreviewWarmGeneration) {
+        warmGalleryPreviews(data, result);
+      }
+    };
+    if ('requestIdleCallback' in window) {
+      window.requestIdleCallback(warm, { timeout: 500 });
+    } else {
+      window.setTimeout(warm, 0);
+    }
+  }
+
+  function prefetchAdjacentFinderGalleries(context = state.galleryContext) {
+    const queue = context?.finderReviewQueue;
+    if (!queue?.results?.length) return;
+    const generation = ++state.galleryPreviewWarmGeneration;
+    const index = Math.max(0, Math.min(queue.results.length - 1, Number(queue.index || 0)));
+    const profile = state.activeProfile;
+    const neighbors = [queue.results[index - 1], queue.results[index + 1]]
+      .filter(result => result?.galleryId !== undefined && result?.galleryId !== null);
+    retainAdjacentGalleryPrefetches(
+      neighbors.map(result => String(result.galleryId)),
+      profile
+    );
+    const seen = new Set();
+    neighbors.forEach(result => {
+      const id = String(result.galleryId);
+      if (seen.has(id)) return;
+      seen.add(id);
+      loadGalleryDetail(id, profile, { prefetch: true })
+        .then(data => scheduleGalleryPreviewWarm(data, result, generation))
+        .catch(() => { /* Navigation retries failed background fetches normally. */ });
+    });
+  }
+
+  async function refreshOpenGalleryDetail(profile = state.activeProfile) {
+    const dialog = $('#gallery-modal');
+    const galleryId = state.gallery?.id;
+    if (!dialog.open || galleryId === undefined || galleryId === null) return false;
+    const detailProfile = String(profile || '');
+    const detailRequest = ++state.galleryDetailRequest;
+    state.loadingDetail = true;
+    $('#image-grid').setAttribute('aria-busy', 'true');
+    renderFinderGalleryReview();
+    try {
+      const data = await loadGalleryDetail(galleryId, detailProfile);
+      if (
+        detailRequest !== state.galleryDetailRequest
+        || detailProfile !== state.activeProfile
+        || !dialog.open
+        || String(state.gallery?.id) !== String(galleryId)
+      ) return false;
+      const detail = normalizeDetail(data);
+      const imageUrls = new Set(detail.images.map(image => image.url));
+      state.gallery = detail;
+      if (state.galleryMode === 'download') {
+        const pendingImages = detail.images.filter(image => !image.downloaded);
+        state.selectedImages = new Set(
+          (pendingImages.length ? pendingImages : detail.images).map(image => image.url)
+        );
+      } else {
+        state.selectedImages = new Set([...state.selectedImages].filter(url => imageUrls.has(url)));
+      }
+      state.finderFeedbackGallerySelection = new Set(
+        [...state.finderFeedbackGallerySelection].filter(url => imageUrls.has(url))
+      );
+      state.poseSelectedImages = new Set(
+        [...state.poseSelectedImages].filter(url => imageUrls.has(url))
+      );
+      const listItem = state.galleries.find(item => String(item.id) === String(galleryId));
+      if (listItem) {
+        Object.assign(listItem, {
+          saved: detail.saved,
+          ignored: detail.ignored,
+          imageCount: detail.imageCount,
+          thumbnailUrl: detail.thumbnailUrl || listItem.thumbnailUrl
+        });
+      }
+      renderGallerySummary();
+      renderImages();
+      renderGalleries();
+      $('#gallery-modal-kicker').textContent = displayHost(detail.url);
+      $('#gallery-modal-title').textContent = detail.title;
+      prefetchAdjacentFinderGalleries();
+      return true;
+    } catch (error) {
+      if (error.name !== 'AbortError') {
+        toast('Could not refresh gallery', errorMessage(error), 'error');
+      }
+      return false;
+    } finally {
+      if (
+        detailRequest === state.galleryDetailRequest
+        && detailProfile === state.activeProfile
+        && dialog.open
+      ) {
+        state.loadingDetail = false;
+        $('#image-grid').setAttribute('aria-busy', 'false');
+        updateSelectionUi();
+        renderFinderGalleryReview();
+      }
+    }
+  }
+
   async function openGallery(id, context = null) {
     if (!confirmDiscardFinderFeedbackGalleryChanges('Discard the unsaved Finder feedback selection and open another gallery?')) return;
     if (state.poseLoadedKey && (state.poseDirty || state.poseSaving)) {
@@ -1104,6 +1583,8 @@
     const summarySource = context?.summary || state.galleries.find(item => String(item.id) === String(id));
     const summary = summarySource ? normalizeGallery(summarySource) : null;
     if (!summary) return;
+    cancelForegroundGalleryDetailRequests();
+    const detailProfile = state.activeProfile;
     const detailRequest = ++state.galleryDetailRequest;
     state.poseApplyRequest += 1;
     state.poseApplying = false;
@@ -1144,8 +1625,12 @@
     const dialog = $('#gallery-modal');
     if (!dialog.open) dialog.showModal();
     try {
-      const data = await api(withParams(`/api/galleries/${encodeURIComponent(id)}`, { profile: state.activeProfile }));
-      if (detailRequest !== state.galleryDetailRequest) return;
+      const data = await loadGalleryDetail(id, detailProfile);
+      if (
+        detailRequest !== state.galleryDetailRequest
+        || detailProfile !== state.activeProfile
+        || !dialog.open
+      ) return;
       state.gallery = normalizeDetail(data);
       const listItem = state.galleries.find(item => String(item.id) === String(id));
       if (listItem) Object.assign(listItem, { saved: state.gallery.saved, ignored: state.gallery.ignored, imageCount: state.gallery.imageCount, thumbnailUrl: state.gallery.thumbnailUrl || listItem.thumbnailUrl });
@@ -1179,14 +1664,23 @@
       $('#gallery-modal-kicker').textContent = displayHost(state.gallery.url);
       $('#gallery-modal-title').textContent = state.gallery.title;
       if (requestedMode === 'pose' || requestedMode === 'feedback') scrollToFinderSuggestion();
+      prefetchAdjacentFinderGalleries();
     } catch (error) {
-      if (detailRequest !== state.galleryDetailRequest) return;
+      if (
+        detailRequest !== state.galleryDetailRequest
+        || detailProfile !== state.activeProfile
+        || !dialog.open
+      ) return;
       $('#image-grid').replaceChildren();
       $('#images-empty').hidden = false;
       $('#selection-summary').textContent = errorMessage(error);
       toast('Could not open gallery', errorMessage(error), 'error');
     } finally {
-      if (detailRequest !== state.galleryDetailRequest) return;
+      if (
+        detailRequest !== state.galleryDetailRequest
+        || detailProfile !== state.activeProfile
+        || !dialog.open
+      ) return;
       state.loadingDetail = false;
       $('#image-grid').setAttribute('aria-busy', 'false');
       updateSelectionUi();
@@ -2119,6 +2613,7 @@
     try {
       await api('/api/downloads', { method: 'POST', body: payload });
       const count = state.selectedImages.size;
+      invalidateGalleryDetailCache(gallery.id);
       const item = state.galleries.find(candidate => String(candidate.id) === String(gallery.id));
       if (item) item.queued = true;
       closeModal($('#lightbox-modal'));
@@ -2162,7 +2657,26 @@
   async function loadJobs({ quiet = false } = {}) {
     try {
       const data = await api('/api/downloads');
-      state.jobs = apiItems(data, 'downloads').map(normalizeJob);
+      const previousJobs = new Map(state.jobs.map(job => [String(job.id), job]));
+      const nextJobs = apiItems(data, 'downloads').map(normalizeJob);
+      nextJobs.forEach(job => {
+        const previous = previousJobs.get(String(job.id));
+        if (
+          previous
+          && previous.status === job.status
+          && previous.complete === job.complete
+        ) return;
+        if (job.galleryId !== undefined && job.galleryId !== null) {
+          invalidateGalleryDetailCache(job.galleryId);
+          return;
+        }
+        const listItem = state.galleries.find(gallery => (
+          job.galleryUrl
+          && normalizeHistoryUrl(gallery.url) === normalizeHistoryUrl(job.galleryUrl)
+        ));
+        if (listItem) invalidateGalleryDetailCache(listItem.id);
+      });
+      state.jobs = nextJobs;
       state.galleries.forEach(gallery => {
         gallery.queued = state.jobs.some(job => !isTerminalJob(job) && (
           String(job.galleryId) === String(gallery.id) ||
@@ -5383,6 +5897,7 @@
       scan.joytagExcludedTags = [...config.joytagExcludedTags];
       scan.joytagRejectThreshold = config.joytagRejectThreshold;
       scan.referenceFingerprint = config.referenceFingerprint || '';
+      cancelAdjacentGalleryPrefetches();
       state.finderScan = scan;
       state.finderScanId = scan.id;
       state.finderResults = [];
@@ -6082,6 +6597,7 @@
     }
     const changedScan = String(scanId || '') !== String(state.finderScanId || '');
     if (changedScan) {
+      cancelAdjacentGalleryPrefetches();
       $('#finder-continue-source').value = '';
       resetFinderResultPagination();
     }
@@ -6958,6 +7474,7 @@
       state.galleryDetailRequest += 1;
       state.galleryNavigationRequest += 1;
       state.poseApplyRequest += 1;
+      cancelAdjacentGalleryPrefetches({ includeForeground: true });
       state.loadingDetail = false;
       closeModal($('#lightbox-modal'));
       flushPoseDraft();
