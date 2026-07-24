@@ -69,6 +69,16 @@ class AppConfig:
             "PORNPIC_WEBUI_FINDER_POSE_MODEL_PATH"
         )
     )
+    finder_joytag_model_path: Path | None = field(
+        default_factory=lambda: _optional_path_from_env(
+            "PORNPIC_WEBUI_FINDER_JOYTAG_MODEL_PATH"
+        )
+    )
+    finder_joytag_tags_path: Path | None = field(
+        default_factory=lambda: _optional_path_from_env(
+            "PORNPIC_WEBUI_FINDER_JOYTAG_TAGS_PATH"
+        )
+    )
     finder_execution_provider: str = field(
         default_factory=lambda: os.getenv(
             "PORNPIC_WEBUI_FINDER_EXECUTION_PROVIDER", "auto"
@@ -169,6 +179,14 @@ class AppConfig:
             self.finder_pose_model_path = (
                 self.data_dir / "models" / "rtmo-l.onnx"
             ).resolve()
+        if self.finder_joytag_model_path is None:
+            self.finder_joytag_model_path = (
+                self.data_dir / "models" / "joytag" / "model.onnx"
+            ).resolve()
+        if self.finder_joytag_tags_path is None:
+            self.finder_joytag_tags_path = (
+                self.data_dir / "models" / "joytag" / "top_tags.txt"
+            ).resolve()
 
     @property
     def db_path(self) -> Path:
@@ -194,9 +212,13 @@ class AppConfig:
         assert self.finder_examples_root is not None
         assert self.finder_model_path is not None
         assert self.finder_pose_model_path is not None
+        assert self.finder_joytag_model_path is not None
+        assert self.finder_joytag_tags_path is not None
         self.finder_examples_root.mkdir(parents=True, exist_ok=True)
         self.finder_model_path.parent.mkdir(parents=True, exist_ok=True)
         self.finder_pose_model_path.parent.mkdir(parents=True, exist_ok=True)
+        self.finder_joytag_model_path.parent.mkdir(parents=True, exist_ok=True)
+        self.finder_joytag_tags_path.parent.mkdir(parents=True, exist_ok=True)
 
 
 config = AppConfig()

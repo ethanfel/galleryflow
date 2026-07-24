@@ -76,6 +76,16 @@ class FinderScanCreate(BaseModel):
     source_url: str = Field(min_length=1, max_length=2_000)
     page_limit: int = Field(default=5, ge=1, le=50)
     minimum_score: float = Field(default=0.7, ge=0, le=1)
+    mode: Literal["pose", "joytag"] = "pose"
+    joytag_tag: str | None = Field(default=None, min_length=1, max_length=200)
+    reference_fingerprint: str | None = Field(
+        default=None, min_length=64, max_length=64, pattern="^[0-9a-f]{64}$"
+    )
+
+
+class FinderReferenceAnalysisCreate(BaseModel):
+    example_directory: str = Field(min_length=1, max_length=500)
+    top_tags: int = Field(default=40, ge=8, le=100)
 
 
 class FinderScanExtend(BaseModel):

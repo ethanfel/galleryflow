@@ -39,6 +39,7 @@ def build_visual_app(
     finder_exhausted: bool = False,
     finder_continue: bool = False,
     finder_pagination: bool = False,
+    finder_tag: bool = False,
 ):
     finder_source_exhausted = finder_exhausted or finder_continue
     finder_pose_mode = open_finder_pose_flow or finder_direct_assign
@@ -184,6 +185,7 @@ def build_visual_app(
     }
     finder_race_state = {"review": "pending", "results_calls": 0, "selected": []}
     finder_continue_state = {"scan_calls": 0, "continue_calls": 0}
+    finder_tag_state: dict[str, object] = {"created": False, "payload": None}
     if finder_race:
         finder_scan["status"] = "running"
 
@@ -198,6 +200,13 @@ def build_visual_app(
                 "configured": 8,
                 "appearance": 8,
                 "pose": 8,
+            },
+            "joytag": {
+                "available": True,
+                "ready": True,
+                "error": "",
+                "model_key": "joytag-visual-smoke",
+                "provider": {"active": "CUDAExecutionProvider"},
             },
         }
 
@@ -257,7 +266,100 @@ def build_visual_app(
         }
 
     async def fake_finder_scans(**kwargs: object) -> dict:
-        return {"scans": [finder_scan]}
+        return {"scans": [] if finder_tag else [finder_scan]}
+
+    async def fake_finder_reference_analysis(**kwargs: object) -> dict:
+        preview = (
+            "/api/media?url=https%3A%2F%2Fexample.test%2Freference-{index}.jpg"
+            "&token=visual"
+        )
+        return {
+            "analysis": {
+                "directory": (
+                    "sorted_outpaint/mating press - backview/"
+                    "selected_target_upscaled"
+                ),
+                "fingerprint": "a" * 64,
+                "image_count": 2,
+                "model_key": "joytag-visual-smoke",
+                "provider": "CUDAExecutionProvider",
+                "quantization": "uint8",
+                "bytes_per_cached_image": 5813,
+                "tags": [
+                    {
+                        "tag": "mating_press",
+                        "index": 214,
+                        "average": 0.82,
+                        "minimum": 0.74,
+                        "maximum": 0.90,
+                        "median": 0.82,
+                        "hits_at_0_4": 2,
+                        "image_count": 2,
+                    },
+                    {
+                        "tag": "lying",
+                        "index": 18,
+                        "average": 0.67,
+                        "minimum": 0.54,
+                        "maximum": 0.80,
+                        "median": 0.67,
+                        "hits_at_0_4": 2,
+                        "image_count": 2,
+                    },
+                ],
+                "images": [
+                    {
+                        "name": "reference-01.jpg",
+                        "preview_url": preview.format(index=1),
+                        "scores": {"mating_press": 0.90, "lying": 0.54},
+                    },
+                    {
+                        "name": "reference-02.jpg",
+                        "preview_url": preview.format(index=2),
+                        "scores": {"mating_press": 0.74, "lying": 0.80},
+                    },
+                ],
+            }
+        }
+
+    async def fake_finder_create(payload: object, **kwargs: object) -> dict:
+        values = (
+            payload.model_dump()
+            if callable(getattr(payload, "model_dump", None))
+            else dict(payload)
+            if isinstance(payload, dict)
+            else {}
+        )
+        finder_tag_state["payload"] = values
+        valid = (
+            values.get("mode") == "joytag"
+            and values.get("joytag_tag") == "mating_press"
+            and values.get("reference_fingerprint") == "a" * 64
+            and abs(float(values.get("minimum_score") or 0) - 0.35) < 1e-9
+        )
+        if not valid:
+            raise HTTPException(
+                status_code=422,
+                detail="Tag Finder sent an invalid scan payload",
+            )
+        finder_tag_state["created"] = True
+        finder_scan.update(
+            {
+                "id": "visual-tag-finder",
+                "status": "completed",
+                "pose_tag_id": 1,
+                "pose_tag_label": "mating press - backview",
+                "search_mode": "joytag",
+                "joytag_tag": "mating_press",
+                "reference_fingerprint": "a" * 64,
+                "minimum_score": 0.35,
+                "ranking_version": "joytag-v1",
+                "candidate_count": 1,
+                "processed_galleries": 1,
+                "processed_images": 21,
+            }
+        )
+        return {"scan": dict(finder_scan)}
 
     async def fake_finder_scan(**kwargs: object) -> dict:
         finder_continue_state["scan_calls"] += 1
@@ -307,6 +409,52 @@ def build_visual_app(
             return (
                 f"/api/media?url=https%3A%2F%2Fexample.test%2F{name}.jpg&token=visual"
             )
+
+        if finder_tag:
+            result = {
+                "id": "visual-tag-result",
+                "gallery_id": galleries[2]["id"],
+                "gallery_url": galleries[2]["url"],
+                "title": "Single qualifying JoyTag candidate",
+                "rank": 1,
+                "score": 0.73,
+                "tag": "mating_press",
+                "tag_score": 0.73,
+                "match_type": "tag",
+                "ranking_tier": 1,
+                "online_scanned": True,
+                "review": "pending",
+                "feedback_image_urls": [],
+                "images_scored": 21,
+                "image_count": 21,
+                "top_matches": [
+                    {
+                        "rank": 1,
+                        "image_url": "https://example.test/tag-candidate-1.jpg",
+                        "preview_url": media("tag-candidate-1"),
+                        "ordinal": 9,
+                        "score": 0.73,
+                        "tag": "mating_press",
+                        "tag_score": 0.73,
+                        "match_type": "tag",
+                        "ranking_tier": 1,
+                    }
+                ],
+            }
+            return {
+                "items": [result],
+                "total": 1,
+                "counts": {
+                    "pending": 1,
+                    "accepted": 0,
+                    "maybe": 0,
+                    "rejected": 0,
+                    "total": 1,
+                },
+                "limit": 24,
+                "offset": 0,
+                "page_count": 1,
+            }
 
         if finder_race:
             finder_race_state["results_calls"] += 1
@@ -531,8 +679,10 @@ def build_visual_app(
             script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const button=document.querySelector('.image-preview-button');if(button){button.click();clearInterval(poll)}},50)});"
         if open_pose:
             script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const modal=document.querySelector('#gallery-modal');const button=document.querySelector('[data-gallery-mode=pose]');const image=document.querySelector('.image-option:not(.skeleton-image)');if(modal?.open&&button&&image){button.click();clearInterval(poll)}},50)});"
-        if open_finder:
+        if open_finder and not finder_tag:
             script += "localStorage.setItem('galleryflow:finder-scan', JSON.stringify('visual-finder'));window.addEventListener('load',()=>{const poll=setInterval(()=>{const button=document.querySelector('.finder-overlay-toggle:not([hidden])');if(button){button.click();clearInterval(poll)}},50)});"
+        if finder_tag:
+            script += """localStorage.setItem('galleryflow:finder-mode',JSON.stringify('joytag'));localStorage.setItem('galleryflow:finder-scan',JSON.stringify(''));window.addEventListener('load',()=>{let phase='configure';const folderValue='sorted_outpaint/mating press - backview/selected_target_upscaled';const poll=setInterval(()=>{const folder=document.querySelector('#finder-folder');const analyze=document.querySelector('#finder-analyze-references');if(phase==='configure'&&folder&&analyze&&!analyze.hidden){folder.value=folderValue;folder.dispatchEvent(new Event('input',{bubbles:true}));if(!analyze.disabled){analyze.click();phase='analysis'}}else if(phase==='analysis'){const choice=document.querySelector('input[data-finder-joytag-tag="mating_press"]');const references=document.querySelectorAll('#finder-joytag-reference-grid .finder-joytag-reference');if(!choice||references.length!==2)return;choice.click();const threshold=document.querySelector('#finder-joytag-threshold');threshold.value='0.35';threshold.dispatchEvent(new Event('input',{bubbles:true}));const label=document.querySelector('#finder-joytag-dataset-label');label.value='mating press - backview';label.dispatchEvent(new Event('input',{bubbles:true}));const oldThreshold=document.querySelector('#finder-min-similarity');const statsOk=document.querySelector('#finder-joytag-average')?.textContent==='0.820'&&document.querySelector('#finder-joytag-reference-coverage')?.textContent==='2 / 2 pass';const oldHidden=oldThreshold?.disabled&&oldThreshold.closest('.field')?.hidden;if(statsOk&&oldHidden&&!document.querySelector('#finder-start')?.disabled){document.querySelector('#finder-start').click();phase='results'}}else if(phase==='results'){const card=document.querySelector('#finder-result-grid .finder-card');if(!card)return;const threshold=document.querySelector('#finder-result-threshold');const copy=[...card.querySelectorAll('.finder-similarity,.finder-match-kind,.finder-match-score,.finder-feedback-selection-copy')].map(item=>item.textContent).join(' ');const oneMatch=card.querySelectorAll('.finder-match').length===1;const rangeOk=threshold?.min==='0.05'&&threshold?.value==='0.35';const joytagCopy=copy.includes('JoyTag')&&copy.includes('confidence')&&!copy.includes('Visual fallback')&&!copy.includes('Pose match');document.documentElement.dataset.finderTag=oneMatch&&rangeOk&&joytagCopy?'pass':'fail';clearInterval(poll)}},50);setTimeout(()=>{if(!document.documentElement.dataset.finderTag)document.documentElement.dataset.finderTag='fail'},6500)});"""
         if finder_pagination:
             script += "window.addEventListener('load',()=>{let clicked=false;const poll=setInterval(()=>{const status=document.querySelector('#finder-page-status')?.textContent;const cards=document.querySelectorAll('#finder-result-grid .finder-card');if(!clicked&&status==='Page 1 of 3'&&cards.length===24){document.querySelector('#finder-page-next')?.click();clicked=true}else if(clicked&&status==='Page 2 of 3'&&cards.length===24&&cards[0]?.querySelector('.finder-rank')?.textContent==='#25'){document.documentElement.dataset.finderPagination='pass';clearInterval(poll)}},50);setTimeout(()=>{if(!document.documentElement.dataset.finderPagination)document.documentElement.dataset.finderPagination='fail'},4500)});"
         if finder_continue:
@@ -587,6 +737,19 @@ def build_visual_app(
         elif open_finder and getattr(route, "path", None) == "/api/pose-tags":
             route.endpoint = fake_pose_tags
             route.dependant.call = fake_pose_tags
+        elif (
+            finder_tag
+            and getattr(route, "path", None) == "/api/finder/reference-analysis"
+        ):
+            route.endpoint = fake_finder_reference_analysis
+            route.dependant.call = fake_finder_reference_analysis
+        elif (
+            finder_tag
+            and getattr(route, "path", None) == "/api/finder/scans"
+            and "POST" in getattr(route, "methods", set())
+        ):
+            route.endpoint = fake_finder_create
+            route.dependant.call = fake_finder_create
         elif open_finder and getattr(route, "path", None) == "/api/finder/scans":
             route.endpoint = fake_finder_scans
             route.dependant.call = fake_finder_scans
@@ -653,6 +816,7 @@ def main() -> None:
     parser.add_argument("--finder-exhausted", action="store_true")
     parser.add_argument("--finder-continue", action="store_true")
     parser.add_argument("--finder-pagination", action="store_true")
+    parser.add_argument("--finder-tag", action="store_true")
     args = parser.parse_args()
     finder_mode = (
         args.finder
@@ -664,9 +828,12 @@ def main() -> None:
         or args.finder_exhausted
         or args.finder_continue
         or args.finder_pagination
+        or args.finder_tag
     )
     suffix = (
-        "finder-pagination"
+        "finder-tag"
+        if args.finder_tag
+        else "finder-pagination"
         if args.finder_pagination
         else "finder-continue-mobile"
         if args.finder_continue and args.mobile
@@ -742,6 +909,7 @@ def main() -> None:
                     finder_exhausted=args.finder_exhausted,
                     finder_continue=args.finder_continue,
                     finder_pagination=args.finder_pagination,
+                    finder_tag=args.finder_tag,
                 ),
                 host="127.0.0.1",
                 port=18101,
@@ -773,7 +941,7 @@ def main() -> None:
             "--disable-sync",
             "--force-prefers-reduced-motion",
             "--no-first-run",
-            f"--virtual-time-budget={7500 if args.finder_unusable_save or args.finder_continue else 6500 if args.finder_direct_assign else 4500 if args.finder_race else 4000 if args.finder_pose_flow else 3000 if args.lightbox or args.pose else 2000 if finder_mode else 1000}",
+            f"--virtual-time-budget={7500 if args.finder_unusable_save or args.finder_continue else 7000 if args.finder_tag else 6500 if args.finder_direct_assign else 4500 if args.finder_race else 4000 if args.finder_pose_flow else 3000 if args.lightbox or args.pose else 2000 if finder_mode else 1000}",
             f"--user-data-dir={Path(directory) / 'chrome-profile'}",
             f"--window-size={viewport}",
             f"--screenshot={output}",
@@ -785,6 +953,7 @@ def main() -> None:
             or args.finder_unusable_save
             or args.finder_continue
             or args.finder_pagination
+            or args.finder_tag
         ):
             command.insert(1, "--dump-dom")
         completed = subprocess.run(
@@ -797,6 +966,7 @@ def main() -> None:
                 or args.finder_unusable_save
                 or args.finder_continue
                 or args.finder_pagination
+                or args.finder_tag
             ),
             text=(
                 args.finder_race
@@ -804,6 +974,7 @@ def main() -> None:
                 or args.finder_unusable_save
                 or args.finder_continue
                 or args.finder_pagination
+                or args.finder_tag
             ),
         )
         if args.finder_race and 'data-finder-race="pass"' not in completed.stdout:
@@ -835,6 +1006,10 @@ def main() -> None:
         ):
             raise AssertionError(
                 "Finder pagination did not load page two with global result ranks"
+            )
+        if args.finder_tag and 'data-finder-tag="pass"' not in completed.stdout:
+            raise AssertionError(
+                "Tag Finder analysis, tag selection, scan payload, or result rendering failed"
             )
         server.should_exit = True
         thread.join(timeout=5)

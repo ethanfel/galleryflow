@@ -185,22 +185,75 @@
             <div class="finder-panel-heading"><div><span class="sort-step">01</span><div><h2 id="finder-setup-title">Configure scan</h2><p>Examples stay on this server.</p></div></div></div>
 
             <label class="field"><span>Recent scan</span><select id="finder-scan-select"><option value="">New scan</option></select></label>
-            <label class="field"><span>Examples folder</span><small class="finder-folder-hint" id="finder-folder-hint">Use a library-relative path such as poses/matting-press, or paste the full container path. Existing folders are suggestions only.</small><input id="finder-folder" type="text" list="finder-folder-options" maxlength="500" placeholder="sorted_outpaint/mating press - backview/selected_target_upscaled" autocomplete="off" spellcheck="false"></label>
-            <datalist id="finder-folder-options"></datalist>
-            <label class="field"><span>Pose tag</span><small>Existing tags are reused; a new tag is created when the scan starts.</small><input id="finder-pose-tag" type="text" list="finder-pose-tag-options" maxlength="80" placeholder="e.g. standing profile" autocomplete="off"></label>
-            <datalist id="finder-pose-tag-options"></datalist>
-            <section class="finder-feedback-card" id="finder-feedback-card" aria-labelledby="finder-feedback-title" aria-live="polite">
-              <header class="finder-feedback-head">
-                <span class="finder-feedback-icon" aria-hidden="true"><svg><use href="#i-spark"></use></svg></span>
-                <span><small>Pose-specific refinement</small><strong id="finder-feedback-title">Select an existing pose</strong></span>
-                <i class="finder-feedback-state" id="finder-feedback-state">Waiting</i>
-              </header>
-              <div class="finder-feedback-body">
-                <span class="finder-feedback-count is-accepted"><i></i><strong id="finder-feedback-accepted">—</strong><small>accepted samples</small></span>
-                <span class="finder-feedback-count is-rejected"><i></i><strong id="finder-feedback-rejected">—</strong><small>rejected samples</small></span>
-                <button class="finder-feedback-reset" id="finder-feedback-reset" type="button" disabled><svg><use href="#i-refresh"></use></svg><span>Reset feedback</span></button>
+            <div class="finder-mode-field">
+              <span>Search method</span>
+              <div class="segmented finder-mode-switch" id="finder-mode-switch" role="tablist" aria-label="Finder search method">
+                <button class="is-active" id="finder-mode-pose" type="button" role="tab" aria-selected="true" aria-controls="finder-pose-config" data-finder-mode="pose"><svg><use href="#i-spark"></use></svg><span>Pose search</span></button>
+                <button id="finder-mode-tag" type="button" role="tab" aria-selected="false" aria-controls="finder-tag-config" data-finder-mode="tag"><svg><use href="#i-search"></use></svg><span>Tag search</span></button>
               </div>
-              <p id="finder-feedback-copy">Checked suggestions become pose feedback; unchecked suggestions are excluded. Reviews can adjust or veto future pose ranking—the vision models are not retrained.</p>
+              <small id="finder-mode-copy">Compare body geometry and use visual similarity only as fallback evidence.</small>
+            </div>
+            <div class="finder-reference-field">
+              <label class="field"><span>Examples folder</span><small class="finder-folder-hint" id="finder-folder-hint">Use a library-relative path such as poses/matting-press, or paste the full container path. Existing folders are suggestions only.</small><input id="finder-folder" type="text" list="finder-folder-options" maxlength="500" placeholder="sorted_outpaint/mating press - backview/selected_target_upscaled" autocomplete="off" spellcheck="false"></label>
+              <button class="button button-quiet finder-analyze-references" id="finder-analyze-references" type="button" hidden disabled><svg><use href="#i-spark"></use></svg><span>Analyze</span></button>
+            </div>
+            <datalist id="finder-folder-options"></datalist>
+            <div class="finder-pose-config" id="finder-pose-config" role="tabpanel" aria-labelledby="finder-mode-pose">
+              <label class="field"><span>Pose tag</span><small>Existing tags are reused; a new tag is created when the scan starts.</small><input id="finder-pose-tag" type="text" list="finder-pose-tag-options" maxlength="80" placeholder="e.g. standing profile" autocomplete="off"></label>
+              <datalist id="finder-pose-tag-options"></datalist>
+              <section class="finder-feedback-card" id="finder-feedback-card" aria-labelledby="finder-feedback-title" aria-live="polite">
+                <header class="finder-feedback-head">
+                  <span class="finder-feedback-icon" aria-hidden="true"><svg><use href="#i-spark"></use></svg></span>
+                  <span><small>Pose-specific refinement</small><strong id="finder-feedback-title">Select an existing pose</strong></span>
+                  <i class="finder-feedback-state" id="finder-feedback-state">Waiting</i>
+                </header>
+                <div class="finder-feedback-body">
+                  <span class="finder-feedback-count is-accepted"><i></i><strong id="finder-feedback-accepted">—</strong><small>accepted samples</small></span>
+                  <span class="finder-feedback-count is-rejected"><i></i><strong id="finder-feedback-rejected">—</strong><small>rejected samples</small></span>
+                  <button class="finder-feedback-reset" id="finder-feedback-reset" type="button" disabled><svg><use href="#i-refresh"></use></svg><span>Reset feedback</span></button>
+                </div>
+                <p id="finder-feedback-copy">Checked suggestions become pose feedback; unchecked suggestions are excluded. Reviews can adjust or veto future pose ranking—the vision models are not retrained.</p>
+              </section>
+            </div>
+            <section class="finder-tag-config" id="finder-tag-config" role="tabpanel" aria-labelledby="finder-mode-tag" hidden>
+              <label class="field finder-tag-dataset-field"><span>Dataset label</span><small>Name used for saved reviews and later control/target preparation.</small><input id="finder-joytag-dataset-label" type="text" maxlength="80" placeholder="Filled from the selected JoyTag tag" autocomplete="off"></label>
+              <details class="finder-joytag-card" id="finder-joytag-analysis" open>
+                <summary>
+                  <span class="finder-joytag-icon" aria-hidden="true"><svg><use href="#i-spark"></use></svg></span>
+                  <span><small>Reference analysis</small><strong id="finder-joytag-title">JoyTag signals</strong><em id="finder-joytag-summary">Analyze the examples folder to choose a tag.</em></span>
+                  <i class="finder-joytag-state" id="finder-joytag-state">Waiting</i>
+                  <svg class="finder-joytag-chevron" aria-hidden="true"><use href="#i-chevron"></use></svg>
+                </summary>
+                <div class="finder-joytag-body">
+                  <p class="finder-joytag-error" id="finder-joytag-error" role="alert" hidden></p>
+                  <div class="finder-joytag-empty" id="finder-joytag-empty">
+                    <svg aria-hidden="true"><use href="#i-image"></use></svg>
+                    <span><strong>No analysis yet</strong><small>Choose a folder and run JoyTag to inspect its strongest tags.</small></span>
+                  </div>
+                  <div class="finder-joytag-results" id="finder-joytag-results" hidden>
+                    <div class="finder-joytag-meta">
+                      <span><strong id="finder-joytag-image-count">0</strong><small>references</small></span>
+                      <span><strong id="finder-joytag-provider">—</strong><small>provider</small></span>
+                    </div>
+                    <div class="finder-joytag-section-heading">
+                      <span><strong>Choose the search tag</strong><small>Folder averages and coverage</small></span>
+                      <label><span class="sr-only">Filter JoyTag tags</span><input id="finder-joytag-tag-filter" type="search" placeholder="Filter tags…" autocomplete="off" spellcheck="false"></label>
+                    </div>
+                    <div class="finder-joytag-tags" id="finder-joytag-tags" role="radiogroup" aria-label="JoyTag search tag"></div>
+                    <section class="finder-joytag-signal" aria-labelledby="finder-joytag-selected-tag">
+                      <header><span><small>Selected signal</small><strong id="finder-joytag-selected-tag">Choose a tag</strong></span><i id="finder-joytag-reference-coverage">0 / 0 pass</i></header>
+                      <div class="finder-joytag-score-stats">
+                        <span><small>Average</small><strong id="finder-joytag-average">—</strong></span>
+                        <span><small>Minimum</small><strong id="finder-joytag-minimum">—</strong></span>
+                        <span><small>Maximum</small><strong id="finder-joytag-maximum">—</strong></span>
+                      </div>
+                      <label class="finder-joytag-threshold"><span>Candidate confidence <output id="finder-joytag-threshold-output" for="finder-joytag-threshold">0.40</output></span><small>Only images meeting this tag confidence become gallery suggestions.</small><input id="finder-joytag-threshold" type="range" min="0.05" max="0.95" step="0.01" value="0.40"></label>
+                    </section>
+                    <div class="finder-joytag-reference-heading"><strong>Reference images</strong><small id="finder-joytag-reference-copy">Scores update with the selected tag.</small></div>
+                    <div class="finder-joytag-reference-grid" id="finder-joytag-reference-grid" aria-live="polite"></div>
+                  </div>
+                </div>
+              </details>
             </section>
             <label class="field"><span>Source URL <button class="field-inline-action" id="finder-use-current" type="button">Use current</button></span><small>A gallery, category, model, search page, or the site home page.</small><input id="finder-source" type="url" inputmode="url" spellcheck="false" placeholder="https://www.pornpics.com/"></label>
 

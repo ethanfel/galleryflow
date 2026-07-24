@@ -495,7 +495,89 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .finder-panel-heading p, .finder-results-header p { margin: 2px 0 0; overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .field-inline-action { padding: 0; border: 0; background: transparent; color: var(--accent); font-size: 9px; font-weight: 650; }
 .field-inline-action:hover { color: #ff9fb4; }
+.finder-mode-field { display: flex; margin-top: 16px; flex-direction: column; color: var(--text-soft); font-size: 11px; font-weight: 600; }
+.finder-mode-switch { width: 100%; margin-top: 7px; }
+.finder-mode-switch button { display: inline-flex; min-width: 0; flex: 1; gap: 6px; align-items: center; justify-content: center; }
+.finder-mode-switch button svg { width: 13px; height: 13px; flex: none; }
+.finder-mode-field > small { margin-top: 5px; color: var(--muted); font-size: 8px; font-weight: 400; line-height: 1.45; }
+.finder-reference-field { display: grid; margin-top: 16px; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; align-items: end; }
+.finder-reference-field > .field { min-width: 0; margin-top: 0; }
+.finder-analyze-references { min-width: 92px; min-height: 41px; padding-inline: 10px; font-size: 9px; }
+.finder-analyze-references svg { width: 13px; height: 13px; }
 .finder-folder-hint { line-height: 1.4; overflow-wrap: anywhere; }
+.finder-pose-config > .field:first-child { margin-top: 16px; }
+.finder-tag-config { margin-top: 10px; }
+.finder-tag-config > .finder-joytag-card { margin-top: 10px; }
+.finder-joytag-card { overflow: hidden; border: 1px solid rgba(240,181,91,.18); border-radius: 11px; background: linear-gradient(135deg, rgba(240,181,91,.065), rgba(225,29,109,.025) 64%, var(--surface-2)); }
+.finder-joytag-card > summary { display: grid; min-height: 54px; padding: 9px 10px; grid-template-columns: 30px minmax(0, 1fr) auto 13px; gap: 8px; align-items: center; cursor: pointer; list-style: none; }
+.finder-joytag-card > summary::-webkit-details-marker { display: none; }
+.finder-joytag-card > summary:focus-visible { outline: 2px solid white; outline-offset: -3px; }
+.finder-joytag-icon { display: grid; width: 30px; height: 30px; place-items: center; border-radius: 9px; background: rgba(240,181,91,.12); color: #f3c46f; }
+.finder-joytag-icon svg { width: 14px; height: 14px; }
+.finder-joytag-card > summary > span:nth-child(2) { display: flex; min-width: 0; flex-direction: column; }
+.finder-joytag-card > summary small { color: var(--muted-2); font-size: 7px; font-weight: 650; letter-spacing: .06em; text-transform: uppercase; }
+.finder-joytag-card > summary strong { margin-top: 1px; color: var(--text-soft); font-size: 10px; font-weight: 680; }
+.finder-joytag-card > summary em { margin-top: 1px; overflow: hidden; color: var(--muted); font-size: 7px; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
+.finder-joytag-state { display: inline-flex; min-height: 21px; padding: 0 7px; align-items: center; border-radius: 999px; background: rgba(255,255,255,.045); color: var(--muted); font-size: 7px; font-style: normal; font-weight: 750; letter-spacing: .045em; text-transform: uppercase; white-space: nowrap; }
+.finder-joytag-card.is-loading .finder-joytag-state { background: var(--amber-soft); color: var(--amber); }
+.finder-joytag-card.is-ready { border-color: rgba(79,210,160,.2); }
+.finder-joytag-card.is-ready .finder-joytag-state { background: var(--green-soft); color: var(--green); }
+.finder-joytag-card.is-error { border-color: rgba(255,107,114,.22); }
+.finder-joytag-card.is-error .finder-joytag-state { background: var(--red-soft); color: var(--red); }
+.finder-joytag-chevron { width: 11px; height: 11px; color: var(--muted); transform: rotate(90deg); transition: transform .18s var(--ease); }
+.finder-joytag-card[open] .finder-joytag-chevron { transform: rotate(-90deg); }
+.finder-joytag-body { padding: 0 10px 10px; border-top: 1px solid rgba(255,255,255,.045); }
+.finder-joytag-empty { display: flex; min-height: 70px; padding: 10px 3px 0; gap: 10px; align-items: center; color: var(--muted); }
+.finder-joytag-empty > svg { width: 24px; height: 24px; flex: none; opacity: .55; }
+.finder-joytag-empty > span { display: flex; min-width: 0; flex-direction: column; }
+.finder-joytag-empty strong { color: var(--text-soft); font-size: 9px; }
+.finder-joytag-empty small { margin-top: 2px; font-size: 7px; line-height: 1.4; }
+.finder-joytag-error { margin: 9px 0 0; padding: 8px; border: 1px solid rgba(255,107,114,.18); border-radius: 8px; background: var(--red-soft); color: #ff999f; font-size: 8px; line-height: 1.4; }
+.finder-joytag-meta { display: grid; margin-top: 9px; grid-template-columns: 1fr 1fr; border: 1px solid rgba(255,255,255,.045); border-radius: 8px; background: rgba(8,8,12,.2); }
+.finder-joytag-meta > span { display: flex; min-width: 0; min-height: 42px; padding: 6px 8px; flex-direction: column; justify-content: center; }
+.finder-joytag-meta > span + span { border-left: 1px solid rgba(255,255,255,.045); }
+.finder-joytag-meta strong { overflow: hidden; color: var(--text-soft); font-size: 10px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+.finder-joytag-meta small { margin-top: 1px; color: var(--muted); font-size: 7px; }
+.finder-joytag-section-heading { display: flex; margin-top: 11px; gap: 8px; align-items: end; justify-content: space-between; }
+.finder-joytag-section-heading > span { display: flex; min-width: 0; flex-direction: column; }
+.finder-joytag-section-heading strong, .finder-joytag-reference-heading strong { color: var(--text-soft); font-size: 9px; }
+.finder-joytag-section-heading small, .finder-joytag-reference-heading small { margin-top: 1px; color: var(--muted); font-size: 7px; }
+.finder-joytag-section-heading label { width: 112px; flex: none; }
+.finder-joytag-section-heading input { width: 100%; height: 28px; padding: 0 8px; border: 1px solid var(--border); border-radius: 7px; outline: 0; background: rgba(8,8,12,.26); color: var(--text-soft); font-size: 8px; }
+.finder-joytag-section-heading input:focus { border-color: rgba(240,181,91,.45); box-shadow: 0 0 0 3px rgba(240,181,91,.07); }
+.finder-joytag-tags { display: flex; max-height: 130px; margin-top: 7px; padding: 1px; gap: 5px; overflow: auto; flex-wrap: wrap; align-content: flex-start; }
+.finder-joytag-tag { position: relative; display: inline-flex; min-height: 27px; padding: 0 7px; gap: 5px; align-items: center; border: 1px solid rgba(255,255,255,.07); border-radius: 999px; background: rgba(8,8,12,.22); color: var(--muted); font-size: 7px; cursor: pointer; }
+.finder-joytag-tag:hover { border-color: rgba(240,181,91,.3); color: var(--text-soft); }
+.finder-joytag-tag:has(input:checked) { border-color: rgba(240,181,91,.48); background: rgba(240,181,91,.12); color: #f4cc83; }
+.finder-joytag-tag:has(input:focus-visible) { outline: 2px solid white; outline-offset: 2px; }
+.finder-joytag-tag input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.finder-joytag-tag b { color: currentColor; font-variant-numeric: tabular-nums; }
+.finder-joytag-tag small { padding-left: 4px; border-left: 1px solid rgba(255,255,255,.09); color: var(--muted); font: inherit; }
+.finder-joytag-signal { margin-top: 10px; padding: 9px; border: 1px solid rgba(240,181,91,.14); border-radius: 9px; background: rgba(8,8,12,.18); }
+.finder-joytag-signal > header { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+.finder-joytag-signal > header > span { display: flex; min-width: 0; flex-direction: column; }
+.finder-joytag-signal > header small { color: var(--muted-2); font-size: 7px; font-weight: 650; letter-spacing: .05em; text-transform: uppercase; }
+.finder-joytag-signal > header strong { margin-top: 1px; overflow: hidden; color: #f4cc83; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.finder-joytag-signal > header i { min-height: 21px; padding: 5px 7px; border-radius: 999px; background: var(--green-soft); color: var(--green); font-size: 7px; font-style: normal; font-weight: 700; white-space: nowrap; }
+.finder-joytag-score-stats { display: grid; margin-top: 8px; grid-template-columns: repeat(3, 1fr); border: 1px solid rgba(255,255,255,.045); border-radius: 7px; }
+.finder-joytag-score-stats > span { display: flex; min-width: 0; min-height: 38px; padding: 5px 6px; flex-direction: column; justify-content: center; }
+.finder-joytag-score-stats > span + span { border-left: 1px solid rgba(255,255,255,.045); }
+.finder-joytag-score-stats small { color: var(--muted); font-size: 7px; }
+.finder-joytag-score-stats strong { margin-top: 1px; color: var(--text-soft); font-size: 9px; font-variant-numeric: tabular-nums; }
+.finder-joytag-threshold { display: flex; margin-top: 9px; flex-direction: column; color: var(--text-soft); font-size: 9px; font-weight: 600; }
+.finder-joytag-threshold > span { display: flex; align-items: center; justify-content: space-between; }
+.finder-joytag-threshold output { color: #f4cc83; font-variant-numeric: tabular-nums; }
+.finder-joytag-threshold small { margin-top: 1px; color: var(--muted); font-size: 7px; font-weight: 400; line-height: 1.35; }
+.finder-joytag-threshold input { width: 100%; height: 22px; margin-top: 4px; padding: 0; border: 0; background: transparent; accent-color: var(--amber); cursor: pointer; }
+.finder-joytag-reference-heading { display: flex; margin-top: 11px; align-items: end; justify-content: space-between; }
+.finder-joytag-reference-grid { display: grid; max-height: 320px; margin-top: 7px; padding-right: 2px; gap: 6px; overflow: auto; grid-template-columns: repeat(auto-fill, minmax(82px, 1fr)); }
+.finder-joytag-reference { position: relative; min-width: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 8px; background: rgba(8,8,12,.25); }
+.finder-joytag-reference.is-passing { border-color: rgba(79,210,160,.34); }
+.finder-joytag-reference:not(.is-passing) { opacity: .48; }
+.finder-joytag-reference img { display: block; width: 100%; aspect-ratio: 4 / 5; object-fit: contain; background: #0b0a0e; }
+.finder-joytag-reference > span { display: flex; min-width: 0; min-height: 27px; padding: 4px 5px; gap: 4px; align-items: center; }
+.finder-joytag-reference b { overflow: hidden; color: var(--muted); font-size: 6px; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
+.finder-joytag-reference strong { margin-left: auto; color: var(--text-soft); font-size: 7px; font-variant-numeric: tabular-nums; }
 .finder-config-row { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 10px; align-items: end; }
 .finder-config-row .field { margin-top: 16px; }
 .finder-slider-field input[type="range"], .finder-threshold input[type="range"] { height: 22px; padding: 0; border: 0; background: transparent; accent-color: var(--accent); cursor: pointer; }
@@ -958,6 +1040,7 @@ kbd { min-width: 30px; padding: 4px 8px; border: 1px solid var(--border-strong);
   .sort-folder-list { max-height: 250px; }
   .finder-workspace { grid-template-columns: 1fr; }
   .finder-setup { position: static; }
+  .finder-joytag-reference-grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); }
 }
 
 @media (max-width: 760px) {
@@ -1107,6 +1190,7 @@ kbd { min-width: 30px; padding: 4px 8px; border: 1px solid var(--border-strong);
   .sort-action-bar kbd { display: none; }
   .finder-intro { display: flex; }
   .finder-setup { padding: 16px; }
+  .finder-joytag-reference-grid { grid-template-columns: repeat(auto-fill, minmax(105px, 1fr)); }
   .finder-results-panel { min-height: 0; }
   .finder-results-header { padding-inline: 13px; }
   .finder-session-actions .button { width: 38px; padding: 0; }
@@ -1193,6 +1277,16 @@ kbd { min-width: 30px; padding: 4px 8px; border: 1px solid var(--border-strong);
   .sort-key-hint { display: none; }
   .sort-action-bar { margin: 14px -12px -12px; padding: 10px 12px; gap: 5px; }
   .finder-config-row { grid-template-columns: 78px minmax(0, 1fr); }
+  .finder-mode-switch button { padding-inline: 6px; font-size: 9px; }
+  .finder-reference-field { grid-template-columns: 1fr; }
+  .finder-analyze-references { width: 100%; }
+  .finder-joytag-card > summary { grid-template-columns: 30px minmax(0, 1fr) 13px; }
+  .finder-joytag-state { grid-row: 2; grid-column: 2; width: max-content; margin-top: -5px; }
+  .finder-joytag-chevron { grid-row: 1 / 3; grid-column: 3; }
+  .finder-joytag-section-heading { align-items: stretch; flex-direction: column; }
+  .finder-joytag-section-heading label { width: 100%; }
+  .finder-joytag-reference-heading { gap: 5px; align-items: flex-start; flex-direction: column; }
+  .finder-joytag-reference-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .finder-model-card { grid-template-columns: 34px minmax(0, 1fr); }
   .finder-model-icon { width: 34px; height: 34px; }
   .finder-model-state { grid-column: 2; width: max-content; margin-top: -5px; }

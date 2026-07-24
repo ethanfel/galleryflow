@@ -96,6 +96,16 @@
     finderResultLoading: false,
     finderResultRequest: 0,
     finderResultThresholdTimer: null,
+    finderMode: storage.get('finder-mode', 'pose') === 'joytag' ? 'joytag' : 'pose',
+    finderReferenceAnalysis: null,
+    finderReferenceAnalysisSource: '',
+    finderReferenceAnalysisLoading: false,
+    finderReferenceAnalysisError: '',
+    finderReferenceAnalysisRequest: 0,
+    finderJoytagSelectedTag: '',
+    finderJoytagTagFilter: '',
+    finderJoytagThreshold: Math.max(0.05, Math.min(0.95, Number(storage.get('finder-joytag-threshold', 0.4)) || 0.4)),
+    finderJoytagAutoPoseLabel: '',
     finderLoaded: false,
     finderLoading: false,
     finderBusy: false,
@@ -115,6 +125,7 @@
   const FINDER_MAX_PAGES = 500;
   const FINDER_RESULTS_PAGE_SIZE = 24;
   const FINDER_RANKING_VERSION = 'pose-precision-v2';
+  const FINDER_JOYTAG_RANKING_VERSION = 'joytag-v1';
   const poseRoleLabel = role => ({ solo: 'Solo', couple: 'Couple', group: 'Group' }[role] || 'Solo');
 
   class ApiError extends Error {
@@ -178,6 +189,9 @@
   function safeUrl(value) {
     if (!value) return '';
     if (/^data:image\/svg\+xml;base64,[a-z0-9+/=]+$/i.test(value) && value.length <= 200000) {
+      return value;
+    }
+    if (/^data:image\/(?:jpeg|png|webp);base64,[a-z0-9+/=]+$/i.test(value) && value.length <= 500000) {
       return value;
     }
     try {
@@ -2238,6 +2252,10 @@
     const providers = data.providers && typeof data.providers === 'object' ? data.providers : {};
     const appearanceProvider = providers.appearance && typeof providers.appearance === 'object' ? providers.appearance : {};
     const poseProvider = providers.pose && typeof providers.pose === 'object' ? providers.pose : {};
+    const joytag = data.joytag && typeof data.joytag === 'object' ? data.joytag : {};
+    const joytagProvider = joytag.provider && typeof joytag.provider === 'object'
+      ? joytag.provider
+      : providers.joytag && typeof providers.joytag === 'object' ? providers.joytag : {};
     const providerDetails = [];
     if (appearanceProvider.cpu_fallback) providerDetails.push('Appearance using CPU fallback');
     if (poseProvider.fallback) providerDetails.push('Pose using CPU fallback');
@@ -2261,7 +2279,64 @@
       defaultSourceUrl: String(data.default_source_url || data.source_url || ''),
       folderRoot: String(data.folder_root || model.folder_root || ''),
       corpus: normalizeFinderCorpus(data.corpus || model.corpus),
-      inferenceBatch: normalizeFinderInferenceBatch(data.inference_batch ?? model.inference_batch)
+      inferenceBatch: normalizeFinderInferenceBatch(data.inference_batch ?? model.inference_batch),
+      joytagAvailable: joytag.available === undefined ? null : Boolean(joytag.available),
+      joytagReady: Boolean(joytag.ready),
+      joytagError: String(joytag.error || ''),
+      joytagModelKey: String(joytag.model_key || ''),
+      joytagProvider: String(joytagProvider.active || joytagProvider.provider || '')
+    };
+  }
+
+  function normalizeFinderReferenceAnalysis(item) {
+    const analysis = item?.analysis && typeof item.analysis === 'object' ? item.analysis : item;
+    if (!analysis || typeof analysis !== 'object' || Array.isArray(analysis)) return null;
+    const fingerprint = String(analysis.fingerprint || '');
+    const directory = String(analysis.directory || '');
+    const rawTags = Array.isArray(analysis.tags) ? analysis.tags : [];
+    const rawImages = Array.isArray(analysis.images) ? analysis.images : [];
+    if (!fingerprint || !directory || !rawTags.length || !rawImages.length) return null;
+    const tags = rawTags.map((item, index) => {
+      const tag = String(item?.tag || '').trim();
+      if (!tag) return null;
+      return {
+        tag,
+        index: Math.max(0, Number.parseInt(item?.index ?? index, 10) || 0),
+        average: normalizeFinderScore(item?.average, 0),
+        minimum: normalizeFinderScore(item?.minimum, 0),
+        maximum: normalizeFinderScore(item?.maximum, 0),
+        median: normalizeFinderScore(item?.median, 0),
+        hitsAtPointFour: Math.max(0, Number(item?.hits_at_0_4 || 0)),
+        imageCount: Math.max(0, Number(item?.image_count || analysis.image_count || rawImages.length))
+      };
+    }).filter(Boolean);
+    if (!tags.length) return null;
+    const knownTags = new Set(tags.map(item => item.tag));
+    const images = rawImages.map(item => {
+      const scores = {};
+      if (item?.scores && typeof item.scores === 'object' && !Array.isArray(item.scores)) {
+        Object.entries(item.scores).forEach(([tag, value]) => {
+          if (!knownTags.has(tag)) return;
+          const score = normalizeFinderScore(value);
+          if (score !== null) scores[tag] = score;
+        });
+      }
+      return {
+        name: String(item?.name || 'Reference image'),
+        previewUrl: String(item?.preview_url || ''),
+        scores
+      };
+    });
+    return {
+      directory,
+      fingerprint,
+      imageCount: Math.max(1, Number(analysis.image_count || images.length)),
+      modelKey: String(analysis.model_key || ''),
+      provider: String(analysis.provider || ''),
+      quantization: String(analysis.quantization || ''),
+      bytesPerCachedImage: Math.max(0, Number(analysis.bytes_per_cached_image || 0)),
+      tags,
+      images
     };
   }
 
@@ -2307,8 +2382,10 @@
       && (reportedContinuation === undefined ? Boolean(nextUrl) : Boolean(reportedContinuation));
     const rankingVersion = String(scan.ranking_version || config.ranking_version || 'appearance-first-v1');
     const rankingCurrent = scan.ranking_current === undefined
-      ? rankingVersion === FINDER_RANKING_VERSION
+      ? [FINDER_RANKING_VERSION, FINDER_JOYTAG_RANKING_VERSION].includes(rankingVersion)
       : Boolean(scan.ranking_current);
+    const searchMode = ['joytag', 'tag'].includes(String(scan.search_mode || config.search_mode || scan.mode || config.mode || '').toLowerCase())
+      || rankingVersion === FINDER_JOYTAG_RANKING_VERSION ? 'joytag' : 'pose';
     const scanCorpus = scan.corpus && typeof scan.corpus === 'object' ? scan.corpus : {};
     const corpusSearchRaw = scan.corpus_search_complete
       ?? progress.corpus_search_complete
@@ -2335,6 +2412,9 @@
       poseTagLabel: String(scan.pose_tag_label || config.pose_tag_label || poseTag.label || poseTag.name || ''),
       poseTagSlug: String(scan.pose_tag_slug || poseTag.slug || ''),
       poseDefaultRole: POSE_ROLES.includes(scan.pose_default_role || poseTag.default_role) ? (scan.pose_default_role || poseTag.default_role) : 'solo',
+      searchMode,
+      joytagTag: String(scan.joytag_tag || config.joytag_tag || ''),
+      referenceFingerprint: String(scan.reference_fingerprint || config.reference_fingerprint || ''),
       sourceUrl: String(scan.source_url || config.source_url || scan.url || ''),
       nextUrl,
       hasNextPage,
@@ -2458,6 +2538,8 @@
       exactScore: firstFinderScore(match.exact_score, match.duplicate_score, match.phash_score, breakdown.exact, breakdown.exact_score, index === 0 ? fallback.exactScore : null, isExact ? 1 : null),
       poseScore: firstFinderScore(match.pose_score, match.keypoint_score, match.geometry_score, breakdown.pose, breakdown.pose_score, index === 0 ? fallback.poseScore : null),
       appearanceScore: firstFinderScore(match.appearance_score, match.visual_score, match.dino_score, breakdown.appearance, breakdown.appearance_score, index === 0 ? fallback.appearanceScore : null),
+      tag: String(match.tag || (index === 0 ? fallback.tag : '') || ''),
+      tagScore: firstFinderScore(match.tag_score, index === 0 ? fallback.tagScore : null, match.match_type === 'tag' ? match.score : null),
       personCount: Math.max(0, Number(match.person_count ?? match.people_count ?? match.persons_detected ?? (index === 0 ? fallback.personCount : 0) ?? 0) || 0),
       overlayUrl: String(match.skeleton_overlay_url || match.pose_overlay_url || match.overlay_url || (index === 0 ? fallback.overlayUrl : '') || ''),
       poseReliable: Boolean(match.pose_reliable ?? match.poseReliable ?? (index === 0 ? fallback.poseReliable : false)),
@@ -2510,6 +2592,8 @@
       exactScore: firstFinderScore(item?.exact_score, item?.duplicate_score, item?.phash_score, breakdown.exact, breakdown.exact_score, best.exact_score, isExact ? 1 : null),
       poseScore: firstFinderScore(item?.pose_score, item?.keypoint_score, item?.geometry_score, breakdown.pose, breakdown.pose_score, best.pose_score, best.keypoint_score),
       appearanceScore: firstFinderScore(item?.appearance_score, item?.visual_score, item?.dino_score, breakdown.appearance, breakdown.appearance_score, best.appearance_score, best.visual_score),
+      tag: String(item?.tag || best.tag || ''),
+      tagScore: firstFinderScore(item?.tag_score, best.tag_score, item?.match_type === 'tag' ? item?.score : null),
       personCount: Math.max(0, Number(item?.person_count ?? item?.people_count ?? item?.persons_detected ?? best.person_count ?? best.people_count ?? 0) || 0),
       overlayUrl: item?.skeleton_overlay_url || item?.pose_overlay_url || item?.overlay_url || best.skeleton_overlay_url || best.pose_overlay_url || best.overlay_url || '',
       poseReliable: Boolean(item?.pose_reliable ?? item?.poseReliable ?? best.pose_reliable ?? best.poseReliable),
@@ -2629,6 +2713,8 @@
       poseScore: firstFinderScore(fallback.poseScore, primaryMatch.poseScore),
       poseReliable: fallback.poseReliable || primaryMatch.poseReliable,
       appearanceScore: firstFinderScore(fallback.appearanceScore, primaryMatch.appearanceScore),
+      tag: primaryMatch.tag || fallback.tag,
+      tagScore: firstFinderScore(primaryMatch.tagScore, fallback.tagScore, matchType === 'tag' ? score : null),
       personCount: fallback.personCount || primaryMatch.personCount,
       hasOverlay: matches.some(match => Boolean(match.overlayUrl)),
       origin,
@@ -2711,6 +2797,308 @@
       option.label = `${tag.label} · ${poseRoleLabel(tag.defaultRole)} control`;
       list.append(option);
     });
+  }
+
+  function normalizeFinderMode(value) {
+    return ['joytag', 'tag'].includes(String(value || '').toLowerCase()) ? 'joytag' : 'pose';
+  }
+
+  function finderConfigUsesJoyTag() {
+    return state.finderMode === 'joytag';
+  }
+
+  function finderScanUsesJoyTag(scan = state.finderScan) {
+    return normalizeFinderMode(scan?.searchMode) === 'joytag';
+  }
+
+  function finderFolderKey(value) {
+    return String(value || '').trim().replace(/\/+$/, '');
+  }
+
+  function humanizeJoytagTag(value) {
+    const words = String(value || '').trim().replaceAll('_', ' ').replace(/\s+/g, ' ');
+    return words ? words[0].toUpperCase() + words.slice(1) : '';
+  }
+
+  function finderReferenceAnalysisIsCurrent() {
+    return Boolean(
+      state.finderReferenceAnalysis?.fingerprint
+      && finderFolderKey(state.finderReferenceAnalysisSource)
+      && finderFolderKey($('#finder-folder').value) === finderFolderKey(state.finderReferenceAnalysisSource)
+    );
+  }
+
+  function finderJoytagData(tag = state.finderJoytagSelectedTag) {
+    return state.finderReferenceAnalysis?.tags.find(item => item.tag === tag) || null;
+  }
+
+  function setFinderJoytagDatasetLabel(value, { automatic = false } = {}) {
+    const label = String(value || '').trim().replace(/\s+/g, ' ');
+    $('#finder-joytag-dataset-label').value = label;
+    $('#finder-pose-tag').value = label;
+    state.finderJoytagAutoPoseLabel = automatic ? label : '';
+  }
+
+  function syncFinderJoytagDatasetFromSelection() {
+    const proposed = humanizeJoytagTag(state.finderJoytagSelectedTag);
+    if (!proposed) return;
+    const current = $('#finder-joytag-dataset-label').value.trim().replace(/\s+/g, ' ');
+    if (!current || current === state.finderJoytagAutoPoseLabel) {
+      setFinderJoytagDatasetLabel(proposed, { automatic: true });
+    }
+  }
+
+  function renderFinderMode() {
+    const joytag = finderConfigUsesJoyTag();
+    $$('[data-finder-mode]').forEach(button => {
+      const active = normalizeFinderMode(button.dataset.finderMode) === state.finderMode;
+      button.classList.toggle('is-active', active);
+      button.setAttribute('aria-selected', String(active));
+      button.tabIndex = active ? 0 : -1;
+    });
+    $('#finder-pose-config').hidden = joytag;
+    $('#finder-tag-config').hidden = !joytag;
+    $('#finder-analyze-references').hidden = !joytag;
+    const poseThresholdField = $('#finder-min-similarity').closest('.field');
+    poseThresholdField.hidden = joytag;
+    $('#finder-min-similarity').disabled = joytag;
+    poseThresholdField.closest('.finder-config-row').style.gridTemplateColumns = joytag ? '1fr' : '';
+    $('#finder-mode-copy').textContent = joytag
+      ? 'Analyze the reference folder, choose one JoyTag signal, then rank every matching image by tag confidence.'
+      : 'Compare body geometry and use visual similarity only as fallback evidence.';
+    $('#finder-title').textContent = joytag ? 'Tag Finder' : 'Pose Finder';
+    $('#finder-title').nextElementSibling.textContent = joytag
+      ? 'Choose a tag detected in your reference images, then review galleries ranked by that exact JoyTag confidence.'
+      : 'Teach GalleryFlow from a folder of examples, then review galleries ranked by pose evidence, with visual layout used only as a fallback.';
+    $('#finder-start').querySelector('span').textContent = joytag ? 'Start tag scan' : 'Start scan';
+    const welcome = $('#finder-welcome');
+    $('h3', welcome).textContent = joytag ? 'Find galleries with matching tags' : 'Find galleries with matching poses';
+    $('p', welcome).textContent = joytag
+      ? 'Analyze a reference folder, select the interaction or pose tag you want, and choose its confidence threshold.'
+      : 'Select an examples folder and pose tag. High-precision pose matches rank ahead of visual fallbacks, and every review decision is remembered.';
+  }
+
+  function setFinderMode(value, { persist = true } = {}) {
+    const mode = normalizeFinderMode(value);
+    if (state.finderScan && !finderScanIsTerminal() && mode !== state.finderMode) return;
+    if (mode === 'joytag' && state.finderMode !== 'joytag') {
+      const existing = $('#finder-joytag-dataset-label').value.trim()
+        || $('#finder-pose-tag').value.trim();
+      if (existing && !$('#finder-joytag-dataset-label').value.trim()) {
+        setFinderJoytagDatasetLabel(existing, { automatic: true });
+      }
+    }
+    state.finderMode = mode;
+    if (persist) storage.set('finder-mode', mode);
+    renderFinderMode();
+    renderFinderReferenceAnalysis();
+    renderFinderStatus();
+    renderFinderResults();
+    syncFinderConfigAvailability();
+    if (mode === 'pose') loadFinderFeedback({ quiet: true, force: true });
+  }
+
+  function invalidateFinderReferenceAnalysis({ clearSelection = true } = {}) {
+    state.finderReferenceAnalysisRequest += 1;
+    state.finderReferenceAnalysis = null;
+    state.finderReferenceAnalysisSource = '';
+    state.finderReferenceAnalysisLoading = false;
+    state.finderReferenceAnalysisError = '';
+    if (clearSelection) {
+      state.finderJoytagSelectedTag = '';
+      const datasetLabel = $('#finder-joytag-dataset-label').value.trim();
+      if (datasetLabel && datasetLabel === state.finderJoytagAutoPoseLabel) {
+        setFinderJoytagDatasetLabel('');
+      }
+    }
+    setButtonBusy($('#finder-analyze-references'), false);
+    renderFinderReferenceAnalysis();
+    syncFinderConfigAvailability();
+  }
+
+  function renderFinderReferenceAnalysis() {
+    const card = $('#finder-joytag-analysis');
+    const analysis = state.finderReferenceAnalysis;
+    const loading = state.finderReferenceAnalysisLoading;
+    const error = state.finderReferenceAnalysisError;
+    const selectedTag = state.finderJoytagSelectedTag;
+    const threshold = Math.max(0.05, Math.min(0.95, Number(state.finderJoytagThreshold || 0.4)));
+    state.finderJoytagThreshold = threshold;
+    card.classList.toggle('is-loading', loading);
+    card.classList.toggle('is-ready', Boolean(analysis && !error));
+    card.classList.toggle('is-error', Boolean(error));
+    $('#finder-joytag-state').textContent = loading ? 'Analyzing' : error ? 'Retry' : analysis ? 'Ready' : 'Waiting';
+    $('#finder-joytag-summary').textContent = loading
+      ? 'Tagging every reference image in batches…'
+      : error
+        ? 'Reference analysis failed—review the message below.'
+        : analysis
+          ? `${formatNumber(analysis.imageCount)} references · ${analysis.quantization || 'cached'} scores`
+          : state.finderScan?.searchMode === 'joytag' && state.finderScan.joytagTag
+            ? `Saved scan used “${humanizeJoytagTag(state.finderScan.joytagTag)}”; analyze before starting another.`
+            : 'Analyze the examples folder to choose a tag.';
+    const errorElement = $('#finder-joytag-error');
+    errorElement.hidden = !error;
+    errorElement.textContent = error;
+    const empty = $('#finder-joytag-empty');
+    empty.hidden = Boolean(analysis) || loading;
+    if (!analysis && !loading) {
+      $('strong', empty).textContent = error ? 'Analysis unavailable' : 'No analysis yet';
+      $('small', empty).textContent = error
+        ? 'Correct the folder or retry the analysis.'
+        : state.finderScan?.searchMode === 'joytag' && state.finderScan.joytagTag
+          ? `This saved scan used ${humanizeJoytagTag(state.finderScan.joytagTag)}. Run Analyze to create a new tag scan.`
+          : 'Choose a folder and run JoyTag to inspect its strongest tags.';
+    }
+    $('#finder-joytag-results').hidden = !analysis;
+    $('#finder-joytag-threshold').value = threshold.toFixed(2);
+    $('#finder-joytag-threshold-output').textContent = threshold.toFixed(2);
+    if (!analysis) return;
+
+    $('#finder-joytag-image-count').textContent = formatNumber(analysis.imageCount);
+    const providerCopy = [analysis.provider, analysis.quantization].filter(Boolean).join(' · ');
+    $('#finder-joytag-provider').textContent = providerCopy || 'Ready';
+    $('#finder-joytag-provider').title = [
+      analysis.modelKey,
+      analysis.bytesPerCachedImage ? `${formatBytes(analysis.bytesPerCachedImage)} cached per image` : ''
+    ].filter(Boolean).join(' · ');
+
+    const filter = state.finderJoytagTagFilter.trim().toLocaleLowerCase();
+    const tags = analysis.tags.filter(item => (
+      !filter
+      || item.tag.toLocaleLowerCase().includes(filter)
+      || humanizeJoytagTag(item.tag).toLocaleLowerCase().includes(filter)
+    ));
+    const tagList = $('#finder-joytag-tags');
+    tagList.replaceChildren();
+    tags.forEach(item => {
+      const values = analysis.images
+        .map(image => normalizeFinderScore(image.scores[item.tag]))
+        .filter(score => score !== null);
+      const passing = values.filter(score => score >= threshold).length;
+      const label = document.createElement('label');
+      label.className = 'finder-joytag-tag';
+      label.title = `${item.tag}: average ${item.average.toFixed(3)}, median ${item.median.toFixed(3)}`;
+      const input = document.createElement('input');
+      input.type = 'radio';
+      input.name = 'finder-joytag-search-tag';
+      input.value = item.tag;
+      input.checked = item.tag === selectedTag;
+      input.dataset.finderJoytagTag = item.tag;
+      const name = document.createElement('span');
+      name.textContent = humanizeJoytagTag(item.tag);
+      const average = document.createElement('b');
+      average.textContent = finderScoreLabel(item.average);
+      const coverage = document.createElement('small');
+      coverage.textContent = `${passing}/${analysis.imageCount}`;
+      label.append(input, name, average, coverage);
+      tagList.append(label);
+    });
+    if (!tags.length) {
+      const message = document.createElement('small');
+      message.textContent = 'No analyzed tags match this filter.';
+      tagList.append(message);
+    }
+
+    const selected = finderJoytagData();
+    $('#finder-joytag-selected-tag').textContent = selected
+      ? humanizeJoytagTag(selected.tag)
+      : 'Choose a tag';
+    $('#finder-joytag-average').textContent = selected ? selected.average.toFixed(3) : '—';
+    $('#finder-joytag-minimum').textContent = selected ? selected.minimum.toFixed(3) : '—';
+    $('#finder-joytag-maximum').textContent = selected ? selected.maximum.toFixed(3) : '—';
+    const selectedScores = selected
+      ? analysis.images.map(image => normalizeFinderScore(image.scores[selected.tag])).filter(score => score !== null)
+      : [];
+    const passing = selectedScores.filter(score => score >= threshold).length;
+    $('#finder-joytag-reference-coverage').textContent = `${passing} / ${analysis.imageCount} pass`;
+
+    const grid = $('#finder-joytag-reference-grid');
+    grid.replaceChildren();
+    analysis.images.forEach(image => {
+      const score = selected ? normalizeFinderScore(image.scores[selected.tag]) : null;
+      const reference = document.createElement('article');
+      reference.className = 'finder-joytag-reference';
+      reference.classList.toggle('is-passing', score === null || score >= threshold);
+      reference.title = selected && score !== null
+        ? `${image.name} · ${selected.tag} ${score.toFixed(3)}`
+        : image.name;
+      const preview = document.createElement('img');
+      preview.loading = 'lazy';
+      preview.decoding = 'async';
+      loadImage(preview, image.previewUrl, image.name);
+      const copy = document.createElement('span');
+      const name = document.createElement('b');
+      name.textContent = image.name;
+      const value = document.createElement('strong');
+      value.textContent = score === null ? '—' : score.toFixed(3);
+      copy.append(name, value);
+      reference.append(preview, copy);
+      grid.append(reference);
+    });
+  }
+
+  function selectFinderJoytagTag(tag) {
+    if (!state.finderReferenceAnalysis?.tags.some(item => item.tag === tag)) return;
+    state.finderJoytagSelectedTag = tag;
+    syncFinderJoytagDatasetFromSelection();
+    renderFinderReferenceAnalysis();
+    syncFinderConfigAvailability();
+    announce(`${humanizeJoytagTag(tag)} selected for JoyTag search.`);
+  }
+
+  async function analyzeFinderReferences() {
+    if (state.finderReferenceAnalysisLoading || state.finderBusy) return;
+    const exampleDirectory = $('#finder-folder').value.trim();
+    if (!exampleDirectory) {
+      toast('Choose a reference folder', 'Enter a folder inside the Finder library before analyzing it.', 'info');
+      $('#finder-folder').focus();
+      return;
+    }
+    const previousTag = state.finderJoytagSelectedTag;
+    const sourceKey = finderFolderKey(exampleDirectory);
+    const request = ++state.finderReferenceAnalysisRequest;
+    state.finderReferenceAnalysis = null;
+    state.finderReferenceAnalysisSource = exampleDirectory;
+    state.finderReferenceAnalysisLoading = true;
+    state.finderReferenceAnalysisError = '';
+    renderFinderReferenceAnalysis();
+    syncFinderConfigAvailability();
+    const button = $('#finder-analyze-references');
+    setButtonBusy(button, true, 'Analyzing…');
+    try {
+      const data = await api('/api/finder/reference-analysis', {
+        method: 'POST',
+        body: { example_directory: exampleDirectory, top_tags: 40 }
+      });
+      if (
+        request !== state.finderReferenceAnalysisRequest
+        || sourceKey !== finderFolderKey($('#finder-folder').value)
+      ) return;
+      const analysis = normalizeFinderReferenceAnalysis(data);
+      if (!analysis) throw new ApiError('The server returned an invalid JoyTag reference analysis.');
+      state.finderReferenceAnalysis = analysis;
+      state.finderReferenceAnalysisSource = exampleDirectory;
+      state.finderJoytagSelectedTag = analysis.tags.some(item => item.tag === previousTag)
+        ? previousTag
+        : '';
+      state.finderReferenceAnalysisError = '';
+      if (state.finderJoytagSelectedTag) syncFinderJoytagDatasetFromSelection();
+      toast('Reference analysis ready', `${formatNumber(analysis.imageCount)} images tagged. Choose the signal you want to search.`, 'success');
+      announce(`JoyTag analysis complete for ${analysis.imageCount} reference images.`);
+    } catch (error) {
+      if (request !== state.finderReferenceAnalysisRequest) return;
+      state.finderReferenceAnalysis = null;
+      state.finderReferenceAnalysisError = errorMessage(error);
+      toast('Could not analyze references', errorMessage(error), 'error');
+    } finally {
+      if (request === state.finderReferenceAnalysisRequest) {
+        state.finderReferenceAnalysisLoading = false;
+        setButtonBusy(button, false);
+        renderFinderReferenceAnalysis();
+        syncFinderConfigAvailability();
+      }
+    }
   }
 
   function finderFeedbackTag() {
@@ -2804,6 +3192,28 @@
   function renderFinderStatus() {
     const model = state.finderStatus;
     const card = $('#finder-model-card');
+    const root = model?.folderRoot;
+    const normalizedRoot = root ? root.replace(/\/+$/, '') || '/' : '';
+    const fullExample = normalizedRoot === '/' ? '/poses/matting-press' : `${normalizedRoot}/poses/matting-press`;
+    $('#finder-folder-hint').textContent = normalizedRoot
+      ? `Use poses/matting-press relative to ${normalizedRoot}, or paste ${fullExample}. Existing folders are suggestions only.`
+      : 'Use a library-relative path such as poses/matting-press, or paste the full container path. Existing folders are suggestions only.';
+    if (finderConfigUsesJoyTag()) {
+      const available = model?.joytagAvailable !== false;
+      const ready = Boolean(model?.joytagReady || state.finderReferenceAnalysis);
+      const error = model?.joytagError || '';
+      card.classList.toggle('is-ready', available && !error);
+      card.classList.toggle('is-error', !available || Boolean(error));
+      $('#finder-model-name').textContent = 'JoyTag image tagger';
+      $('#finder-model-detail').textContent = error
+        ? `Model error: ${error}`
+        : [
+            ready ? 'Ready for batched tag confidence search' : 'Loads automatically when references are analyzed',
+            model?.joytagProvider || state.finderReferenceAnalysis?.provider || ''
+          ].filter(Boolean).join(' · ');
+      $('#finder-model-state').textContent = error ? 'Retry available' : ready ? 'Ready' : available ? 'Available' : 'Unavailable';
+      return;
+    }
     card.classList.toggle('is-ready', Boolean(model?.ready && !model.error));
     card.classList.toggle('is-error', Boolean(model && (!model.ready || model.error)));
     $('#finder-model-name').textContent = model?.name || 'Model unavailable';
@@ -2832,12 +3242,6 @@
       batchDetail
     ].filter(Boolean).join(' · ');
     $('#finder-model-state').textContent = model?.error ? 'Retry available' : model?.modelReady ? 'Ready' : model?.ready ? 'Available' : model ? model.status.replaceAll('_', ' ') : 'Offline';
-    const root = model?.folderRoot;
-    const normalizedRoot = root ? root.replace(/\/+$/, '') || '/' : '';
-    const fullExample = normalizedRoot === '/' ? '/poses/matting-press' : `${normalizedRoot}/poses/matting-press`;
-    $('#finder-folder-hint').textContent = normalizedRoot
-      ? `Use poses/matting-press relative to ${normalizedRoot}, or paste ${fullExample}. Existing folders are suggestions only.`
-      : 'Use a library-relative path such as poses/matting-press, or paste the full container path. Existing folders are suggestions only.';
   }
 
   function renderFinderCorpus() {
@@ -2900,7 +3304,11 @@
     if (state.finderScan?.id && !scans.some(scan => String(scan.id) === String(state.finderScan.id))) scans.unshift(state.finderScan);
     scans.forEach(scan => {
       const date = scan.createdAt ? relativeTime(scan.createdAt) : '';
-      const label = `${scan.poseTagLabel || 'Pose scan'} · ${scan.status.replaceAll('_', ' ')}${date ? ` · ${date}` : ''}`;
+      const searchLabel = finderScanUsesJoyTag(scan)
+        ? humanizeJoytagTag(scan.joytagTag) || scan.poseTagLabel || 'Tag scan'
+        : scan.poseTagLabel || 'Pose scan';
+      const modeLabel = finderScanUsesJoyTag(scan) ? 'JoyTag' : 'Pose';
+      const label = `${searchLabel} · ${modeLabel} · ${scan.status.replaceAll('_', ' ')}${date ? ` · ${date}` : ''}`;
       select.add(new Option(label, String(scan.id)));
     });
     if ([...select.options].some(option => option.value === selected)) select.value = selected;
@@ -2909,28 +3317,77 @@
   function syncFinderConfigAvailability() {
     const locked = Boolean(state.finderScan && !finderScanIsTerminal());
     const feedbackMutationPending = state.finderFeedbackBusy || finderFeedbackIsSaving();
-    ['finder-folder', 'finder-pose-tag', 'finder-source', 'finder-pages', 'finder-min-similarity'].forEach(id => { $(`#${id}`).disabled = locked || state.finderBusy; });
+    const joytag = finderConfigUsesJoyTag();
+    ['finder-folder', 'finder-pose-tag', 'finder-source', 'finder-pages'].forEach(id => { $(`#${id}`).disabled = locked || state.finderBusy; });
+    $('#finder-min-similarity').disabled = locked || state.finderBusy || joytag;
+    $('#finder-joytag-dataset-label').disabled = locked || state.finderBusy;
+    $('#finder-joytag-threshold').disabled = locked || state.finderBusy || state.finderReferenceAnalysisLoading;
+    $('#finder-joytag-tag-filter').disabled = state.finderReferenceAnalysisLoading || !state.finderReferenceAnalysis;
+    $$('[data-finder-mode]').forEach(button => { button.disabled = locked || state.finderBusy; });
     $('#finder-use-current').disabled = locked || state.finderBusy;
     $('#finder-scan-select').disabled = state.finderLoading || feedbackMutationPending;
-    const hasConfig = Boolean($('#finder-folder').value.trim() && $('#finder-pose-tag').value.trim() && $('#finder-source').value.trim());
+    const analysisCurrent = finderReferenceAnalysisIsCurrent();
+    const joytagReady = state.finderStatus?.joytagAvailable !== false;
+    const poseReady = Boolean(state.finderStatus?.ready);
+    const modelReady = joytag ? joytagReady : poseReady;
+    const hasConfig = Boolean(
+      $('#finder-folder').value.trim()
+      && $('#finder-pose-tag').value.trim()
+      && $('#finder-source').value.trim()
+      && (!joytag || (analysisCurrent && state.finderJoytagSelectedTag))
+    );
+    const analyze = $('#finder-analyze-references');
+    analyze.disabled = locked
+      || state.finderBusy
+      || state.finderReferenceAnalysisLoading
+      || !joytagReady
+      || !$('#finder-folder').value.trim();
+    analyze.title = !joytagReady
+      ? state.finderStatus?.joytagError || 'JoyTag is unavailable'
+      : !$('#finder-folder').value.trim() ? 'Choose an examples folder first' : '';
     $('#finder-start').hidden = locked;
     $('#finder-start').disabled = state.finderLoading
       || state.finderBusy
       || feedbackMutationPending
-      || !state.finderStatus?.ready
+      || !modelReady
       || !hasConfig;
+    $('#finder-start').title = joytag && !analysisCurrent
+      ? 'Analyze the current examples folder before starting a tag scan'
+      : joytag && !state.finderJoytagSelectedTag
+        ? 'Choose one JoyTag signal before starting'
+        : !modelReady ? (joytag ? state.finderStatus?.joytagError : state.finderStatus?.detail) || 'Finder model unavailable' : '';
   }
 
   function applyFinderScanConfig(scan) {
     if (!scan) return;
+    const scanMode = normalizeFinderMode(scan.searchMode);
+    state.finderMode = scanMode;
+    storage.set('finder-mode', scanMode);
     $('#finder-folder').value = scan.examplesFolder;
     $('#finder-pose-tag').value = scan.poseTagLabel;
+    $('#finder-joytag-dataset-label').value = scan.poseTagLabel;
+    state.finderJoytagAutoPoseLabel = '';
+    state.finderJoytagSelectedTag = scanMode === 'joytag' ? scan.joytagTag : '';
     $('#finder-source').value = scan.sourceUrl || finderDefaultSource();
     $('#finder-pages').value = Math.max(1, Math.min(50, scan.pages || 5));
     $('#finder-min-similarity').value = scan.minSimilarity.toFixed(2);
+    state.finderJoytagThreshold = Math.max(0.05, Math.min(0.95, scan.minSimilarity));
+    $('#finder-joytag-threshold').value = state.finderJoytagThreshold.toFixed(2);
+    $('#finder-joytag-threshold-output').textContent = state.finderJoytagThreshold.toFixed(2);
+    $('#finder-result-threshold').min = scanMode === 'joytag' ? '0.05' : '0.40';
     $('#finder-result-threshold').value = scan.minSimilarity.toFixed(2);
     $('#finder-min-output').textContent = scan.minSimilarity.toFixed(2);
     $('#finder-filter-output').textContent = scan.minSimilarity.toFixed(2);
+    if (
+      state.finderReferenceAnalysis
+      && finderFolderKey(state.finderReferenceAnalysisSource) !== finderFolderKey(scan.examplesFolder)
+    ) {
+      state.finderReferenceAnalysis = null;
+      state.finderReferenceAnalysisSource = '';
+      state.finderReferenceAnalysisError = '';
+    }
+    renderFinderMode();
+    renderFinderReferenceAnalysis();
   }
 
   function finderScoreLabel(score) {
@@ -2938,6 +3395,13 @@
   }
 
   function finderEvidenceLabel(item, { short = false } = {}) {
+    if (finderScanUsesJoyTag() || item?.matchType === 'tag') {
+      const score = finderScoreLabel(firstFinderScore(item?.tagScore, item?.score));
+      const tag = humanizeJoytagTag(item?.tag || state.finderScan?.joytagTag);
+      return short
+        ? `JoyTag confidence ${score}`
+        : `${tag || 'Selected tag'} · JoyTag confidence ${score}`;
+    }
     const tier = normalizeFinderTier(item?.rankingTier);
     const score = finderScoreLabel(item?.score);
     if (tier === 3) return `${short ? 'Exact' : 'Exact image'} ${score}`;
@@ -2947,6 +3411,7 @@
   }
 
   function finderEvidenceKind(item) {
+    if (finderScanUsesJoyTag() || item?.matchType === 'tag') return 'JoyTag tag';
     const tier = normalizeFinderTier(item?.rankingTier);
     if (tier === 3) return 'Exact image';
     if (tier === 2) return 'Pose match';
@@ -2955,6 +3420,7 @@
   }
 
   function appendFinderMatchMedia(container, result) {
+    const joytag = finderScanUsesJoyTag() || result.matchType === 'tag';
     const matches = result.matches?.length ? result.matches : [{
       rank: 1,
       imageUrl: result.bestImageUrl,
@@ -2991,8 +3457,8 @@
       }
       $('.finder-match-ordinal', button).textContent = match.ordinal ? `Image ${String(match.ordinal).padStart(2, '0')}` : 'Candidate';
       const peopleBadge = $('.finder-match-people', button);
-      peopleBadge.hidden = !match.personCount;
-      if (match.personCount) peopleBadge.textContent = `${match.personCount} ${match.personCount === 1 ? 'person' : 'people'}`;
+      peopleBadge.hidden = joytag || !match.personCount;
+      if (!joytag && match.personCount) peopleBadge.textContent = `${match.personCount} ${match.personCount === 1 ? 'person' : 'people'}`;
       const overlayUrl = safeUrl(match.overlayUrl);
       if (overlayUrl) {
         const overlay = $('.finder-skeleton-overlay', button);
@@ -3005,14 +3471,21 @@
       }
       const select = document.createElement('label');
       select.className = 'finder-match-select';
-      select.title = selected ? 'Selected for pose feedback—click to exclude' : 'Excluded from pose feedback—click to include';
+      select.title = joytag
+        ? selected ? 'Selected as a matching image—click to exclude' : 'Excluded from this gallery review—click to include'
+        : selected ? 'Selected for pose feedback—click to exclude' : 'Excluded from pose feedback—click to include';
       const checkbox = document.createElement('input');
       checkbox.type = 'checkbox';
       checkbox.checked = selected;
       checkbox.disabled = !match.imageUrl || result.feedbackSaving || state.finderFeedbackBusy;
       checkbox.dataset.finderFeedbackMatch = match.feedbackKey;
       checkbox.dataset.finderResult = String(result.key);
-      checkbox.setAttribute('aria-label', match.imageUrl ? `Use ${ordinalCopy} as pose feedback` : `${ordinalCopy} is unavailable for pose feedback`);
+      checkbox.setAttribute(
+        'aria-label',
+        joytag
+          ? match.imageUrl ? `Select ${ordinalCopy} as a matching image` : `${ordinalCopy} is unavailable`
+          : match.imageUrl ? `Use ${ordinalCopy} as pose feedback` : `${ordinalCopy} is unavailable for pose feedback`
+      );
       select.innerHTML = '<svg><use href="#i-check"></use></svg><span>Use</span>';
       select.prepend(checkbox);
       item.append(button, select);
@@ -3022,6 +3495,21 @@
 
   function renderFinderDiagnostics(card, result) {
     const breakdown = $('.finder-score-breakdown', card);
+    if (finderScanUsesJoyTag() || result.matchType === 'tag') {
+      const badge = document.createElement('span');
+      const score = firstFinderScore(result.tagScore, result.score) ?? 0;
+      const tag = humanizeJoytagTag(result.tag || state.finderScan?.joytagTag) || 'JoyTag';
+      badge.className = 'finder-score-chip is-appearance';
+      badge.title = `${tag} JoyTag confidence ${finderScoreLabel(score)}`;
+      badge.innerHTML = '<i></i><span></span><b></b>';
+      $('span', badge).textContent = `${tag} · JoyTag`;
+      $('b', badge).textContent = finderScoreLabel(score);
+      breakdown.append(badge);
+      $('.finder-person-count', card).hidden = true;
+      $('.finder-overlay-toggle', card).hidden = true;
+      $('.finder-diagnostic-toolbar', card).hidden = false;
+      return;
+    }
     const scores = [
       ['exact', 'Exact', result.exactScore],
       ['pose', 'Pose', result.poseScore],
@@ -3095,6 +3583,13 @@
 
   function renderFinderResults() {
     const ranked = [...state.finderResults];
+    const joytagScan = finderScanUsesJoyTag();
+    const resultThreshold = $('#finder-result-threshold');
+    const resultThresholdMinimum = joytagScan ? 0.05 : 0.40;
+    resultThreshold.min = resultThresholdMinimum.toFixed(2);
+    if (Number(resultThreshold.value || 0) < resultThresholdMinimum) {
+      resultThreshold.value = resultThresholdMinimum.toFixed(2);
+    }
     const loadedCounts = {
       pending: ranked.filter(result => result.review === 'pending').length,
       accepted: ranked.filter(result => result.review === 'accepted').length,
@@ -3111,7 +3606,11 @@
       button.classList.toggle('is-active', active);
       button.setAttribute('aria-selected', String(active));
     });
-    const threshold = Number($('#finder-result-threshold').value || 0);
+    const threshold = Number(resultThreshold.value || resultThresholdMinimum);
+    const thresholdControl = resultThreshold.closest('.finder-threshold');
+    const thresholdCopy = $('span', thresholdControl);
+    if (thresholdCopy?.firstChild) thresholdCopy.firstChild.textContent = joytagScan ? 'JoyTag ≥ ' : 'Score ≥ ';
+    thresholdControl.title = joytagScan ? 'Filter galleries by selected JoyTag confidence' : 'Applied within each evidence tier';
     $('#finder-filter-output').textContent = threshold.toFixed(2);
     const results = ranked.filter(result => result.review === state.finderReview && result.score >= threshold);
     const grid = $('#finder-result-grid');
@@ -3139,11 +3638,13 @@
       const kindCopy = finderEvidenceKind(result);
       matchKind.hidden = !kindCopy;
       matchKind.textContent = kindCopy;
-      matchKind.title = result.rankingTier === 1
-        ? 'RTMO could not confirm matching person counts and enough body-and-limb evidence, so this candidate is ranked by visual layout below high-precision pose matches.'
-        : result.rankingTier === 0
-          ? 'RTMO found high-precision body evidence, but its geometry did not reach the pose-match floor.'
-          : '';
+      matchKind.title = joytagScan
+        ? `${humanizeJoytagTag(result.tag || state.finderScan?.joytagTag) || 'Selected tag'} confidence from JoyTag`
+        : result.rankingTier === 1
+          ? 'RTMO could not confirm matching person counts and enough body-and-limb evidence, so this candidate is ranked by visual layout below high-precision pose matches.'
+          : result.rankingTier === 0
+            ? 'RTMO found high-precision body evidence, but its geometry did not reach the pose-match floor.'
+            : '';
       $('.finder-card-title', card).textContent = result.title;
       const matchCopy = `${formatNumber(result.matchCount)} ${result.matchCount === 1 ? 'image' : 'images'} compared`;
       $('.finder-card-meta', card).textContent = `${matchCopy}${result.imageCount ? ` · ${formatNumber(result.imageCount)} total` : ''}`;
@@ -3153,25 +3654,43 @@
       const usableFeedbackCount = result.feedbackUsableImageUrls.length;
       const pendingFeedbackCount = result.feedbackPendingImageUrls.length;
       const reviewedWithFeedback = ['accepted', 'rejected'].includes(result.review);
-      feedbackCopy.textContent = result.feedbackSaving
-        ? 'Saving gallery review and pose feedback…'
-        : state.finderFeedbackBusy
-          ? 'Resetting pose feedback…'
+      if (joytagScan) {
+        feedbackCopy.textContent = result.feedbackSaving
+          ? 'Saving gallery review and selected matching images…'
           : result.review === 'maybe'
             ? selectedFeedback
-              ? `Maybe is neutral—no feedback saved · ${selectedFeedback} checked for a future decision`
-              : 'Maybe is neutral—no pose feedback · check images before changing to Accept'
+              ? `Maybe is neutral · ${selectedFeedback} matching ${selectedFeedback === 1 ? 'image' : 'images'} kept for a future decision`
+              : 'Maybe is neutral · select images before changing to Accept'
             : reviewedWithFeedback
               ? result.feedbackSelectionDirty
                 ? `${savedFeedbackCount} selected · unsaved changes—use Save selection`
-                : pendingFeedbackCount
-                  ? `${savedFeedbackCount} selected and saved · ${usableFeedbackCount} ranking-eligible · ${pendingFeedbackCount} pose-pending`
-                  : savedFeedbackCount
-                    ? `${savedFeedbackCount} ${result.review} feedback ${savedFeedbackCount === 1 ? 'image' : 'images'} ${result.feedbackAnalysisProvided ? 'saved and ranking-eligible' : 'saved'} · edit checks or open the gallery`
-                    : `Gallery ${result.review} · no image-level pose feedback saved`
+                : savedFeedbackCount
+                  ? `${savedFeedbackCount} matching ${savedFeedbackCount === 1 ? 'image' : 'images'} saved with this ${result.review} gallery · edit checks or open the gallery`
+                  : `Gallery ${result.review} · no matching images saved`
               : selectedFeedback
-                ? `${selectedFeedback} of ${result.matches.length} suggested ${result.matches.length === 1 ? 'image' : 'images'} checked for pose feedback · uncheck wrong images`
-                : 'No suggested images checked · Accept requires at least one';
+                ? `${selectedFeedback} of ${result.matches.length} JoyTag ${result.matches.length === 1 ? 'suggestion' : 'suggestions'} selected · uncheck false positives`
+                : 'No matching images selected · Accept requires at least one';
+      } else {
+        feedbackCopy.textContent = result.feedbackSaving
+          ? 'Saving gallery review and pose feedback…'
+          : state.finderFeedbackBusy
+            ? 'Resetting pose feedback…'
+            : result.review === 'maybe'
+              ? selectedFeedback
+                ? `Maybe is neutral—no feedback saved · ${selectedFeedback} checked for a future decision`
+                : 'Maybe is neutral—no pose feedback · check images before changing to Accept'
+              : reviewedWithFeedback
+                ? result.feedbackSelectionDirty
+                  ? `${savedFeedbackCount} selected · unsaved changes—use Save selection`
+                  : pendingFeedbackCount
+                    ? `${savedFeedbackCount} selected and saved · ${usableFeedbackCount} ranking-eligible · ${pendingFeedbackCount} pose-pending`
+                    : savedFeedbackCount
+                      ? `${savedFeedbackCount} ${result.review} feedback ${savedFeedbackCount === 1 ? 'image' : 'images'} ${result.feedbackAnalysisProvided ? 'saved and ranking-eligible' : 'saved'} · edit checks or open the gallery`
+                      : `Gallery ${result.review} · no image-level pose feedback saved`
+                : selectedFeedback
+                  ? `${selectedFeedback} of ${result.matches.length} suggested ${result.matches.length === 1 ? 'image' : 'images'} checked for pose feedback · uncheck wrong images`
+                  : 'No suggested images checked · Accept requires at least one';
+      }
       renderFinderDiagnostics(card, result);
       $$('.finder-card-open', card).forEach(button => {
         button.dataset.finderAction = 'open';
@@ -3198,12 +3717,15 @@
         : result.feedbackSaving
         ? 'Saving this gallery review'
         : !savedFeedbackCount ? 'Check at least one matching image before accepting' : '';
+      if (joytagScan && state.finderFeedbackBusy) accept.title = 'Wait for the current Finder update to finish';
       reject.title = state.finderFeedbackBusy
-        ? 'Wait for pose feedback reset to finish'
+        ? joytagScan ? 'Wait for the current Finder update to finish' : 'Wait for pose feedback reset to finish'
         : result.feedbackSaving ? 'Saving this gallery review' : '';
       maybe.title = state.finderFeedbackBusy
-        ? 'Wait for pose feedback reset to finish'
-        : result.review === 'maybe' ? 'Maybe is neutral and creates no pose feedback' : 'Keep this gallery without using it as pose feedback';
+        ? joytagScan ? 'Wait for the current Finder update to finish' : 'Wait for pose feedback reset to finish'
+        : joytagScan
+          ? result.review === 'maybe' ? 'Maybe keeps this gallery neutral' : 'Keep this gallery for later review'
+          : result.review === 'maybe' ? 'Maybe is neutral and creates no pose feedback' : 'Keep this gallery without using it as pose feedback';
       saveSelection.title = result.review === 'accepted' && !savedFeedbackCount
         ? 'Accepted feedback needs at least one selected image'
         : result.feedbackSelectionDirty ? 'Save the edited feedback image selection' : 'Selection is already saved';
@@ -3217,7 +3739,9 @@
         ? 'Lower the display threshold or choose another review tab.'
         : finderScanIsRunning()
           ? 'Results will appear here as galleries are compared.'
-          : 'Try more examples, a lower minimum match score, or a wider source.';
+          : joytagScan
+            ? 'Try a lower JoyTag confidence threshold or a wider source.'
+            : 'Try more examples, a lower minimum match score, or a wider source.';
     }
     renderFinderPagination();
   }
@@ -3262,6 +3786,8 @@
   function renderFinderWorkspace() {
     renderFinderFolders();
     renderFinderTags();
+    renderFinderMode();
+    renderFinderReferenceAnalysis();
     renderFinderStatus();
     renderFinderFeedback();
     renderFinderCorpus();
@@ -3282,7 +3808,9 @@
     const canExtend = finderScanCanExtend(scan);
     const canContinue = finderScanCanContinue(scan);
     const atPageCap = finderScanAtPageCap(scan);
-    const finderReady = Boolean(state.finderStatus?.ready);
+    const finderReady = finderScanUsesJoyTag(scan)
+      ? state.finderStatus?.joytagAvailable !== false
+      : Boolean(state.finderStatus?.ready);
     const finderMutationPending = state.finderFeedbackBusy || finderFeedbackIsSaving();
     $('#finder-extend').hidden = !canExtend;
     $('#finder-continue').hidden = !canContinue;
@@ -3344,7 +3872,10 @@
       : sourceExhausted
         ? 'The selected Source URL has no more pages'
         : `Exploring ${displayHost(scan.sourceUrl)} for new galleries`;
-    $('#finder-session-label').textContent = `${scan.poseTagLabel || 'Pose scan'} · ${status}`;
+    const sessionName = finderScanUsesJoyTag(scan)
+      ? humanizeJoytagTag(scan.joytagTag) || scan.poseTagLabel || 'Tag scan'
+      : scan.poseTagLabel || 'Pose scan';
+    $('#finder-session-label').textContent = `${sessionName} · ${finderScanUsesJoyTag(scan) ? 'JoyTag' : 'Pose'} · ${status}`;
     $('#finder-pages-scanned').textContent = formatNumber(scan.pagesScanned);
     $('#finder-pages-total').textContent = formatNumber(scan.pages || 0);
     $('#finder-pages-budget').hidden = sourceExhausted;
@@ -3374,22 +3905,40 @@
   }
 
   function readFinderConfig({ validate = false } = {}) {
+    const mode = state.finderMode;
+    const joytag = mode === 'joytag';
     const exampleDirectory = $('#finder-folder').value.trim();
     const tagLabel = $('#finder-pose-tag').value.trim().replace(/\s+/g, ' ');
     const sourceInput = $('#finder-source').value.trim();
     const sourceUrl = /^https?:\/\//i.test(sourceInput) ? safeUrl(sourceInput) : '';
     const requestedPages = Number.parseInt($('#finder-pages').value || '5', 10);
     const pageLimit = Math.max(1, Math.min(50, Number.isFinite(requestedPages) ? requestedPages : 5));
-    const minimumScore = Math.max(0.4, Math.min(0.95, Number($('#finder-min-similarity').value || 0.68)));
+    const minimumScore = joytag
+      ? Math.max(0.05, Math.min(0.95, Number(state.finderJoytagThreshold || 0.4)))
+      : Math.max(0.4, Math.min(0.95, Number($('#finder-min-similarity').value || 0.68)));
     if (validate && !exampleDirectory) {
       const root = state.finderStatus?.folderRoot || 'the library root';
       toast('Enter an examples folder', `Use any folder inside ${root}, as a relative path or full container path.`, 'info');
       $('#finder-folder').focus();
       return null;
     }
+    if (validate && joytag && !finderReferenceAnalysisIsCurrent()) {
+      toast('Analyze this reference folder', 'Tag search needs a fresh JoyTag analysis of the folder currently shown.', 'info');
+      $('#finder-analyze-references').focus();
+      return null;
+    }
+    if (validate && joytag && !state.finderJoytagSelectedTag) {
+      toast('Choose a JoyTag signal', 'Select the interaction or pose tag you want to find.', 'info');
+      $('#finder-joytag-tags').scrollIntoView({ block: 'nearest' });
+      return null;
+    }
     if (validate && !tagLabel) {
-      toast('Name the pose', 'Choose an existing pose tag or enter a new one.', 'info');
-      $('#finder-pose-tag').focus();
+      toast(
+        joytag ? 'Name the dataset' : 'Name the pose',
+        joytag ? 'Enter the label used for saved reviews and control/target preparation.' : 'Choose an existing pose tag or enter a new one.',
+        'info'
+      );
+      (joytag ? $('#finder-joytag-dataset-label') : $('#finder-pose-tag')).focus();
       return null;
     }
     if (validate && !sourceUrl) {
@@ -3397,12 +3946,30 @@
       $('#finder-source').focus();
       return null;
     }
-    if (validate && !state.finderStatus?.ready) {
-      toast('Finder model is not ready', state.finderStatus?.detail || 'Refresh after the model becomes available.', 'info');
+    const modelReady = joytag
+      ? state.finderStatus?.joytagAvailable !== false
+      : Boolean(state.finderStatus?.ready);
+    if (validate && !modelReady) {
+      toast(
+        joytag ? 'JoyTag is not ready' : 'Finder model is not ready',
+        joytag
+          ? state.finderStatus?.joytagError || 'Refresh after the tagger becomes available.'
+          : state.finderStatus?.detail || 'Refresh after the model becomes available.',
+        'info'
+      );
       return null;
     }
     $('#finder-pages').value = String(pageLimit);
-    return { exampleDirectory, tagLabel, sourceUrl, pageLimit, minimumScore };
+    return {
+      mode,
+      exampleDirectory,
+      tagLabel,
+      sourceUrl,
+      pageLimit,
+      minimumScore,
+      joytagTag: joytag ? state.finderJoytagSelectedTag : null,
+      referenceFingerprint: joytag ? state.finderReferenceAnalysis.fingerprint : null
+    };
   }
 
   function readFinderContinueConfig({ validate = false } = {}) {
@@ -3414,8 +3981,17 @@
       $('#finder-continue-source').focus();
       return null;
     }
-    if (validate && !state.finderStatus?.ready) {
-      toast('Finder model is not ready', state.finderStatus?.detail || 'Refresh after the model becomes available.', 'info');
+    const joytag = finderScanUsesJoyTag();
+    const modelReady = joytag
+      ? state.finderStatus?.joytagAvailable !== false
+      : Boolean(state.finderStatus?.ready);
+    if (validate && !modelReady) {
+      toast(
+        joytag ? 'JoyTag is not ready' : 'Finder model is not ready',
+        (joytag ? state.finderStatus?.joytagError : state.finderStatus?.detail)
+          || 'Refresh after the model becomes available.',
+        'info'
+      );
       return null;
     }
     return { sourceUrl, additionalPages };
@@ -3557,6 +4133,14 @@
   }
 
   async function loadFinderFeedback({ quiet = false, force = false } = {}) {
+    if (finderConfigUsesJoyTag()) {
+      state.finderFeedbackRequest += 1;
+      state.finderFeedback = null;
+      state.finderFeedbackLoading = false;
+      state.finderFeedbackError = '';
+      renderFinderFeedback();
+      return;
+    }
     const tag = finderFeedbackTag();
     window.clearTimeout(state.finderFeedbackTimer);
     state.finderFeedbackTimer = null;
@@ -3838,7 +4422,10 @@
           pose_tag_id: tag.id,
           source_url: config.sourceUrl,
           page_limit: config.pageLimit,
-          minimum_score: config.minimumScore
+          minimum_score: config.minimumScore,
+          mode: config.mode,
+          joytag_tag: config.joytagTag,
+          reference_fingerprint: config.referenceFingerprint
         }
       });
       const scan = normalizeFinderScan(data?.scan || data);
@@ -3846,6 +4433,9 @@
       if (!scan.poseTagLabel) scan.poseTagLabel = tag.label;
       if (!scan.poseTagId) scan.poseTagId = tag.id;
       scan.poseDefaultRole = tag.defaultRole;
+      scan.searchMode = config.mode;
+      scan.joytagTag = config.joytagTag || '';
+      scan.referenceFingerprint = config.referenceFingerprint || '';
       state.finderScan = scan;
       state.finderScanId = scan.id;
       state.finderResults = [];
@@ -3854,9 +4444,16 @@
       resetFinderResultPagination();
       state.finderScans = [scan, ...state.finderScans.filter(item => String(item.id) !== String(scan.id))];
       storage.set('finder-scan', state.finderScanId);
+      $('#finder-result-threshold').min = config.mode === 'joytag' ? '0.05' : '0.40';
       $('#finder-result-threshold').value = config.minimumScore.toFixed(2);
       $('#finder-filter-output').textContent = config.minimumScore.toFixed(2);
-      toast('Finder scan started', `Scanning up to ${config.pageLimit} pages for “${tag.label}”.`, 'success');
+      toast(
+        config.mode === 'joytag' ? 'JoyTag scan started' : 'Finder scan started',
+        config.mode === 'joytag'
+          ? `Searching up to ${config.pageLimit} pages for “${humanizeJoytagTag(config.joytagTag)}” at ${config.minimumScore.toFixed(2)} confidence.`
+          : `Scanning up to ${config.pageLimit} pages for “${tag.label}”.`,
+        'success'
+      );
       await loadFinderScan({ quiet: true });
     } catch (error) {
       toast('Could not start Finder', errorMessage(error), 'error');
@@ -4062,7 +4659,11 @@
     result.feedbackImageUrls = nextImageUrls;
     result.feedbackSelectionDirty = true;
     renderFinderResults();
-    announce(`${input.checked ? 'Included' : 'Excluded'} suggested image ${result.feedbackMatchKeys.length} of ${result.matches.length} for pose feedback.`);
+    announce(
+      finderScanUsesJoyTag()
+        ? `${input.checked ? 'Included' : 'Excluded'} matching image ${result.feedbackMatchKeys.length} of ${result.matches.length} for this gallery review.`
+        : `${input.checked ? 'Included' : 'Excluded'} suggested image ${result.feedbackMatchKeys.length} of ${result.matches.length} for pose feedback.`
+    );
   }
 
   async function reviewFinderResult(result, review, button = null, { feedbackImageUrls: explicitFeedbackUrls = null } = {}) {
@@ -4814,9 +5415,57 @@
       syncFinderConfigAvailability();
       $('#finder-source').focus();
     });
-    ['finder-folder', 'finder-pose-tag', 'finder-source', 'finder-pages'].forEach(id => {
+    $$('[data-finder-mode]').forEach(button => button.addEventListener('click', () => {
+      setFinderMode(button.dataset.finderMode);
+    }));
+    const handleFinderFolderInput = () => {
+      const current = finderFolderKey($('#finder-folder').value);
+      const analyzed = finderFolderKey(state.finderReferenceAnalysisSource);
+      if (
+        (
+          state.finderReferenceAnalysis
+          || state.finderReferenceAnalysisLoading
+          || state.finderReferenceAnalysisError
+        )
+        && current !== analyzed
+      ) {
+        invalidateFinderReferenceAnalysis();
+      } else {
+        syncFinderConfigAvailability();
+      }
+    };
+    $('#finder-folder').addEventListener('input', handleFinderFolderInput);
+    $('#finder-folder').addEventListener('change', handleFinderFolderInput);
+    ['finder-pose-tag', 'finder-source', 'finder-pages'].forEach(id => {
       $(`#${id}`).addEventListener('input', syncFinderConfigAvailability);
       $(`#${id}`).addEventListener('change', syncFinderConfigAvailability);
+    });
+    $('#finder-analyze-references').addEventListener('click', analyzeFinderReferences);
+    $('#finder-joytag-dataset-label').addEventListener('input', event => {
+      const value = event.currentTarget.value;
+      $('#finder-pose-tag').value = value;
+      state.finderJoytagAutoPoseLabel = '';
+      syncFinderConfigAvailability();
+    });
+    $('#finder-joytag-dataset-label').addEventListener('change', event => {
+      const normalized = event.currentTarget.value.trim().replace(/\s+/g, ' ');
+      event.currentTarget.value = normalized;
+      $('#finder-pose-tag').value = normalized;
+      syncFinderConfigAvailability();
+    });
+    $('#finder-joytag-tag-filter').addEventListener('input', event => {
+      state.finderJoytagTagFilter = event.currentTarget.value;
+      renderFinderReferenceAnalysis();
+    });
+    $('#finder-joytag-tags').addEventListener('change', event => {
+      const input = event.target.closest('input[data-finder-joytag-tag]');
+      if (input?.checked) selectFinderJoytagTag(input.dataset.finderJoytagTag);
+    });
+    $('#finder-joytag-threshold').addEventListener('input', event => {
+      state.finderJoytagThreshold = Math.max(0.05, Math.min(0.95, Number(event.currentTarget.value || 0.4)));
+      storage.set('finder-joytag-threshold', state.finderJoytagThreshold);
+      renderFinderReferenceAnalysis();
+      syncFinderConfigAvailability();
     });
     $('#finder-pose-tag').addEventListener('input', () => scheduleFinderFeedbackLoad());
     $('#finder-pose-tag').addEventListener('change', () => loadFinderFeedback({ quiet: true, force: true }));

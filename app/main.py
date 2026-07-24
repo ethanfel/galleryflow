@@ -23,6 +23,7 @@ from .finder import (
 )
 from .models import (
     DownloadCreate,
+    FinderReferenceAnalysisCreate,
     FinderReviewPatch,
     FinderScanContinue,
     FinderScanCreate,
@@ -488,6 +489,17 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
     async def finder_feedback(pose_tag_id: int) -> dict:
         return {
             "feedback": await asyncio.to_thread(finder.feedback_status, pose_tag_id)
+        }
+
+    @app.post("/api/finder/reference-analysis")
+    async def analyze_finder_references(
+        payload: FinderReferenceAnalysisCreate,
+    ) -> dict:
+        return {
+            "analysis": await finder.analyze_reference_directory(
+                payload.example_directory,
+                top_tags=payload.top_tags,
+            )
         }
 
     @app.delete("/api/finder/feedback/{pose_tag_id}")

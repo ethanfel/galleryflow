@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import io
 import json
@@ -16,7 +17,7 @@ from urllib.parse import urljoin
 
 import httpx
 import numpy as np
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from .config import AppConfig
 from .db import Database, utc_now
@@ -36,8 +37,12 @@ ANALYZER_VERSION = "hybrid-spatial-pyramid-v1+rtmo-l-geometry-v1+phash64-gate-v1
 LEGACY_RANKING_VERSION = "appearance-v1"
 POSE_FIRST_RANKING_VERSION = "pose-first-v1"
 CURRENT_RANKING_VERSION = "pose-precision-v2"
+JOYTAG_RANKING_VERSION = "joytag-v1"
 POSE_RANKING_VERSIONS = frozenset(
     {POSE_FIRST_RANKING_VERSION, CURRENT_RANKING_VERSION}
+)
+CURRENT_RANKING_VERSIONS = frozenset(
+    {CURRENT_RANKING_VERSION, JOYTAG_RANKING_VERSION}
 )
 CORPUS_BACKFILL_VERSION = "top-matches-v1"
 CORPUS_SCAN_GUARD_VERSION = "pre-corpus-scans-v1"
@@ -117,6 +122,7 @@ class FinderService:
         *,
         encoder: Any | None = None,
         pose_estimator: Any | None = None,
+        joytagger: Any | None = None,
         media_fetcher: MediaFetcher | None = None,
     ) -> None:
         self.config = config
@@ -125,13 +131,18 @@ class FinderService:
         self.events = events
         self.encoder = encoder
         self.pose_estimator = pose_estimator
+        self.joytagger = joytagger
         self.media_fetcher = media_fetcher
         assert config.finder_examples_root is not None
         assert config.finder_model_path is not None
         assert config.finder_pose_model_path is not None
+        assert config.finder_joytag_model_path is not None
+        assert config.finder_joytag_tags_path is not None
         self.examples_root = config.finder_examples_root.resolve()
         self.model_path = config.finder_model_path.resolve()
         self.pose_model_path = config.finder_pose_model_path.resolve()
+        self.joytag_model_path = config.finder_joytag_model_path.resolve()
+        self.joytag_tags_path = config.finder_joytag_tags_path.resolve()
         self.queue: asyncio.Queue[str] = asyncio.Queue()
         self._workers: list[asyncio.Task] = []
         self._client: httpx.AsyncClient | None = None
@@ -148,11 +159,15 @@ class FinderService:
         self._lock = threading.RLock()
         self._stopping = False
         self._available = True
+        self._joytag_available = True
         self._ready = False
         self._pose_ready = False
+        self._joytag_ready = False
         self._prepare_error = ""
         self._pose_error = ""
+        self._joytag_error = ""
         self._model_key = ""
+        self._joytag_model_key = ""
         self._last_event_at: dict[str, float] = {}
         self._cache_writes_since_prune = 0
 
@@ -177,6 +192,9 @@ class FinderService:
                     pages_completed INTEGER NOT NULL DEFAULT 0,
                     minimum_score REAL NOT NULL,
                     ranking_version TEXT NOT NULL DEFAULT 'pose-precision-v2',
+                    search_mode TEXT NOT NULL DEFAULT 'pose',
+                    joytag_tag TEXT NOT NULL DEFAULT '',
+                    joytag_tag_index INTEGER,
                     status TEXT NOT NULL,
                     total_galleries INTEGER NOT NULL DEFAULT 0,
                     processed_galleries INTEGER NOT NULL DEFAULT 0,
@@ -228,6 +246,7 @@ class FinderService:
                     score REAL NOT NULL DEFAULT 0,
                     ranking_tier INTEGER NOT NULL DEFAULT 1,
                     matches_json TEXT NOT NULL DEFAULT '[]',
+                    selected_images_json TEXT NOT NULL DEFAULT '[]',
                     images_scored INTEGER NOT NULL DEFAULT 0,
                     online_scanned INTEGER NOT NULL DEFAULT 1,
                     status TEXT NOT NULL,
@@ -267,6 +286,15 @@ class FinderService:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS finder_joytag_cache (
+                    model_key TEXT NOT NULL,
+                    source_key TEXT NOT NULL,
+                    dimensions INTEGER NOT NULL,
+                    scores BLOB NOT NULL,
+                    created_at TEXT NOT NULL,
+                    last_used_at TEXT NOT NULL,
+                    PRIMARY KEY (model_key, source_key)
                 );
                 CREATE TABLE IF NOT EXISTS finder_feedback_decisions (
                     origin_result_id TEXT PRIMARY KEY,
@@ -319,6 +347,8 @@ class FinderService:
                     ON finder_embedding_cache(
                         model_key, source_key, include_mirror
                     );
+                CREATE INDEX IF NOT EXISTS idx_finder_joytag_cache_source
+                    ON finder_joytag_cache(source_key);
                 CREATE INDEX IF NOT EXISTS idx_finder_corpus_images_source
                     ON finder_corpus_images(source_key);
                 CREATE INDEX IF NOT EXISTS idx_finder_corpus_images_scan
@@ -349,6 +379,9 @@ class FinderService:
                     "corpus_images_scored": "INTEGER NOT NULL DEFAULT 0",
                     "corpus_galleries_scored": "INTEGER NOT NULL DEFAULT 0",
                     "feedback_revision": "INTEGER NOT NULL DEFAULT 0",
+                    "search_mode": "TEXT NOT NULL DEFAULT 'pose'",
+                    "joytag_tag": "TEXT NOT NULL DEFAULT ''",
+                    "joytag_tag_index": "INTEGER",
                 },
                 "finder_scan_references": {
                     "metadata_json": "TEXT NOT NULL DEFAULT '{}'",
@@ -360,6 +393,7 @@ class FinderService:
                     "matches_json": "TEXT NOT NULL DEFAULT '[]'",
                     "ranking_tier": "INTEGER NOT NULL DEFAULT 1",
                     "online_scanned": "INTEGER NOT NULL DEFAULT 1",
+                    "selected_images_json": "TEXT NOT NULL DEFAULT '[]'",
                 },
             }
             for table, additions in migrations.items():
@@ -467,7 +501,7 @@ class FinderService:
                 """UPDATE finder_scans
                    SET status = 'failed', finished_at = COALESCE(finished_at, ?),
                        updated_at = ?, error = ?
-                   WHERE ranking_version != ?
+                   WHERE ranking_version NOT IN (?, ?)
                      AND status IN (
                          'queued','preparing','scanning','pausing','paused',
                          'canceling'
@@ -478,6 +512,7 @@ class FinderService:
                     "This Finder scan uses an earlier ranking model and cannot "
                     "continue after the pose-precision upgrade. Start a new scan.",
                     CURRENT_RANKING_VERSION,
+                    JOYTAG_RANKING_VERSION,
                 ),
             )
 
@@ -486,6 +521,10 @@ class FinderService:
         """Return the exact cache namespace used for a remote preview image."""
 
         return f"url:{canonicalize_url(url)}"
+
+    @staticmethod
+    def _joytag_threshold(value: float) -> float:
+        return float(np.rint(max(0.0, min(1.0, float(value))) * 255.0) / 255.0)
 
     def _backfill_corpus_associations(self, db: Any) -> None:
         """Recover partial gallery membership from durable historical top matches.
@@ -695,6 +734,7 @@ class FinderService:
                FROM finder_results r
                JOIN finder_scans s ON s.id = r.scan_id
                WHERE r.review IN ('accepted', 'rejected')
+                 AND s.search_mode = 'pose'
                ORDER BY r.updated_at, r.id"""
         ).fetchall()
         touched_pose_tags: set[int] = set()
@@ -781,6 +821,20 @@ class FinderService:
             except Exception as exc:
                 self._available = False
                 self._prepare_error = str(exc)[:1000]
+        if self.joytagger is None:
+            try:
+                from .joytag import JoyTagAnalyzer
+
+                self.joytagger = JoyTagAnalyzer(
+                    self.joytag_model_path,
+                    self.joytag_tags_path,
+                    execution_provider=self.config.finder_execution_provider,
+                    max_image_bytes=self.config.finder_max_image_bytes,
+                    max_image_pixels=self.config.finder_max_image_pixels,
+                )
+            except Exception as exc:
+                self._joytag_available = False
+                self._joytag_error = str(exc)[:1000]
         # Injected encoders are commonly tests or custom integrations. Only pair
         # the built-in DINO encoder with the built-in RTMO estimator implicitly;
         # callers can still inject both explicitly.
@@ -802,7 +856,7 @@ class FinderService:
                 # Pose is an enhancement. Spatial matching remains usable when
                 # RTMO cannot be initialized or downloaded.
                 self._pose_error = str(exc)[:1000]
-        if self._available:
+        if self._available or self._joytag_available:
             for scan_id in self._queued_scan_ids():
                 self.queue.put_nowait(scan_id)
             self._workers = [
@@ -841,6 +895,29 @@ class FinderService:
                 await asyncio.to_thread(
                     self._prune_embedding_cache, purge_stale_models=True
                 )
+
+    async def _ensure_joytag_ready(self) -> None:
+        if not self._joytag_available or self.joytagger is None:
+            raise FinderUnavailable(
+                self._joytag_error or "Finder tag-search support is unavailable"
+            )
+        async with self._prepare_lock:
+            if not self._joytag_ready:
+                try:
+                    await self.joytagger.prepare()
+                    self._joytag_ready = True
+                    self._joytag_error = ""
+                except Exception as exc:
+                    self._joytag_ready = False
+                    self._joytag_error = str(exc)[:1000]
+                    raise FinderUnavailable(
+                        self._joytag_error or "JoyTag preparation failed"
+                    ) from exc
+            self._joytag_model_key = str(
+                getattr(self.joytagger, "model_key", "") or ""
+            )
+            if not self._joytag_model_key:
+                raise FinderUnavailable("JoyTag did not report a model identity")
 
     async def stop(self) -> None:
         self._stopping = True
@@ -885,11 +962,16 @@ class FinderService:
             encoder_provider() if callable(encoder_provider) else {}
         )
         pose_provider_status = pose_provider() if callable(pose_provider) else {}
+        joytag_provider = getattr(self.joytagger, "provider_status", None)
+        joytag_provider_status = (
+            joytag_provider() if callable(joytag_provider) else {}
+        )
         active_devices = [
             str(value)
             for value in (
                 encoder_provider_status.get("active"),
                 pose_provider_status.get("active"),
+                joytag_provider_status.get("active"),
             )
             if value
         ]
@@ -920,6 +1002,7 @@ class FinderService:
             "providers": {
                 "appearance": encoder_provider_status,
                 "pose": pose_provider_status,
+                "joytag": joytag_provider_status,
             },
             "device": ", ".join(dict.fromkeys(active_devices)),
             "backend": "spatial DINOv2 + RTMO-L"
@@ -927,6 +1010,15 @@ class FinderService:
             else "spatial DINOv2",
             "analyzer_version": ANALYZER_VERSION,
             "ranking_version": CURRENT_RANKING_VERSION,
+            "joytag": {
+                "available": self._joytag_available,
+                "ready": self._joytag_ready,
+                "error": self._joytag_error,
+                "model_path": str(self.joytag_model_path),
+                "tags_path": str(self.joytag_tags_path),
+                "model_key": self._joytag_model_key,
+                "provider": joytag_provider_status,
+            },
             "folder_root": str(self.examples_root),
             # Kept for clients written against the 2.2 API.
             "examples_root": str(self.examples_root),
@@ -1493,6 +1585,281 @@ class FinderService:
             os.close(descriptor)
 
     @staticmethod
+    def _reference_preview(data: bytes) -> str:
+        with Image.open(io.BytesIO(data)) as source:
+            image = ImageOps.exif_transpose(source).convert("RGB")
+            image.thumbnail((180, 220), Image.Resampling.LANCZOS)
+            output = io.BytesIO()
+            image.save(output, format="JPEG", quality=82, optimize=True)
+        encoded = base64.b64encode(output.getvalue()).decode("ascii")
+        return f"data:image/jpeg;base64,{encoded}"
+
+    def _cached_joytag_scores(self, source_key: str) -> np.ndarray | None:
+        if not self._joytag_model_key or self.joytagger is None:
+            return None
+        dimensions = len(tuple(getattr(self.joytagger, "tags", ())))
+        with self._lock, self.database.connect() as db:
+            row = db.execute(
+                """SELECT dimensions, scores FROM finder_joytag_cache
+                   WHERE model_key = ? AND source_key = ?""",
+                (self._joytag_model_key, source_key),
+            ).fetchone()
+            if not row:
+                return None
+            raw = bytes(row["scores"])
+            if int(row["dimensions"]) != dimensions or len(raw) != dimensions:
+                db.execute(
+                    """DELETE FROM finder_joytag_cache
+                       WHERE model_key = ? AND source_key = ?""",
+                    (self._joytag_model_key, source_key),
+                )
+                return None
+            db.execute(
+                """UPDATE finder_joytag_cache SET last_used_at = ?
+                   WHERE model_key = ? AND source_key = ?""",
+                (utc_now(), self._joytag_model_key, source_key),
+            )
+        return np.frombuffer(raw, dtype=np.uint8).astype(np.float32) / 255.0
+
+    def _store_joytag_scores(
+        self,
+        source_key: str,
+        scores: np.ndarray,
+    ) -> np.ndarray:
+        values = np.asarray(scores, dtype=np.float32).reshape(-1)
+        expected = len(tuple(getattr(self.joytagger, "tags", ())))
+        if expected <= 0 or values.shape != (expected,):
+            raise ValueError("JoyTag returned an unexpected score vector")
+        if not np.all(np.isfinite(values)):
+            raise ValueError("JoyTag returned non-finite scores")
+        quantized = np.clip(np.rint(values * 255.0), 0, 255).astype(np.uint8)
+        now = utc_now()
+        with self._lock, self.database.connect() as db:
+            db.execute(
+                """INSERT INTO finder_joytag_cache(
+                       model_key, source_key, dimensions, scores,
+                       created_at, last_used_at
+                   ) VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(model_key, source_key) DO UPDATE SET
+                       dimensions = excluded.dimensions,
+                       scores = excluded.scores,
+                       last_used_at = excluded.last_used_at""",
+                (
+                    self._joytag_model_key,
+                    source_key,
+                    int(quantized.size),
+                    quantized.tobytes(),
+                    now,
+                    now,
+                ),
+            )
+        return quantized.astype(np.float32) / 255.0
+
+    async def _joytag_scores_many(
+        self,
+        items: list[tuple[bytes, str]],
+        *,
+        scan_id: str | None = None,
+        gate_acquired: bool = False,
+    ) -> list[np.ndarray | BaseException]:
+        if not items:
+            return []
+        await self._ensure_joytag_ready()
+        outcomes: list[np.ndarray | BaseException | None] = [None] * len(items)
+        missing: dict[str, tuple[bytes, list[int]]] = {}
+        for index, (data, source_key) in enumerate(items):
+            cached = await asyncio.to_thread(
+                self._cached_joytag_scores, source_key
+            )
+            if cached is not None:
+                outcomes[index] = cached
+                continue
+            entry = missing.get(source_key)
+            if entry is None:
+                missing[source_key] = (data, [index])
+            else:
+                entry[1].append(index)
+
+        batch_size = self.config.finder_inference_batch_size
+        pending = list(missing.items())
+        async def classify_pending() -> None:
+            for start in range(0, len(pending), batch_size):
+                if scan_id is not None:
+                    self._check_control(scan_id)
+                batch = pending[start : start + batch_size]
+                payloads = [entry[1][0] for entry in batch]
+                try:
+                    raw_scores = await asyncio.to_thread(
+                        self.joytagger.classify_many_bytes,
+                        payloads,
+                    )
+                    matrix = np.asarray(raw_scores, dtype=np.float32)
+                    if matrix.ndim == 1 and len(batch) == 1:
+                        matrix = matrix.reshape(1, -1)
+                    if matrix.shape != (
+                        len(batch),
+                        len(tuple(getattr(self.joytagger, "tags", ()))),
+                    ):
+                        raise ValueError("JoyTag returned an unexpected batch shape")
+                    batch_outcomes: list[np.ndarray | BaseException] = [
+                        row for row in matrix
+                    ]
+                except Exception:
+                    # Preserve per-image failure isolation when one corrupt
+                    # payload or a transient provider problem rejects a batch.
+                    batch_outcomes = []
+                    for payload in payloads:
+                        try:
+                            one = await asyncio.to_thread(
+                                self.joytagger.classify_many_bytes,
+                                [payload],
+                            )
+                            batch_outcomes.append(
+                                np.asarray(one, dtype=np.float32).reshape(1, -1)[0]
+                            )
+                        except Exception as exc:
+                            batch_outcomes.append(exc)
+                for (source_key, (_, indices)), result in zip(
+                    batch, batch_outcomes, strict=True
+                ):
+                    if isinstance(result, BaseException):
+                        stored: np.ndarray | BaseException = result
+                    else:
+                        try:
+                            stored = await asyncio.to_thread(
+                                self._store_joytag_scores,
+                                source_key,
+                                result,
+                            )
+                        except Exception as exc:
+                            stored = exc
+                    for index in indices:
+                        outcomes[index] = stored
+        if gate_acquired:
+            await classify_pending()
+        else:
+            async with self._inference_batch_gate:
+                await classify_pending()
+        return [
+            item
+            if item is not None
+            else RuntimeError("JoyTag batch produced no result")
+            for item in outcomes
+        ]
+
+    async def analyze_reference_directory(
+        self,
+        example_directory: str,
+        *,
+        top_tags: int = 40,
+    ) -> dict[str, Any]:
+        await self._ensure_joytag_ready()
+        directory, normalized = self._resolve_example_directory(example_directory)
+        files = self._example_files(directory)
+        fingerprint = hashlib.sha256()
+        manifest: list[tuple[Path, str, str]] = []
+        for path in files:
+            data = await asyncio.to_thread(self._read_example_file, path)
+            self._validate_image_bytes(data)
+            digest = hashlib.sha256(data).hexdigest()
+            relative = path.relative_to(directory).as_posix()
+            fingerprint.update(relative.encode("utf-8"))
+            fingerprint.update(b"\0")
+            fingerprint.update(digest.encode("ascii"))
+            fingerprint.update(b"\0")
+            manifest.append((path, relative, digest))
+
+        outcomes: list[np.ndarray | BaseException] = []
+        previews: list[str] = []
+        batch_size = self.config.finder_inference_batch_size
+        for start in range(0, len(manifest), batch_size):
+            batch = manifest[start : start + batch_size]
+            items: list[tuple[bytes, str]] = []
+            batch_previews: list[str] = []
+            for path, _, digest in batch:
+                data = await asyncio.to_thread(self._read_example_file, path)
+                if hashlib.sha256(data).hexdigest() != digest:
+                    raise FinderConflict(
+                        "Reference images changed while they were being analyzed"
+                    )
+                items.append((data, f"sha256:{digest}"))
+                batch_previews.append(
+                    await asyncio.to_thread(self._reference_preview, data)
+                )
+            outcomes.extend(await self._joytag_scores_many(items))
+            previews.extend(batch_previews)
+        failures = [
+            f"{relative}: {outcome}"
+            for (_, relative, _), outcome in zip(manifest, outcomes, strict=True)
+            if isinstance(outcome, BaseException)
+        ]
+        if failures:
+            raise FinderUnavailable(
+                "Could not analyze every reference image: " + "; ".join(failures[:3])
+            )
+        matrix = np.stack(
+            [
+                np.asarray(outcome, dtype=np.float32)
+                for outcome in outcomes
+                if not isinstance(outcome, BaseException)
+            ]
+        )
+        tags = tuple(str(tag) for tag in getattr(self.joytagger, "tags", ()))
+        means = np.mean(matrix, axis=0)
+        count = max(8, min(100, int(top_tags)))
+        ordered = sorted(
+            range(len(tags)),
+            key=lambda index: (
+                -float(means[index]),
+                -float(np.max(matrix[:, index])),
+                tags[index],
+            ),
+        )[:count]
+        tag_items = []
+        for index in ordered:
+            values = matrix[:, index]
+            tag_items.append(
+                {
+                    "tag": tags[index],
+                    "index": index,
+                    "average": round(float(np.mean(values)), 4),
+                    "minimum": round(float(np.min(values)), 4),
+                    "maximum": round(float(np.max(values)), 4),
+                    "median": round(float(np.median(values)), 4),
+                    "hits_at_0_4": int(np.count_nonzero(values >= 0.4)),
+                    "image_count": len(manifest),
+                }
+            )
+        images = []
+        for (_, relative, _), preview, outcome in zip(
+            manifest, previews, outcomes, strict=True
+        ):
+            values = np.asarray(outcome, dtype=np.float32)
+            images.append(
+                {
+                    "name": relative,
+                    "preview_url": preview,
+                    "scores": {
+                        tags[index]: round(float(values[index]), 4)
+                        for index in ordered
+                    },
+                }
+            )
+        provider = getattr(self.joytagger, "provider_status", None)
+        provider_status = provider() if callable(provider) else {}
+        return {
+            "directory": normalized,
+            "fingerprint": fingerprint.hexdigest(),
+            "image_count": len(manifest),
+            "model_key": self._joytag_model_key,
+            "provider": provider_status.get("active") or "",
+            "quantization": "uint8",
+            "bytes_per_cached_image": len(tags),
+            "tags": tag_items,
+            "images": images,
+        }
+
+    @staticmethod
     def _decode_scan(row: Any) -> dict[str, Any]:
         scan = dict(row)
         scan["cancel_requested"] = bool(scan["cancel_requested"])
@@ -1500,7 +1867,16 @@ class FinderService:
         scan["reference_ready"] = bool(scan["reference_ready"])
         scan["corpus_search_complete"] = bool(scan["corpus_search_complete"])
         scan["has_next_page"] = bool(scan.get("next_url"))
-        scan["ranking_current"] = scan.get("ranking_version") == CURRENT_RANKING_VERSION
+        scan["search_mode"] = (
+            "joytag"
+            if scan.get("search_mode") == "joytag"
+            or scan.get("ranking_version") == JOYTAG_RANKING_VERSION
+            else "pose"
+        )
+        scan["joytag_tag"] = str(scan.get("joytag_tag") or "")
+        scan["ranking_current"] = (
+            scan.get("ranking_version") in CURRENT_RANKING_VERSIONS
+        )
         scan["review_counts"] = {
             state: max(0, int(scan.get(f"{state}_count", 0)))
             for state in ("pending", "maybe", "accepted", "rejected")
@@ -1597,9 +1973,10 @@ class FinderService:
                 for row in db.execute(
                     """SELECT id FROM finder_scans
                        WHERE status = 'queued' AND cancel_requested = 0
-                         AND pause_requested = 0 AND ranking_version = ?
+                         AND pause_requested = 0
+                         AND ranking_version IN (?, ?)
                        ORDER BY created_at""",
-                    (CURRENT_RANKING_VERSION,),
+                    (CURRENT_RANKING_VERSION, JOYTAG_RANKING_VERSION),
                 ).fetchall()
             ]
 
@@ -1611,16 +1988,47 @@ class FinderService:
         source_url: str,
         page_limit: int,
         minimum_score: float,
+        mode: str = "pose",
+        joytag_tag: str | None = None,
+        reference_fingerprint: str | None = None,
     ) -> dict[str, Any]:
-        if not self._available:
+        if mode not in {"pose", "joytag"}:
+            raise ValueError("Finder mode must be pose or joytag")
+        if mode == "pose" and not self._available:
             raise FinderUnavailable(
                 self._prepare_error or "Finder vision support is unavailable"
+            )
+        if mode == "joytag" and not self._joytag_available:
+            raise FinderUnavailable(
+                self._joytag_error or "Finder tag-search support is unavailable"
             )
         _, normalized_directory = self._resolve_example_directory(example_directory)
         source_url = validate_source_url(source_url)
         tag = self.database.get_pose_tag(pose_tag_id)
         if not tag:
             raise FinderNotFound("Pose tag not found")
+        selected_tag = (joytag_tag or "").strip()
+        if mode == "joytag":
+            if not selected_tag:
+                raise ValueError("Choose a JoyTag tag before starting a tag search")
+            if not reference_fingerprint:
+                raise ValueError(
+                    "Analyze the reference folder before starting a tag search"
+                )
+            if self._joytag_ready and selected_tag not in tuple(
+                str(value) for value in getattr(self.joytagger, "tags", ())
+            ):
+                raise ValueError("The selected JoyTag tag is not available")
+        else:
+            selected_tag = ""
+            reference_fingerprint = None
+        ranking_version = (
+            JOYTAG_RANKING_VERSION
+            if mode == "joytag"
+            else CURRENT_RANKING_VERSION
+        )
+        if mode == "joytag":
+            minimum_score = self._joytag_threshold(minimum_score)
         scan_id = uuid.uuid4().hex
         now = utc_now()
         with self._lock, self.database.connect() as db:
@@ -1628,9 +2036,12 @@ class FinderService:
                 """INSERT INTO finder_scans(
                        id, example_directory, pose_tag_id, pose_tag_label,
                        pose_tag_slug, pose_default_role, source_url, next_url,
-                       page_limit, minimum_score, ranking_version, status,
+                       page_limit, minimum_score, ranking_version, search_mode,
+                       joytag_tag, reference_fingerprint, status,
                        created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
+                   ) VALUES (
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?
+                   )""",
                 (
                     scan_id,
                     normalized_directory,
@@ -1642,12 +2053,16 @@ class FinderService:
                     source_url,
                     page_limit,
                     minimum_score,
-                    CURRENT_RANKING_VERSION,
+                    ranking_version,
+                    mode,
+                    selected_tag,
+                    reference_fingerprint or "",
                     now,
                     now,
                 ),
             )
-            self._snapshot_feedback_for_scan(db, scan_id, int(tag["id"]))
+            if mode == "pose":
+                self._snapshot_feedback_for_scan(db, scan_id, int(tag["id"]))
         self.queue.put_nowait(scan_id)
         scan = self.get_scan(scan_id) or {}
         self._publish(scan, force=True)
@@ -1660,6 +2075,7 @@ class FinderService:
             "reference_ready",
             "reference_count",
             "ranking_version",
+            "joytag_tag_index",
             "next_url",
             "pages_completed",
             "status",
@@ -1713,11 +2129,21 @@ class FinderService:
             raise FinderNotFound("Finder scan not found")
         if scan["status"] != "paused":
             raise FinderConflict("Only a paused Finder scan can be resumed")
-        if scan.get("ranking_version") != CURRENT_RANKING_VERSION:
+        if scan.get("ranking_version") not in CURRENT_RANKING_VERSIONS:
             raise FinderConflict(
                 "A legacy-ranked Finder scan cannot be resumed; start a new scan"
             )
-        if not self._available:
+        if (
+            scan.get("ranking_version") == JOYTAG_RANKING_VERSION
+            and not self._joytag_available
+        ):
+            raise FinderUnavailable(
+                self._joytag_error or "Finder tag-search support is unavailable"
+            )
+        if (
+            scan.get("ranking_version") != JOYTAG_RANKING_VERSION
+            and not self._available
+        ):
             raise FinderUnavailable(
                 self._prepare_error or "Finder vision support is unavailable"
             )
@@ -1750,11 +2176,6 @@ class FinderService:
             raise ValueError(
                 f"Additional pages must be between 1 and {MAX_EXTEND_PAGES}"
             )
-        if not self._available:
-            raise FinderUnavailable(
-                self._prepare_error or "Finder vision support is unavailable"
-            )
-
         enqueue = False
         with self._lock, self.database.connect() as db:
             row = db.execute(
@@ -1765,9 +2186,24 @@ class FinderService:
             ).fetchone()
             if not row:
                 raise FinderNotFound("Finder scan not found")
-            if row["ranking_version"] != CURRENT_RANKING_VERSION:
+            if row["ranking_version"] not in CURRENT_RANKING_VERSIONS:
                 raise FinderConflict(
                     "A legacy-ranked Finder scan cannot be extended; start a new scan"
+                )
+            if (
+                row["ranking_version"] == JOYTAG_RANKING_VERSION
+                and not self._joytag_available
+            ):
+                raise FinderUnavailable(
+                    self._joytag_error
+                    or "Finder tag-search support is unavailable"
+                )
+            if (
+                row["ranking_version"] != JOYTAG_RANKING_VERSION
+                and not self._available
+            ):
+                raise FinderUnavailable(
+                    self._prepare_error or "Finder vision support is unavailable"
                 )
 
             status = str(row["status"])
@@ -1851,11 +2287,6 @@ class FinderService:
                 f"Additional pages must be between 1 and {MAX_EXTEND_PAGES}"
             )
         source_url = validate_source_url(source_url)
-        if not self._available:
-            raise FinderUnavailable(
-                self._prepare_error or "Finder vision support is unavailable"
-            )
-
         with self._lock, self.database.connect() as db:
             row = db.execute(
                 """SELECT status, pages_completed, next_url,
@@ -1865,9 +2296,24 @@ class FinderService:
             ).fetchone()
             if not row:
                 raise FinderNotFound("Finder scan not found")
-            if row["ranking_version"] != CURRENT_RANKING_VERSION:
+            if row["ranking_version"] not in CURRENT_RANKING_VERSIONS:
                 raise FinderConflict(
                     "A legacy-ranked Finder scan cannot continue; start a new scan"
+                )
+            if (
+                row["ranking_version"] == JOYTAG_RANKING_VERSION
+                and not self._joytag_available
+            ):
+                raise FinderUnavailable(
+                    self._joytag_error
+                    or "Finder tag-search support is unavailable"
+                )
+            if (
+                row["ranking_version"] != JOYTAG_RANKING_VERSION
+                and not self._available
+            ):
+                raise FinderUnavailable(
+                    self._prepare_error or "Finder vision support is unavailable"
                 )
 
             status = str(row["status"])
@@ -1942,6 +2388,7 @@ class FinderService:
         matches: list[dict[str, Any]] | None,
         *,
         ranking_version: str = LEGACY_RANKING_VERSION,
+        minimum_score: float | None = None,
     ) -> list[dict[str, Any]]:
         normalized: list[dict[str, Any]] = []
         for item in matches or []:
@@ -1953,6 +2400,7 @@ class FinderService:
                 feedback_adjustment = float(item.get("feedback_adjustment", 0))
                 feedback_revision = max(0, int(item.get("feedback_revision", 0)))
                 appearance = float(item.get("appearance_score", score))
+                tag_score = float(item.get("tag_score", score))
                 exact = float(item.get("exact_score", 0))
                 ordinal = int(item.get("ordinal"))
                 pose = (
@@ -1967,7 +2415,14 @@ class FinderService:
                 )
             except (TypeError, ValueError):
                 continue
-            numeric_scores = (score, base_score, feedback_adjustment, appearance, exact)
+            numeric_scores = (
+                score,
+                base_score,
+                feedback_adjustment,
+                appearance,
+                exact,
+                tag_score,
+            )
             if pose is not None:
                 numeric_scores = (*numeric_scores, pose)
             if not all(np.isfinite(value) for value in numeric_scores):
@@ -1977,6 +2432,8 @@ class FinderService:
                 item.get("preview_remote_url") or item.get("preview_url") or ""
             )
             if not image_url or not preview:
+                continue
+            if minimum_score is not None and score < float(minimum_score):
                 continue
             optional_scores: dict[str, float] = {}
             for name in (
@@ -2031,6 +2488,8 @@ class FinderService:
                 "feedback_applied": abs(feedback_adjustment) > 1e-9,
                 "ranking_tier": ranking_tier,
                 "appearance_score": max(0.0, min(1.0, appearance)),
+                "tag": str(item.get("tag") or ""),
+                "tag_score": max(0.0, min(1.0, tag_score)),
                 "exact_score": max(0.0, min(1.0, exact)),
                 "pose_score": None if pose is None else max(0.0, min(1.0, pose)),
                 "person_count": (
@@ -2055,7 +2514,9 @@ class FinderService:
                 "skeleton_overlay_url": overlay,
                 "is_exact": exact > 0,
                 "match_type": (
-                    "exact"
+                    "tag"
+                    if ranking_version == JOYTAG_RANKING_VERSION
+                    else "exact"
                     if ranking_tier == 3 or exact > 0
                     else "pose"
                     if ranking_tier == 2
@@ -2107,6 +2568,17 @@ class FinderService:
     ) -> dict[str, Any]:
         item = dict(row)
         selections = [dict(sample) for sample in feedback_samples or []][:3]
+        try:
+            selected_image_urls = json.loads(
+                str(item.pop("selected_images_json", "[]") or "[]")
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            selected_image_urls = []
+        if not isinstance(selected_image_urls, list):
+            selected_image_urls = []
+        selected_image_urls = [
+            str(url) for url in selected_image_urls if isinstance(url, str)
+        ][:3]
         online_state = int(item.get("online_scanned", 1))
         item["online_scanned"] = online_state > 0
         item["online_refresh_failed"] = online_state < 0
@@ -2141,14 +2613,18 @@ class FinderService:
                 ranking_version=ranking_version,
             )
         item["top_matches"] = matches
-        item["feedback_image_urls"] = [
-            selection["image_url"] for selection in selections
-        ]
-        item["feedback_usable_image_urls"] = [
-            selection["image_url"]
-            for selection in selections
-            if self._feedback_pose(selection) is not None
-        ]
+        if ranking_version == JOYTAG_RANKING_VERSION:
+            item["feedback_image_urls"] = selected_image_urls
+            item["feedback_usable_image_urls"] = selected_image_urls
+        else:
+            item["feedback_image_urls"] = [
+                selection["image_url"] for selection in selections
+            ]
+            item["feedback_usable_image_urls"] = [
+                selection["image_url"]
+                for selection in selections
+                if self._feedback_pose(selection) is not None
+            ]
         usable_urls = set(item["feedback_usable_image_urls"])
         item["feedback_pending_image_urls"] = [
             selection["image_url"]
@@ -2207,6 +2683,15 @@ class FinderService:
         if not scan:
             raise FinderNotFound("Finder scan not found")
         threshold = scan["minimum_score"] if min_score is None else min_score
+        if scan.get("search_mode") == "joytag":
+            # A Tag scan permanently discards per-image hits below the
+            # confidence chosen when it starts.  Do not let a later display
+            # query below that floor expose zero-score bookkeeping rows that
+            # contain no retained match.
+            threshold = max(
+                float(scan["minimum_score"]),
+                self._joytag_threshold(threshold),
+            )
         clauses = ["scan_id = ?", "status = 'completed'", "score >= ?"]
         params: list[Any] = [scan_id, threshold]
         if review != "all":
@@ -2282,6 +2767,11 @@ class FinderService:
         if not scan:
             raise FinderNotFound("Finder scan not found")
         threshold = scan["minimum_score"] if min_score is None else min_score
+        if scan.get("search_mode") == "joytag":
+            threshold = max(
+                float(scan["minimum_score"]),
+                self._joytag_threshold(threshold),
+            )
         with self._lock, self.database.connect() as db:
             rows = db.execute(
                 """SELECT review, COUNT(*) AS count
@@ -2315,7 +2805,7 @@ class FinderService:
     ) -> tuple[Any, list[Any], list[str], list[dict[str, Any]]]:
         row = db.execute(
             """SELECT r.*, s.pose_tag_id, s.reference_model_key,
-                      s.ranking_version
+                      s.ranking_version, s.search_mode
                FROM finder_results r
                JOIN finder_scans s ON s.id = r.scan_id
                WHERE r.id = ? AND r.scan_id = ?""",
@@ -2353,6 +2843,31 @@ class FinderService:
             (result_id,),
         ).fetchall()
         stored_urls = [str(item["image_url"]) for item in stored_samples]
+        joytag_selection = str(row["search_mode"] or "") == "joytag"
+        if joytag_selection:
+            try:
+                generic_urls = json.loads(
+                    str(row["selected_images_json"] or "[]")
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                generic_urls = []
+            if isinstance(generic_urls, list):
+                stored_urls = [
+                    str(url) for url in generic_urls if isinstance(url, str)
+                ][:3]
+            # A later authoritative gallery refresh may no longer list a
+            # previously validated image.  Preserve that durable manual
+            # selection when a review is saved again without an explicit new
+            # list; explicit URLs must still belong to the current gallery.
+            for image_url in stored_urls:
+                available.setdefault(
+                    image_url,
+                    {
+                        "image_url": image_url,
+                        "preview_remote_url": "",
+                        "ordinal": 0,
+                    },
+                )
         for sample in stored_samples:
             image_url = str(sample["image_url"])
             available.setdefault(
@@ -2443,6 +2958,17 @@ class FinderService:
     ) -> dict[str, Any]:
         """Best-effort analyze selections, then always persist the manual review."""
 
+        scan = self.get_scan(scan_id)
+        if not scan:
+            raise FinderNotFound("Finder scan not found")
+        if scan.get("search_mode") == "joytag":
+            return await asyncio.to_thread(
+                self.set_review,
+                scan_id,
+                result_id,
+                review,
+                feedback_image_urls,
+            )
         targets = await asyncio.to_thread(
             self._review_analysis_targets,
             scan_id,
@@ -2508,6 +3034,34 @@ class FinderService:
                 review=review,
                 feedback_image_urls=feedback_image_urls,
             )
+            if scan.get("search_mode") == "joytag":
+                selected_urls = [
+                    str(match["image_url"]) for match in selected_matches
+                ]
+                now = utc_now()
+                db.execute(
+                    """UPDATE finder_results
+                       SET review = ?, selected_images_json = ?, updated_at = ?
+                       WHERE id = ? AND scan_id = ?""",
+                    (
+                        review,
+                        json.dumps(selected_urls, separators=(",", ":")),
+                        now,
+                        result_id,
+                        scan_id,
+                    ),
+                )
+                saved = db.execute(
+                    "SELECT * FROM finder_results WHERE id = ?", (result_id,)
+                ).fetchone()
+                item = self._decode_result(
+                    saved,
+                    ranking_version=JOYTAG_RANKING_VERSION,
+                )
+                item["above_threshold"] = (
+                    item["score"] >= scan.get("minimum_score", 0)
+                )
+                return item
             previous_decisions = db.execute(
                 """SELECT * FROM finder_feedback_decisions
                    WHERE pose_tag_id = ? AND gallery_key = ?
@@ -2711,6 +3265,8 @@ class FinderService:
             "review_counts",
             "ranking_version",
             "ranking_current",
+            "search_mode",
+            "joytag_tag",
             "extendable",
             "continuable",
             "source_url",
@@ -3385,6 +3941,79 @@ class FinderService:
             for item in outcomes
         ]
 
+    async def _remote_joytag_scores(
+        self,
+        requests: list[tuple[str, str]],
+        *,
+        scan_id: str | None = None,
+    ) -> list[np.ndarray | BaseException]:
+        if not requests:
+            return []
+        if len(requests) > self.config.finder_inference_batch_size:
+            raise ValueError("Finder inference group exceeds the configured batch size")
+        resolved = [(canonicalize_url(url), referer) for url, referer in requests]
+        outcomes: list[np.ndarray | BaseException | None] = [None] * len(resolved)
+        missing: dict[str, tuple[str, str, list[int]]] = {}
+        for index, (canonical, referer) in enumerate(resolved):
+            source_key = self._remote_source_key(canonical)
+            cached = await asyncio.to_thread(
+                self._cached_joytag_scores, source_key
+            )
+            if cached is not None:
+                outcomes[index] = cached
+                continue
+            entry = missing.get(source_key)
+            if entry is None:
+                missing[source_key] = (canonical, referer, [index])
+            else:
+                entry[2].append(index)
+
+        async with self._inference_batch_gate:
+            # Another gallery may have populated a duplicate source while this
+            # call waited. Recheck inside the bounded download/inference gate.
+            fetches: list[tuple[str, tuple[str, str, list[int]]]] = []
+            for source_key, entry in missing.items():
+                cached = await asyncio.to_thread(
+                    self._cached_joytag_scores, source_key
+                )
+                if cached is not None:
+                    for index in entry[2]:
+                        outcomes[index] = cached
+                else:
+                    fetches.append((source_key, entry))
+            fetched = await asyncio.gather(
+                *(
+                    self._fetch_media(canonical, referer)
+                    for _, (canonical, referer, _) in fetches
+                ),
+                return_exceptions=True,
+            )
+            classify_items: list[tuple[bytes, str]] = []
+            classify_fetches: list[
+                tuple[str, tuple[str, str, list[int]]]
+            ] = []
+            for fetch, result in zip(fetches, fetched, strict=True):
+                if isinstance(result, BaseException):
+                    for index in fetch[1][2]:
+                        outcomes[index] = result
+                    continue
+                classify_items.append((result, fetch[0]))
+                classify_fetches.append(fetch)
+            classified = await self._joytag_scores_many(
+                classify_items,
+                scan_id=scan_id,
+                gate_acquired=True,
+            )
+            for fetch, result in zip(classify_fetches, classified, strict=True):
+                for index in fetch[1][2]:
+                    outcomes[index] = result
+        return [
+            item
+            if item is not None
+            else RuntimeError("Finder batch produced no JoyTag result")
+            for item in outcomes
+        ]
+
     async def _remote_embedding(self, url: str, referer: str) -> np.ndarray:
         descriptor = await self._remote_descriptor(url, referer)
         return descriptor.appearance
@@ -3546,6 +4175,101 @@ class FinderService:
             status="scanning",
         )
         return references
+
+    async def _prepare_joytag_scan(self, scan: dict[str, Any]) -> int:
+        await self._ensure_joytag_ready()
+        tags = tuple(str(tag) for tag in getattr(self.joytagger, "tags", ()))
+        selected_tag = str(scan.get("joytag_tag") or "")
+        try:
+            tag_index = tags.index(selected_tag)
+        except ValueError as exc:
+            raise FinderConflict(
+                f"The selected JoyTag tag is not available: {selected_tag}"
+            ) from exc
+        if scan.get("reference_ready"):
+            if scan.get("reference_model_key") != self._joytag_model_key:
+                raise FinderConflict(
+                    "The JoyTag model changed; start a new tag search"
+                )
+            stored_index = scan.get("joytag_tag_index")
+            if stored_index is not None and int(stored_index) != tag_index:
+                raise FinderConflict("The saved JoyTag selection is inconsistent")
+            return tag_index
+
+        directory, _ = self._resolve_example_directory(scan["example_directory"])
+        files = self._example_files(directory)
+        fingerprint = hashlib.sha256()
+        manifest: list[tuple[Path, str]] = []
+        for path in files:
+            self._check_control(scan["id"])
+            data = await asyncio.to_thread(self._read_example_file, path)
+            self._validate_image_bytes(data)
+            digest = hashlib.sha256(data).hexdigest()
+            relative = path.relative_to(directory).as_posix()
+            fingerprint.update(relative.encode("utf-8"))
+            fingerprint.update(b"\0")
+            fingerprint.update(digest.encode("ascii"))
+            fingerprint.update(b"\0")
+            manifest.append((path, digest))
+        actual_fingerprint = fingerprint.hexdigest()
+        if scan.get("reference_fingerprint") != actual_fingerprint:
+            raise FinderConflict(
+                "Reference images changed after analysis; analyze the folder again"
+            )
+        scores: list[float] = []
+        batch_size = self.config.finder_inference_batch_size
+        for start in range(0, len(manifest), batch_size):
+            prepared: list[tuple[bytes, str]] = []
+            for path, digest in manifest[start : start + batch_size]:
+                self._check_control(scan["id"])
+                data = await asyncio.to_thread(self._read_example_file, path)
+                if hashlib.sha256(data).hexdigest() != digest:
+                    raise FinderConflict(
+                        "Reference images changed while preparing the tag search"
+                    )
+                prepared.append((data, f"sha256:{digest}"))
+            outcomes = await self._joytag_scores_many(
+                prepared,
+                scan_id=scan["id"],
+            )
+            for outcome in outcomes:
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                scores.append(float(outcome[tag_index]))
+        if not scores:
+            raise FinderConflict("The tag search has no reference images")
+        # Re-read the complete manifest after inference.  Per-batch digest
+        # checks catch replacements and removals while their batch is being
+        # prepared, but an earlier file could otherwise change—or a new file
+        # could be added—while a later batch is running.
+        final_fingerprint = hashlib.sha256()
+        for path in self._example_files(directory):
+            self._check_control(scan["id"])
+            data = await asyncio.to_thread(self._read_example_file, path)
+            self._validate_image_bytes(data)
+            digest = hashlib.sha256(data).hexdigest()
+            relative = path.relative_to(directory).as_posix()
+            final_fingerprint.update(relative.encode("utf-8"))
+            final_fingerprint.update(b"\0")
+            final_fingerprint.update(digest.encode("ascii"))
+            final_fingerprint.update(b"\0")
+        if final_fingerprint.hexdigest() != actual_fingerprint:
+            raise FinderConflict(
+                "Reference images changed while preparing the tag search"
+            )
+        if max(scores) + 1e-9 < float(scan["minimum_score"]):
+            raise FinderConflict(
+                "No reference image reaches the selected JoyTag threshold"
+            )
+        self._update_scan(
+            scan["id"],
+            reference_ready=1,
+            reference_count=len(scores),
+            reference_model_key=self._joytag_model_key,
+            joytag_tag_index=tag_index,
+            status="scanning",
+        )
+        return tag_index
 
     def _load_scan_references(self, scan_id: str) -> np.ndarray:
         with self._lock, self.database.connect() as db:
@@ -4017,9 +4741,14 @@ class FinderService:
                 """UPDATE finder_scans
                    SET status = 'preparing', updated_at = ?, error = ''
                    WHERE id = ? AND status = 'queued'
-                     AND ranking_version = ?
+                     AND ranking_version IN (?, ?)
                      AND cancel_requested = 0 AND pause_requested = 0""",
-                (utc_now(), scan_id, CURRENT_RANKING_VERSION),
+                (
+                    utc_now(),
+                    scan_id,
+                    CURRENT_RANKING_VERSION,
+                    JOYTAG_RANKING_VERSION,
+                ),
             )
         return bool(result.rowcount)
 
@@ -4032,7 +4761,10 @@ class FinderService:
                 scan = self.get_scan(scan_id)
                 if not scan:
                     continue
-                await self._ensure_encoder_ready()
+                if scan.get("ranking_version") == JOYTAG_RANKING_VERSION:
+                    await self._ensure_joytag_ready()
+                else:
+                    await self._ensure_encoder_ready()
                 await self._run_scan(scan)
             except asyncio.CancelledError:
                 raise
@@ -4486,6 +5218,167 @@ class FinderService:
         with self._lock, self.database.connect() as db:
             return db.execute(query, params).fetchall()
 
+    def _corpus_joytag_rows(
+        self,
+        after: tuple[str, int, str] | None,
+        *,
+        limit: int = 256,
+    ) -> list[Any]:
+        condition = ""
+        params: list[Any] = []
+        if after is not None:
+            condition = """
+                WHERE (i.gallery_key, i.ordinal, i.source_key) > (?, ?, ?)
+            """
+            params.extend(after)
+        params.append(limit)
+        query = f"""SELECT i.gallery_key, i.source_key, i.image_url,
+                           i.preview_remote_url, i.ordinal,
+                           g.gallery_url, g.title, g.thumbnail_remote_url
+                    FROM finder_corpus_images i
+                         INDEXED BY idx_finder_corpus_images_scan
+                    CROSS JOIN finder_corpus_galleries g
+                    {condition}
+                      {"AND" if condition else "WHERE"}
+                      g.gallery_key = i.gallery_key
+                    ORDER BY i.gallery_key, i.ordinal, i.source_key
+                    LIMIT ?"""
+        with self._lock, self.database.connect() as db:
+            return db.execute(query, params).fetchall()
+
+    async def _search_joytag_corpus(
+        self,
+        scan: dict[str, Any],
+        tag_index: int,
+    ) -> None:
+        current = self.get_scan(scan["id"])
+        if not current or current["corpus_search_complete"]:
+            return
+        self._check_control(scan["id"])
+        self._update_scan(
+            scan["id"],
+            corpus_images_scored=0,
+            corpus_galleries_scored=0,
+        )
+        minimum_score = float(current["minimum_score"])
+        selected_tag = str(current["joytag_tag"])
+        after: tuple[str, int, str] | None = None
+        active_key = ""
+        active_card: dict[str, Any] | None = None
+        active_matches: list[dict[str, Any]] = []
+        active_images = 0
+        images_scored = 0
+        galleries_scored = 0
+
+        def save_active() -> None:
+            nonlocal active_card, active_matches, active_images, galleries_scored
+            if active_card is None:
+                return
+            if active_matches:
+                matches = self._normalized_top_matches(
+                    active_matches,
+                    ranking_version=JOYTAG_RANKING_VERSION,
+                    minimum_score=minimum_score,
+                )
+                if matches:
+                    self._save_result(
+                        scan["id"],
+                        active_card,
+                        order=galleries_scored,
+                        score=matches[0]["score"],
+                        images_scored=active_images,
+                        best=None,
+                        status="completed",
+                        ranking_version=JOYTAG_RANKING_VERSION,
+                        top_matches=matches,
+                        online_scanned=False,
+                    )
+            galleries_scored += 1
+            active_card = None
+            active_matches = []
+            active_images = 0
+
+        while True:
+            self._check_control(scan["id"])
+            rows = await asyncio.to_thread(self._corpus_joytag_rows, after)
+            if not rows:
+                break
+            batch_size = self.config.finder_inference_batch_size
+            outcomes: list[np.ndarray | BaseException] = []
+            for start in range(0, len(rows), batch_size):
+                chunk = rows[start : start + batch_size]
+                outcomes.extend(
+                    await self._remote_joytag_scores(
+                        [
+                            (
+                                str(row["preview_remote_url"]),
+                                str(row["gallery_url"]),
+                            )
+                            for row in chunk
+                        ],
+                        scan_id=scan["id"],
+                    )
+                )
+            for row, outcome in zip(rows, outcomes, strict=True):
+                self._check_control(scan["id"])
+                gallery = str(row["gallery_key"])
+                if active_key and gallery != active_key:
+                    save_active()
+                if gallery != active_key:
+                    active_key = gallery
+                    active_card = {
+                        "url": str(row["gallery_url"]),
+                        "title": str(row["title"] or "Untitled gallery"),
+                        "thumbnail_remote_url": str(
+                            row["thumbnail_remote_url"] or ""
+                        ),
+                    }
+                if isinstance(outcome, BaseException):
+                    continue
+                active_images += 1
+                images_scored += 1
+                score = float(outcome[tag_index])
+                if score + 1e-9 < minimum_score:
+                    continue
+                active_matches.append(
+                    {
+                        "image_url": str(row["image_url"]),
+                        "preview_remote_url": str(row["preview_remote_url"]),
+                        "ordinal": int(row["ordinal"]),
+                        "score": score,
+                        "base_score": score,
+                        "appearance_score": score,
+                        "tag_score": score,
+                        "tag": selected_tag,
+                        "ranking_tier": 1,
+                    }
+                )
+            final_row = rows[-1]
+            after = (
+                str(final_row["gallery_key"]),
+                int(final_row["ordinal"]),
+                str(final_row["source_key"]),
+            )
+            self._update_scan(
+                scan["id"],
+                corpus_images_scored=images_scored,
+                corpus_galleries_scored=galleries_scored,
+            )
+            progress = self.get_scan(scan["id"])
+            if progress:
+                self._publish(progress)
+        save_active()
+        self._check_control(scan["id"])
+        self._update_scan(
+            scan["id"],
+            corpus_search_complete=1,
+            corpus_images_scored=images_scored,
+            corpus_galleries_scored=galleries_scored,
+        )
+        progress = self.get_scan(scan["id"])
+        if progress:
+            self._publish(progress, force=True)
+
     def _descriptor_from_corpus_row(
         self,
         row: Any,
@@ -4906,7 +5799,215 @@ class FinderService:
                     error=str(exc),
                 )
 
+    async def _score_joytag_gallery(
+        self,
+        scan: dict[str, Any],
+        card: dict,
+        order: int,
+        tag_index: int,
+    ) -> None:
+        gallery_url = validate_source_url(card["url"])
+        if self._result_complete(scan["id"], gallery_url):
+            return
+        self._check_control(scan["id"])
+        try:
+            async with self._network_semaphore:
+                await self._wait_for_request_slot()
+                detail = await self.scraper.gallery(gallery_url)
+            images = list(detail.get("images") or [])
+            if not images:
+                raise ValueError("Gallery contains no preview images")
+            if len(images) > self.config.finder_max_gallery_images:
+                raise ValueError("Gallery exceeds the Finder image-count limit")
+            for index, image in enumerate(images, start=1):
+                image.setdefault("ordinal", index)
+            await asyncio.to_thread(
+                self._index_corpus_gallery,
+                card,
+                detail,
+                images,
+            )
+
+            minimum_score = float(scan["minimum_score"])
+            selected_tag = str(scan["joytag_tag"])
+            scored = 0
+            qualified: list[dict[str, Any]] = []
+            batch_size = self.config.finder_inference_batch_size
+            for start in range(0, len(images), batch_size):
+                self._check_control(scan["id"])
+                batch: list[dict[str, Any]] = []
+                requests: list[tuple[str, str]] = []
+                for image in images[start : start + batch_size]:
+                    preview = str(image.get("preview_remote_url") or "")
+                    original = str(image.get("url") or "")
+                    try:
+                        await asyncio.to_thread(
+                            validate_public_media_url, preview
+                        )
+                        await asyncio.to_thread(
+                            validate_public_media_url, original
+                        )
+                    except Exception:
+                        continue
+                    batch.append(image)
+                    requests.append((preview, gallery_url))
+                outcomes = await self._remote_joytag_scores(
+                    requests,
+                    scan_id=scan["id"],
+                )
+                for image, outcome in zip(batch, outcomes, strict=True):
+                    if isinstance(outcome, (_FinderPaused, _FinderCanceled)):
+                        raise outcome
+                    if isinstance(outcome, BaseException):
+                        continue
+                    scored += 1
+                    score = float(outcome[tag_index])
+                    if score + 1e-9 < minimum_score:
+                        continue
+                    qualified.append(
+                        {
+                            "image_url": str(image.get("url") or ""),
+                            "preview_remote_url": str(
+                                image.get("preview_remote_url") or ""
+                            ),
+                            "ordinal": int(image["ordinal"]),
+                            "score": score,
+                            "base_score": score,
+                            "appearance_score": score,
+                            "tag_score": score,
+                            "tag": selected_tag,
+                            "ranking_tier": 1,
+                        }
+                    )
+            if not scored:
+                raise ValueError("No gallery preview image could be scored")
+            matches = self._normalized_top_matches(
+                qualified,
+                ranking_version=JOYTAG_RANKING_VERSION,
+                minimum_score=minimum_score,
+            )
+            self._save_result(
+                scan["id"],
+                {**card, "url": detail.get("url") or gallery_url},
+                order=order,
+                score=matches[0]["score"] if matches else 0,
+                images_scored=scored,
+                best=None,
+                status="completed",
+                ranking_version=JOYTAG_RANKING_VERSION,
+                top_matches=matches,
+            )
+        except (_FinderPaused, _FinderCanceled):
+            raise
+        except Exception as exc:
+            if not self._preserve_local_result_after_online_error(
+                scan["id"],
+                card,
+                order=order,
+                error=str(exc),
+            ):
+                self._save_result(
+                    scan["id"],
+                    card,
+                    order=order,
+                    score=0,
+                    images_scored=0,
+                    best=None,
+                    status="failed",
+                    ranking_version=JOYTAG_RANKING_VERSION,
+                    error=str(exc),
+                )
+
+    async def _run_joytag_scan(self, scan: dict[str, Any]) -> None:
+        if scan.get("ranking_version") != JOYTAG_RANKING_VERSION:
+            raise FinderConflict("This is not a current JoyTag Finder scan")
+        tag_index = await self._prepare_joytag_scan(scan)
+        self._check_control(scan["id"])
+        await self._search_joytag_corpus(scan, tag_index)
+        self._check_control(scan["id"])
+        self._update_scan(scan["id"], status="scanning", error="")
+        while True:
+            self._check_control(scan["id"])
+            current = self.get_scan(scan["id"])
+            if not current:
+                raise _FinderCanceled("Finder scan was deleted")
+            if current["pages_completed"] >= current["page_limit"]:
+                if self._finalize_scan_if_done(scan["id"]):
+                    return
+                continue
+            page_url = current.get("next_url")
+            if not page_url:
+                if self._finalize_scan_if_done(scan["id"]):
+                    return
+                continue
+            page_url = validate_source_url(page_url)
+            await self._wait_for_request_slot()
+            page_number = int(current["pages_completed"]) + 1
+            page = await self.scraper.browse(url=page_url, page=page_number)
+            cards: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for card in page.get("items") or []:
+                try:
+                    card_url = validate_source_url(card["url"])
+                    key = gallery_key(card_url)
+                except (KeyError, ValueError):
+                    continue
+                if key in seen:
+                    continue
+                seen.add(key)
+                cards.append({**card, "url": card_url})
+            counts = self._progress_counts(scan["id"])
+            missing = self._missing_on_page(scan["id"], cards)
+            total = max(
+                int(current["total_galleries"]),
+                counts["processed_galleries"] + missing,
+            )
+            self._update_scan(scan["id"], total_galleries=total, **counts)
+
+            batch_size = self.config.finder_network_workers
+            order_base = int(current["pages_completed"]) * 10_000
+            for start in range(0, len(cards), batch_size):
+                self._check_control(scan["id"])
+                batch = cards[start : start + batch_size]
+                outcomes = await asyncio.gather(
+                    *(
+                        self._score_joytag_gallery(
+                            current,
+                            card,
+                            order_base + start + index,
+                            tag_index,
+                        )
+                        for index, card in enumerate(batch)
+                    ),
+                    return_exceptions=True,
+                )
+                for outcome in outcomes:
+                    if isinstance(outcome, (_FinderPaused, _FinderCanceled)):
+                        raise outcome
+                    if isinstance(outcome, BaseException):
+                        raise outcome
+                counts = self._progress_counts(scan["id"])
+                self._update_scan(scan["id"], **counts)
+                update = self.get_scan(scan["id"])
+                if update:
+                    self._publish(update)
+
+            next_url = page.get("next_url")
+            if next_url:
+                next_url = validate_source_url(next_url)
+            self._update_scan(
+                scan["id"],
+                pages_completed=page_number,
+                next_url=next_url,
+            )
+            if not next_url:
+                if self._finalize_scan_if_done(scan["id"]):
+                    return
+
     async def _run_scan(self, scan: dict[str, Any]) -> None:
+        if scan.get("ranking_version") == JOYTAG_RANKING_VERSION:
+            await self._run_joytag_scan(scan)
+            return
         if scan.get("ranking_version") != CURRENT_RANKING_VERSION:
             raise FinderConflict(
                 "A legacy-ranked Finder scan cannot continue; start a new scan"
