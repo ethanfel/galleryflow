@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import sqlite3
 from pathlib import Path
 
 import httpx
 import pytest
 
+import app.downloader as downloader_module
 from app.config import AppConfig
 from app.db import Database, PoseRevisionConflict, utc_now
 from app.downloader import DownloadManager, EventBroker, PoseExportCanceled
@@ -205,8 +207,7 @@ def test_pose_export_preflights_both_sides_and_pose_jobs_restart(
     target_b_source.write_bytes(b"target-b")
     control_source.write_bytes(b"control")
     control_output = (
-        config.pose_root_path
-        / "standing/selected_control/g79186222-0002_control.jpg"
+        config.pose_root_path / "standing/selected_control/g79186222-0002_control.jpg"
     )
     control_output.parent.mkdir(parents=True)
     control_output.write_bytes(b"different")
@@ -227,17 +228,14 @@ def test_pose_export_preflights_both_sides_and_pose_jobs_restart(
             {CONTROL: control_source, TARGET_A: target_source},
         )
     assert not (
-        config.pose_root_path
-        / "standing/selected_target/g79186222-0002_target.jpg"
+        config.pose_root_path / "standing/selected_target/g79186222-0002_target.jpg"
     ).exists()
 
     control_output.unlink()
     original_copy = manager._copy_without_overwrite
     copy_calls = 0
 
-    def fail_second_copy(
-        source: Path, target: Path, should_cancel=None
-    ) -> bool:
+    def fail_second_copy(source: Path, target: Path, should_cancel=None) -> bool:
         nonlocal copy_calls
         copy_calls += 1
         if copy_calls == 4:
@@ -274,8 +272,7 @@ def test_pose_export_preflights_both_sides_and_pose_jobs_restart(
     assert not list((config.pose_root_path / "standing").rglob("*.jpg"))
 
     old_target = (
-        config.pose_root_path
-        / "old-pose/selected_target/g79186222-0003_target.jpg"
+        config.pose_root_path / "old-pose/selected_target/g79186222-0003_target.jpg"
     )
     old_target.parent.mkdir(parents=True)
     old_target.write_bytes(target_source.read_bytes())
@@ -305,8 +302,7 @@ def test_pose_export_preflights_both_sides_and_pose_jobs_restart(
             },
         )
     assert not (
-        config.pose_root_path
-        / "standing/selected_target/g79186222-0002_target.jpg"
+        config.pose_root_path / "standing/selected_target/g79186222-0002_target.jpg"
     ).exists()
     old_target.unlink()
 
@@ -382,8 +378,7 @@ def test_pose_export_preflights_both_sides_and_pose_jobs_restart(
     outside = tmp_path / "outside-pose-output"
     outside.mkdir()
     external_part = (
-        outside
-        / ".g79186222-0009_target.jpg.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.part"
+        outside / ".g79186222-0009_target.jpg.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.part"
     )
     external_part.write_bytes(b"must survive")
     linked_pose = config.pose_root_path / "linked-pose"
@@ -413,6 +408,173 @@ def test_atomic_pose_copy_never_leaves_partial_final(
     monkeypatch.setattr("app.downloader.os.link", fail_publish)
     with pytest.raises(OSError, match="publish interrupted"):
         manager._copy_without_overwrite(source, target)
+    assert not target.exists()
+    assert not list(target.parent.glob(f".{target.name}.*.part"))
+
+
+@pytest.mark.parametrize("link_error", [errno.EPERM, errno.EACCES])
+def test_pose_publish_uses_rename_noreplace_when_hardlinks_are_unavailable(
+    tmp_path: Path, monkeypatch, link_error: int
+) -> None:
+    config, database = make_database(tmp_path)
+    manager = DownloadManager(config, database, object(), EventBroker())  # type: ignore[arg-type]
+    source = config.pose_root_path / "source.jpg"
+    target = config.pose_root_path / "pose/selected_target/pair_target.jpg"
+    source.write_bytes(b"complete image")
+    target.parent.mkdir(parents=True)
+    rename_calls = 0
+    other_writer = target.with_name(f".{target.name}.{'a' * 32}.part")
+    other_writer.write_bytes(b"another active writer")
+
+    def unavailable_link(_: Path, __: Path) -> None:
+        raise OSError(link_error, "hard links unavailable")
+
+    def rename_noreplace(temporary: Path, final: Path) -> None:
+        nonlocal rename_calls
+        rename_calls += 1
+        assert temporary.parent == final.parent
+        os_replace = downloader_module.os.replace
+        os_replace(temporary, final)
+
+    monkeypatch.setattr(downloader_module.os, "link", unavailable_link)
+    monkeypatch.setattr(downloader_module, "_rename_noreplace", rename_noreplace)
+
+    assert manager._copy_without_overwrite(source, target) is True
+    assert rename_calls == 1
+    assert target.read_bytes() == b"complete image"
+    assert other_writer.read_bytes() == b"another active writer"
+    other_writer.unlink()
+    assert not list(target.parent.glob(f".{target.name}.*.part"))
+
+
+def test_linux_rename_noreplace_publishes_without_clobbering(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.part"
+    target = tmp_path / "target.jpg"
+    source.write_bytes(b"first")
+    try:
+        downloader_module._rename_noreplace(source, target)
+    except OSError as exc:
+        if exc.errno in downloader_module._RENAME_NOREPLACE_UNAVAILABLE:
+            pytest.skip("renameat2 RENAME_NOREPLACE is unavailable")
+        raise
+    assert not source.exists()
+    assert target.read_bytes() == b"first"
+
+    racing_source = tmp_path / "racing.part"
+    racing_source.write_bytes(b"second")
+    with pytest.raises(FileExistsError):
+        downloader_module._rename_noreplace(racing_source, target)
+    assert racing_source.read_bytes() == b"second"
+    assert target.read_bytes() == b"first"
+
+
+def test_pose_publish_fails_closed_when_atomic_primitives_are_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, database = make_database(tmp_path)
+    manager = DownloadManager(config, database, object(), EventBroker())  # type: ignore[arg-type]
+    source = config.pose_root_path / "source.jpg"
+    target = config.pose_root_path / "pose/selected_target/pair_target.jpg"
+    source.write_bytes(b"complete image")
+    target.parent.mkdir(parents=True)
+
+    def unavailable_link(_: Path, __: Path) -> None:
+        raise OSError(errno.EPERM, "hard links unavailable")
+
+    def unavailable_rename(_: Path, __: Path) -> None:
+        raise OSError(errno.EOPNOTSUPP, "rename flags unavailable")
+
+    monkeypatch.setattr(downloader_module.os, "link", unavailable_link)
+    monkeypatch.setattr(downloader_module, "_rename_noreplace", unavailable_rename)
+    with pytest.raises(
+        OSError, match="supports neither hard links nor atomic no-replace rename"
+    ) as error:
+        manager._copy_without_overwrite(source, target)
+    assert error.value.errno == errno.EOPNOTSUPP
+    assert not target.exists()
+    assert not list(target.parent.glob(f".{target.name}.*.part"))
+
+
+def test_pose_publish_maps_rename_race_eexist_to_idempotent_result(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, database = make_database(tmp_path)
+    manager = DownloadManager(config, database, object(), EventBroker())  # type: ignore[arg-type]
+    source = config.pose_root_path / "source.jpg"
+    target = config.pose_root_path / "pose/selected_target/pair_target.jpg"
+    source.write_bytes(b"complete image")
+    target.parent.mkdir(parents=True)
+
+    def unavailable_link(_: Path, __: Path) -> None:
+        raise OSError(errno.EPERM, "hard links unavailable")
+
+    def racing_rename(_: Path, final: Path) -> None:
+        final.write_bytes(source.read_bytes())
+        raise OSError(errno.EEXIST, "target won the race")
+
+    monkeypatch.setattr(downloader_module.os, "link", unavailable_link)
+    monkeypatch.setattr(downloader_module, "_rename_noreplace", racing_rename)
+
+    assert manager._copy_without_overwrite(source, target) is False
+    assert target.read_bytes() == b"complete image"
+    assert not list(target.parent.glob(f".{target.name}.*.part"))
+
+
+def test_pose_publish_propagates_rename_eacces_without_unsafe_fallback(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, database = make_database(tmp_path)
+    manager = DownloadManager(config, database, object(), EventBroker())  # type: ignore[arg-type]
+    source = config.pose_root_path / "source.jpg"
+    target = config.pose_root_path / "pose/selected_target/pair_target.jpg"
+    source.write_bytes(b"complete image")
+    target.parent.mkdir(parents=True)
+
+    rename_calls = 0
+
+    def denied_link(_: Path, __: Path) -> None:
+        raise OSError(errno.EACCES, "CIFS hard links unavailable")
+
+    def denied_rename(_: Path, __: Path) -> None:
+        nonlocal rename_calls
+        rename_calls += 1
+        raise OSError(errno.EACCES, "rename denied")
+
+    monkeypatch.setattr(downloader_module.os, "link", denied_link)
+    monkeypatch.setattr(downloader_module, "_rename_noreplace", denied_rename)
+
+    with pytest.raises(OSError) as error:
+        manager._copy_without_overwrite(source, target)
+    assert error.value.errno == errno.EACCES
+    assert rename_calls == 1
+    assert not target.exists()
+    assert not list(target.parent.glob(f".{target.name}.*.part"))
+
+
+def test_pose_publish_does_not_fallback_on_readonly_hardlink_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, database = make_database(tmp_path)
+    manager = DownloadManager(config, database, object(), EventBroker())  # type: ignore[arg-type]
+    source = config.pose_root_path / "source.jpg"
+    target = config.pose_root_path / "pose/selected_target/pair_target.jpg"
+    source.write_bytes(b"complete image")
+    target.parent.mkdir(parents=True)
+
+    def readonly_link(_: Path, __: Path) -> None:
+        raise OSError(errno.EROFS, "read-only filesystem")
+
+    def unexpected_rename(_: Path, __: Path) -> None:
+        raise AssertionError("read-only errors must not try rename")
+
+    monkeypatch.setattr(downloader_module.os, "link", readonly_link)
+    monkeypatch.setattr(downloader_module, "_rename_noreplace", unexpected_rename)
+
+    with pytest.raises(OSError) as error:
+        manager._copy_without_overwrite(source, target)
+    assert error.value.errno == errno.EROFS
     assert not target.exists()
     assert not list(target.parent.glob(f".{target.name}.*.part"))
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import errno
 import hashlib
 import mimetypes
 import os
@@ -37,11 +39,62 @@ CONTENT_EXTENSIONS = {
 POSE_OUTPUT_PART_RE = re.compile(
     r"^\.g.+-\d+_(?:target|control)\.[A-Za-z0-9]+\.[0-9a-f]{32}\.part$"
 )
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+_RENAME_NOREPLACE_UNAVAILABLE = frozenset(
+    {
+        errno.EPERM,
+        errno.EOPNOTSUPP,
+        errno.ENOSYS,
+        errno.EINVAL,
+        errno.EXDEV,
+    }
+)
+_HARDLINK_UNAVAILABLE = _RENAME_NOREPLACE_UNAVAILABLE | {errno.EACCES}
+
+try:
+    _LIBC = ctypes.CDLL(None, use_errno=True)
+    _LIBC_RENAMEAT2 = _LIBC.renameat2
+except (AttributeError, OSError):
+    _LIBC_RENAMEAT2 = None
+else:
+    _LIBC_RENAMEAT2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    _LIBC_RENAMEAT2.restype = ctypes.c_int
+
+
+def _rename_noreplace(source: Path, target: Path) -> None:
+    """Atomically publish source without replacing an existing target."""
+
+    if _LIBC_RENAMEAT2 is None:
+        raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS), source)
+    ctypes.set_errno(0)
+    result = _LIBC_RENAMEAT2(
+        _AT_FDCWD,
+        os.fsencode(source),
+        _AT_FDCWD,
+        os.fsencode(target),
+        _RENAME_NOREPLACE,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno() or errno.EIO
+    error = OSError(error_number, os.strerror(error_number), source)
+    error.filename2 = target
+    raise error
 
 
 class ActiveDownloadError(RuntimeError):
     def __init__(self, job: dict, message: str | None = None):
-        super().__init__(message or "This gallery already has an active download for the selected profile")
+        super().__init__(
+            message
+            or "This gallery already has an active download for the selected profile"
+        )
         self.job = job
 
 
@@ -554,9 +607,7 @@ class DownloadManager:
                     should_cancel_materialization,
                 )
                 status = (
-                    "canceled"
-                    if self.db.job_cancel_requested(job_id)
-                    else "completed"
+                    "canceled" if self.db.job_cancel_requested(job_id) else "completed"
                 )
             except PoseExportCanceled:
                 status = "canceled"
@@ -607,9 +658,7 @@ class DownloadManager:
             self._preflight_pose_identity(pose_root, stem, target_path)
             self._preflight_output(target_source, target_path)
             self._preflight_output(control_source, control_path)
-            plans.append(
-                (target_source, target_path, control_source, control_path)
-            )
+            plans.append((target_source, target_path, control_source, control_path))
 
         created_paths: list[Path] = []
         try:
@@ -646,7 +695,9 @@ class DownloadManager:
             try:
                 existing.resolve().relative_to(pose_root.resolve())
             except ValueError as exc:
-                raise ValueError("Pose output path escapes the configured root") from exc
+                raise ValueError(
+                    "Pose output path escapes the configured root"
+                ) from exc
             if existing != desired_target:
                 pose_name = existing.parent.parent.name
                 raise FileExistsError(
@@ -657,12 +708,13 @@ class DownloadManager:
     def _copy_without_overwrite(
         cls, source: Path, target: Path, should_cancel=None
     ) -> bool:
-        if target.exists():
-            if cls._files_identical(source, target):
+        def existing_result() -> bool:
+            if target.exists() and cls._files_identical(source, target):
                 return False
             raise FileExistsError(f"Refusing to overwrite existing file: {target}")
-        for stale in target.parent.glob(f".{target.name}.*.part"):
-            stale.unlink(missing_ok=True)
+
+        if target.exists():
+            return existing_result()
         temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.part")
         try:
             with source.open("rb") as source_file, temporary.open("xb") as target_file:
@@ -673,12 +725,35 @@ class DownloadManager:
                     if not chunk:
                         break
                     target_file.write(chunk)
-            os.link(temporary, target)
-            return True
-        except FileExistsError:
-            if target.exists() and cls._files_identical(source, target):
-                return False
-            raise FileExistsError(f"Refusing to overwrite existing file: {target}")
+                target_file.flush()
+                os.fsync(target_file.fileno())
+            if should_cancel and should_cancel():
+                raise PoseExportCanceled("Pose export canceled")
+            try:
+                os.link(temporary, target)
+                return True
+            except FileExistsError:
+                return existing_result()
+            except OSError as exc:
+                if exc.errno not in _HARDLINK_UNAVAILABLE:
+                    raise
+
+            if should_cancel and should_cancel():
+                raise PoseExportCanceled("Pose export canceled")
+            try:
+                _rename_noreplace(temporary, target)
+                return True
+            except FileExistsError:
+                return existing_result()
+            except OSError as exc:
+                if exc.errno not in _RENAME_NOREPLACE_UNAVAILABLE:
+                    raise
+                raise OSError(
+                    exc.errno,
+                    "Pose output filesystem supports neither hard links "
+                    "nor atomic no-replace rename",
+                    target,
+                ) from exc
         finally:
             temporary.unlink(missing_ok=True)
 
