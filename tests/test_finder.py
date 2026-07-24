@@ -1361,6 +1361,25 @@ def test_pose_first_persists_gallery_tier_and_uses_leading_lane_threshold(
         "Pose hit",
         "Visual fallback",
     ]
+    first_page, first_total, first_counts = service.results_page(
+        scan["id"], review="pending", min_score=0, limit=2, offset=0
+    )
+    second_page, second_total, second_counts = service.results_page(
+        scan["id"], review="pending", min_score=0, limit=2, offset=2
+    )
+    assert first_total == second_total == 3
+    assert [item["title"] for item in first_page] == ["Exact", "Pose hit"]
+    assert [item["title"] for item in second_page] == ["Visual fallback"]
+    assert {item["id"] for item in first_page}.isdisjoint(
+        {item["id"] for item in second_page}
+    )
+    assert first_counts == second_counts == {
+        "pending": 3,
+        "maybe": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "total": 3,
+    }
     pose_gallery = results[1]
     assert pose_gallery["ranking_tier"] == 2
     assert pose_gallery["score"] == pytest.approx(0.6)
@@ -2723,10 +2742,18 @@ async def test_finder_api_signs_best_preview(tmp_path: Path, monkeypatch) -> Non
             assert missing_continuation.status_code == 404
             result_response = await client.get(
                 f"/api/finder/scans/{scan_id}/results",
-                params={"review": "all", "min_score": 0},
+                params={"review": "all", "min_score": 0, "limit": 1, "offset": 0},
             )
             assert result_response.status_code == 200
-            result = result_response.json()["items"][0]
+            result_page = result_response.json()
+            assert result_page["page"] == 1
+            assert result_page["page_size"] == 1
+            assert result_page["page_count"] >= 1
+            assert result_page["has_previous"] is False
+            assert result_page["has_next"] is (
+                result_page["total"] > len(result_page["items"])
+            )
+            result = result_page["items"][0]
             assert "best_preview_remote_url" not in result
             assert result["best_preview_url"].startswith("/api/media?")
             request = httpx.URL(result["best_preview_url"])

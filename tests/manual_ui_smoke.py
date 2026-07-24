@@ -38,6 +38,7 @@ def build_visual_app(
     finder_unusable_save: bool = False,
     finder_exhausted: bool = False,
     finder_continue: bool = False,
+    finder_pagination: bool = False,
 ):
     finder_source_exhausted = finder_exhausted or finder_continue
     finder_pose_mode = open_finder_pose_flow or finder_direct_assign
@@ -434,6 +435,50 @@ def build_visual_app(
                 "best_ordinal": 7,
             },
         ]
+        if finder_pagination:
+            all_results = [
+                {
+                    **results[0],
+                    "id": f"visual-result-{index + 1}",
+                    "gallery_id": galleries[index % len(galleries)]["id"],
+                    "gallery_url": galleries[index % len(galleries)]["url"],
+                    "title": f"Paged pose candidate {index + 1:02d}",
+                    "rank": index + 1,
+                    "score": 0.96 - index / 1000,
+                    "review": "pending",
+                    "feedback_image_urls": [],
+                }
+                for index in range(49)
+            ]
+            review_filter = str(kwargs.get("review", "pending"))
+            minimum_score = float(kwargs.get("min_score") or 0)
+            filtered = [
+                item
+                for item in all_results
+                if (review_filter == "all" or item["review"] == review_filter)
+                and item["score"] >= minimum_score
+            ]
+            offset = max(0, int(kwargs.get("offset") or 0))
+            limit = max(1, int(kwargs.get("limit") or 24))
+            page_items = filtered[offset : offset + limit]
+            return {
+                "items": page_items,
+                "total": len(filtered),
+                "counts": {
+                    "pending": len(filtered),
+                    "accepted": 0,
+                    "maybe": 0,
+                    "rejected": 0,
+                    "total": len(filtered),
+                },
+                "limit": limit,
+                "offset": offset,
+                "page": offset // limit + 1,
+                "page_size": limit,
+                "page_count": (len(filtered) + limit - 1) // limit,
+                "has_previous": offset > 0,
+                "has_next": offset + len(page_items) < len(filtered),
+            }
         reviews = [first_review, second_review]
         counts = {
             review: reviews.count(review)
@@ -488,6 +533,8 @@ def build_visual_app(
             script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const modal=document.querySelector('#gallery-modal');const button=document.querySelector('[data-gallery-mode=pose]');const image=document.querySelector('.image-option:not(.skeleton-image)');if(modal?.open&&button&&image){button.click();clearInterval(poll)}},50)});"
         if open_finder:
             script += "localStorage.setItem('galleryflow:finder-scan', JSON.stringify('visual-finder'));window.addEventListener('load',()=>{const poll=setInterval(()=>{const button=document.querySelector('.finder-overlay-toggle:not([hidden])');if(button){button.click();clearInterval(poll)}},50)});"
+        if finder_pagination:
+            script += "window.addEventListener('load',()=>{let clicked=false;const poll=setInterval(()=>{const status=document.querySelector('#finder-page-status')?.textContent;const cards=document.querySelectorAll('#finder-result-grid .finder-card');if(!clicked&&status==='Page 1 of 3'&&cards.length===24){document.querySelector('#finder-page-next')?.click();clicked=true}else if(clicked&&status==='Page 2 of 3'&&cards.length===24&&cards[0]?.querySelector('.finder-rank')?.textContent==='#25'){document.documentElement.dataset.finderPagination='pass';clearInterval(poll)}},50);setTimeout(()=>{if(!document.documentElement.dataset.finderPagination)document.documentElement.dataset.finderPagination='fail'},4500)});"
         if finder_continue:
             script += """window.addEventListener('load',()=>{const failedUrl='https://www.pornpics.com/blocked-source/';const nextUrl='https://www.pornpics.com/new-category/';let phase='waiting';let successAt=0;const countsOk=()=>document.querySelector('#finder-accepted-count')?.textContent==='1'&&document.querySelector('#finder-rejected-count')?.textContent==='1';const cardOk=()=>document.querySelectorAll('#finder-result-grid .finder-card').length===1;const poll=setInterval(()=>{const form=document.querySelector('#finder-continue');const source=document.querySelector('#finder-continue-source');const pages=document.querySelector('#finder-continue-pages');const button=document.querySelector('#finder-continue-button');const toasts=[...document.querySelectorAll('.toast')].map(item=>item.textContent).join(' ');if(phase==='waiting'&&form&&!form.hidden&&source&&pages&&button&&!button.disabled&&countsOk()){document.querySelector('[data-finder-review=accepted]')?.click();pages.value='7';pages.dispatchEvent(new Event('input',{bubbles:true}));if(!document.querySelector('#finder-continue-summary')?.textContent.includes('Up to 7 new pages'))return;source.value=failedUrl;button.click();phase='failure-sent'}else if(phase==='failure-sent'&&form&&!form.hidden&&!button?.disabled&&source?.value===failedUrl&&countsOk()&&cardOk()&&toasts.includes('Could not continue Finder search')){document.documentElement.dataset.finderContinueFailure='pass';document.querySelector('#finder-refresh')?.click();setTimeout(()=>{source.value=nextUrl;button.click();successAt=Date.now();phase='success-sent'},180)}else if(phase==='success-sent'&&Date.now()-successAt>1800){const passed=form?.hidden&&document.querySelector('#finder-session-label')?.textContent.includes('running')&&document.querySelector('#finder-source')?.value===nextUrl&&document.querySelector('#finder-scan-select')?.value==='visual-finder'&&countsOk()&&cardOk();document.documentElement.dataset.finderContinue=passed?'pass':'fail';clearInterval(poll)}},50);setTimeout(()=>{if(!document.documentElement.dataset.finderContinue)document.documentElement.dataset.finderContinue='fail';if(!document.documentElement.dataset.finderContinueFailure)document.documentElement.dataset.finderContinueFailure='fail'},6500)});"""
         if finder_review_mode:
@@ -605,6 +652,7 @@ def main() -> None:
     parser.add_argument("--finder-unusable-save", action="store_true")
     parser.add_argument("--finder-exhausted", action="store_true")
     parser.add_argument("--finder-continue", action="store_true")
+    parser.add_argument("--finder-pagination", action="store_true")
     args = parser.parse_args()
     finder_mode = (
         args.finder
@@ -615,9 +663,12 @@ def main() -> None:
         or args.finder_unusable_save
         or args.finder_exhausted
         or args.finder_continue
+        or args.finder_pagination
     )
     suffix = (
-        "finder-continue-mobile"
+        "finder-pagination"
+        if args.finder_pagination
+        else "finder-continue-mobile"
         if args.finder_continue and args.mobile
         else "finder-continue"
         if args.finder_continue
@@ -690,6 +741,7 @@ def main() -> None:
                     finder_unusable_save=args.finder_unusable_save,
                     finder_exhausted=args.finder_exhausted,
                     finder_continue=args.finder_continue,
+                    finder_pagination=args.finder_pagination,
                 ),
                 host="127.0.0.1",
                 port=18101,
@@ -732,6 +784,7 @@ def main() -> None:
             or args.finder_direct_assign
             or args.finder_unusable_save
             or args.finder_continue
+            or args.finder_pagination
         ):
             command.insert(1, "--dump-dom")
         completed = subprocess.run(
@@ -743,12 +796,14 @@ def main() -> None:
                 or args.finder_direct_assign
                 or args.finder_unusable_save
                 or args.finder_continue
+                or args.finder_pagination
             ),
             text=(
                 args.finder_race
                 or args.finder_direct_assign
                 or args.finder_unusable_save
                 or args.finder_continue
+                or args.finder_pagination
             ),
         )
         if args.finder_race and 'data-finder-race="pass"' not in completed.stdout:
@@ -774,6 +829,13 @@ def main() -> None:
                 raise AssertionError(
                     "continued Finder scan lost its new source, results, or review counts"
                 )
+        if (
+            args.finder_pagination
+            and 'data-finder-pagination="pass"' not in completed.stdout
+        ):
+            raise AssertionError(
+                "Finder pagination did not load page two with global result ranks"
+            )
         server.should_exit = True
         thread.join(timeout=5)
     print(output)

@@ -529,12 +529,18 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
             limit=limit,
             offset=offset,
         )
+        page_count = (total + limit - 1) // limit
         return {
             "items": [decorate_finder_result(item) for item in items],
             "total": total,
             "counts": counts,
             "limit": limit,
             "offset": offset,
+            "page": offset // limit + 1,
+            "page_size": limit,
+            "page_count": page_count,
+            "has_previous": offset > 0,
+            "has_next": offset + len(items) < total,
         }
 
     @app.patch("/api/finder/scans/{scan_id}/results/{result_id}")

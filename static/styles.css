@@ -636,6 +636,14 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .finder-threshold { display: flex; min-width: 155px; gap: 9px; align-items: center; color: var(--muted); font-size: 9px; white-space: nowrap; }
 .finder-threshold input { min-width: 80px; flex: 1; }
 .finder-result-grid { display: grid; padding: 16px; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 14px; align-items: start; }
+.finder-pagination { display: flex; min-height: 64px; padding: 11px 16px; gap: 14px; align-items: center; justify-content: center; border-top: 1px solid var(--border); background: rgba(255,255,255,.012); }
+.finder-pagination[hidden] { display: none; }
+.finder-pagination .button { min-width: 92px; min-height: 36px; padding-inline: 11px; justify-content: center; font-size: 9px; }
+.finder-pagination .button svg { width: 13px; height: 13px; }
+.finder-page-previous svg { transform: rotate(180deg); }
+.finder-page-copy { display: flex; min-width: 150px; flex-direction: column; align-items: center; text-align: center; }
+.finder-page-copy strong { color: var(--text-soft); font-size: 10px; font-variant-numeric: tabular-nums; }
+.finder-page-copy small { margin-top: 2px; color: var(--muted); font-size: 8px; font-variant-numeric: tabular-nums; }
 .finder-card { display: flex; min-width: 0; flex-direction: column; }
 .finder-card.is-accepted { border-color: rgba(79,210,160,.32); }
 .finder-card.is-rejected { opacity: .72; }
@@ -1118,6 +1126,9 @@ kbd { min-width: 30px; padding: 4px 8px; border: 1px solid var(--border-strong);
   .finder-review-tabs button { min-width: 0; flex: 1; padding-inline: 6px; justify-content: center; font-size: 9px; }
   .finder-threshold { width: 100%; }
   .finder-result-grid { padding: 10px; grid-template-columns: 1fr; gap: 10px; }
+  .finder-pagination { padding: 10px; gap: 8px; }
+  .finder-pagination .button { min-width: 0; flex: 1; }
+  .finder-page-copy { min-width: 112px; }
   .finder-card-actions .button { min-height: 37px; }
   .finder-card-copy { min-height: 0; padding: 10px; }
   .finder-rank, .finder-similarity, .finder-match-kind, .finder-indexed-badge { min-height: 22px; padding-inline: 6px; font-size: 7px; }

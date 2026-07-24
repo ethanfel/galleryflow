@@ -89,6 +89,13 @@
     finderResults: [],
     finderReviewCounts: null,
     finderReview: 'pending',
+    finderResultPage: 1,
+    finderResultPageCount: 1,
+    finderResultPageSize: 24,
+    finderResultTotal: 0,
+    finderResultLoading: false,
+    finderResultRequest: 0,
+    finderResultThresholdTimer: null,
     finderLoaded: false,
     finderLoading: false,
     finderBusy: false,
@@ -106,6 +113,7 @@
   const POSE_ROLES = ['solo', 'couple', 'group'];
   const FINDER_TERMINAL_STATES = ['completed', 'completed_with_errors', 'complete', 'done', 'failed', 'cancelled', 'canceled'];
   const FINDER_MAX_PAGES = 500;
+  const FINDER_RESULTS_PAGE_SIZE = 24;
   const FINDER_RANKING_VERSION = 'pose-first-v1';
   const poseRoleLabel = role => ({ solo: 'Solo', couple: 'Couple', group: 'Group' }[role] || 'Solo');
 
@@ -3053,10 +3061,40 @@
     $('.finder-diagnostic-toolbar', card).hidden = !breakdown.children.length && !result.personCount && !result.hasOverlay;
   }
 
+  function renderFinderPagination() {
+    const pagination = $('#finder-pagination');
+    const total = Math.max(0, Number(state.finderResultTotal || 0));
+    const pageSize = Math.max(1, Number(state.finderResultPageSize || FINDER_RESULTS_PAGE_SIZE));
+    const pageCount = Math.max(1, Number(state.finderResultPageCount || Math.ceil(total / pageSize) || 1));
+    const page = Math.max(1, Math.min(pageCount, Number(state.finderResultPage || 1)));
+    const first = total ? (page - 1) * pageSize + 1 : 0;
+    const last = total ? Math.min(total, first + state.finderResults.length - 1) : 0;
+    pagination.hidden = !state.finderScan?.id || pageCount <= 1;
+    $('#finder-page-status').textContent = `Page ${formatNumber(page)} of ${formatNumber(pageCount)}`;
+    $('#finder-page-range').textContent = total
+      ? `${formatNumber(first)}–${formatNumber(Math.max(first, last))} of ${formatNumber(total)} results`
+      : '0 results';
+    const previous = $('#finder-page-previous');
+    const next = $('#finder-page-next');
+    previous.disabled = state.finderResultLoading || page <= 1;
+    next.disabled = state.finderResultLoading || page >= pageCount;
+    previous.setAttribute('aria-label', `Previous Finder results page, page ${Math.max(1, page - 1)}`);
+    next.setAttribute('aria-label', `Next Finder results page, page ${Math.min(pageCount, page + 1)}`);
+  }
+
+  function scrollToFinderResults() {
+    const results = $('#finder-results');
+    if (!results) return;
+    const root = document.documentElement;
+    const previousBehavior = root.style.scrollBehavior;
+    root.style.scrollBehavior = 'auto';
+    const top = results.getBoundingClientRect().top + window.scrollY - 84;
+    window.scrollTo(0, Math.max(0, top));
+    root.style.scrollBehavior = previousBehavior;
+  }
+
   function renderFinderResults() {
-    const ranked = [...state.finderResults].sort(
-      (a, b) => b.rankingTier - a.rankingTier || b.score - a.score || (b.appearanceScore ?? -1) - (a.appearanceScore ?? -1) || a.rank - b.rank
-    );
+    const ranked = [...state.finderResults];
     const loadedCounts = {
       pending: ranked.filter(result => result.review === 'pending').length,
       accepted: ranked.filter(result => result.review === 'accepted').length,
@@ -3093,7 +3131,8 @@
       card.classList.toggle('is-rejected', result.review === 'rejected');
       card.classList.toggle('is-indexed', result.indexedOnly);
       appendFinderMatchMedia($('.finder-match-gallery', card), result);
-      $('.finder-rank', card).textContent = `#${String(ranked.indexOf(result) + 1).padStart(2, '0')}`;
+      const resultRank = (state.finderResultPage - 1) * state.finderResultPageSize + ranked.indexOf(result) + 1;
+      $('.finder-rank', card).textContent = `#${String(resultRank).padStart(2, '0')}`;
       $('.finder-similarity', card).textContent = finderEvidenceLabel(result);
       $('.finder-indexed-badge', card).hidden = !result.indexedOnly;
       const matchKind = $('.finder-match-kind', card);
@@ -3171,15 +3210,16 @@
       grid.append(fragment);
     });
     const empty = $('#finder-empty');
-    empty.hidden = Boolean(results.length);
+    empty.hidden = Boolean(results.length) || state.finderResultLoading;
     if (!results.length) {
-      $('h3', empty).textContent = state.finderResults.length ? 'No candidates in this view' : finderScanIsRunning() ? 'Scanning for candidates…' : 'No candidates found';
-      $('p', empty).textContent = state.finderResults.length
+      $('h3', empty).textContent = state.finderResultTotal ? 'No candidates on this page' : finderScanIsRunning() ? 'Scanning for candidates…' : 'No candidates found';
+      $('p', empty).textContent = state.finderResultTotal
         ? 'Lower the display threshold or choose another review tab.'
         : finderScanIsRunning()
           ? 'Results will appear here as galleries are compared.'
           : 'Try more examples, a lower minimum match score, or a wider source.';
     }
+    renderFinderPagination();
   }
 
   function updateFinderExtendSummary({ commit = false } = {}) {
@@ -3414,24 +3454,57 @@
     }, delay);
   }
 
-  async function loadFinderResults({ quiet = false } = {}) {
+  function resetFinderResultPagination() {
+    window.clearTimeout(state.finderResultThresholdTimer);
+    state.finderResultThresholdTimer = null;
+    state.finderResultRequest += 1;
+    state.finderResultPage = 1;
+    state.finderResultPageCount = 1;
+    state.finderResultPageSize = FINDER_RESULTS_PAGE_SIZE;
+    state.finderResultTotal = 0;
+    state.finderResultLoading = false;
+  }
+
+  function scheduleFinderResultFilterLoad(delay = 180) {
+    window.clearTimeout(state.finderResultThresholdTimer);
+    state.finderResultThresholdTimer = window.setTimeout(() => {
+      state.finderResultThresholdTimer = null;
+      loadFinderResults({ quiet: true, page: 1 });
+    }, delay);
+  }
+
+  async function loadFinderResults({ quiet = false, page = state.finderResultPage } = {}) {
     const scanId = state.finderScanId;
+    const review = state.finderReview;
+    const threshold = Math.max(0, Math.min(1, Number($('#finder-result-threshold').value || 0)));
+    const pageSize = FINDER_RESULTS_PAGE_SIZE;
+    const requestedPage = Math.max(1, Number.parseInt(page, 10) || 1);
+    const request = ++state.finderResultRequest;
     const mutationEpoch = state.finderResultMutationEpoch;
     const mutationInFlight = state.finderFeedbackBusy || finderFeedbackIsSaving();
     if (!scanId) {
       state.finderResults = [];
       state.finderReviewCounts = null;
+      resetFinderResultPagination();
       renderFinderWorkspace();
       return;
     }
+    state.finderResultLoading = true;
     $('#finder-result-grid').setAttribute('aria-busy', 'true');
+    renderFinderPagination();
     try {
       const data = await api(withParams(`/api/finder/scans/${encodeURIComponent(scanId)}/results`, {
-        review: 'all',
-        min_score: 0,
-        limit: 500
+        review,
+        min_score: threshold,
+        limit: pageSize,
+        offset: (requestedPage - 1) * pageSize
       }));
-      if (String(scanId) !== String(state.finderScanId)) return;
+      if (
+        request !== state.finderResultRequest
+        || String(scanId) !== String(state.finderScanId)
+        || review !== state.finderReview
+        || Math.abs(threshold - Number($('#finder-result-threshold').value || 0)) > 1e-9
+      ) return;
       if (
         mutationInFlight
         || mutationEpoch !== state.finderResultMutationEpoch
@@ -3441,9 +3514,16 @@
         scheduleFreshFinderResults();
         return;
       }
+      const total = Math.max(0, Number(data?.total ?? apiItems(data, 'results').length) || 0);
+      const pageCount = Math.max(1, Number(data?.page_count || Math.ceil(total / pageSize) || 1));
+      if (requestedPage > pageCount) {
+        return loadFinderResults({ quiet, page: pageCount });
+      }
       state.finderReviewCounts = normalizeFinderReviewCounts(data);
       const previousResults = new Map(state.finderResults.map(result => [String(result.key), result]));
-      state.finderResults = apiItems(data, 'results').map(normalizeFinderResult).map(result => {
+      state.finderResults = apiItems(data, 'results').map(
+        (result, index) => normalizeFinderResult(result, (requestedPage - 1) * pageSize + index)
+      ).map(result => {
         const previous = previousResults.get(String(result.key));
         if (!previous?.feedbackSelectionDirty && !previous?.feedbackSaving) return result;
         return {
@@ -3459,11 +3539,20 @@
           feedbackSaving: previous.feedbackSaving
         };
       });
+      state.finderResultPage = requestedPage;
+      state.finderResultPageCount = pageCount;
+      state.finderResultPageSize = pageSize;
+      state.finderResultTotal = total;
+      state.finderResultLoading = false;
       renderFinderWorkspace();
     } catch (error) {
       if (!quiet) toast('Could not load Finder results', errorMessage(error), 'error');
     } finally {
-      $('#finder-result-grid').setAttribute('aria-busy', 'false');
+      if (request === state.finderResultRequest) {
+        state.finderResultLoading = false;
+        $('#finder-result-grid').setAttribute('aria-busy', 'false');
+        renderFinderPagination();
+      }
     }
   }
 
@@ -3645,6 +3734,7 @@
       state.finderScan = null;
       state.finderResults = [];
       state.finderReviewCounts = null;
+      resetFinderResultPagination();
       renderFinderWorkspace();
       return;
     }
@@ -3675,6 +3765,7 @@
         state.finderScanId = '';
         state.finderResults = [];
         state.finderReviewCounts = null;
+        resetFinderResultPagination();
         storage.set('finder-scan', '');
         renderFinderWorkspace();
       } else if (!quiet) toast('Could not load Finder scan', errorMessage(error), 'error');
@@ -3760,6 +3851,7 @@
       state.finderResults = [];
       state.finderReviewCounts = { pending: 0, accepted: 0, maybe: 0, rejected: 0, total: 0 };
       state.finderReview = 'pending';
+      resetFinderResultPagination();
       state.finderScans = [scan, ...state.finderScans.filter(item => String(item.id) !== String(scan.id))];
       storage.set('finder-scan', state.finderScanId);
       $('#finder-result-threshold').value = config.minimumScore.toFixed(2);
@@ -4151,8 +4243,10 @@
       renderFinderScans();
       return;
     }
-    if (String(scanId || '') !== String(state.finderScanId || '')) {
+    const changedScan = String(scanId || '') !== String(state.finderScanId || '');
+    if (changedScan) {
       $('#finder-continue-source').value = '';
+      resetFinderResultPagination();
     }
     state.finderScanId = scanId;
     state.finderReviewCounts = null;
@@ -4160,6 +4254,7 @@
     if (!scanId) {
       state.finderScan = null;
       state.finderResults = [];
+      resetFinderResultPagination();
       window.clearTimeout(state.finderPollTimer);
       renderFinderWorkspace();
       await loadFinderFeedback({ quiet: true, force: true });
@@ -4729,7 +4824,17 @@
     $('#finder-min-similarity').addEventListener('input', event => {
       $('#finder-min-output').textContent = Number(event.currentTarget.value).toFixed(2);
     });
-    $('#finder-result-threshold').addEventListener('input', renderFinderResults);
+    $('#finder-result-threshold').addEventListener('input', event => {
+      $('#finder-filter-output').textContent = Number(event.currentTarget.value || 0).toFixed(2);
+      state.finderResultPage = 1;
+      renderFinderResults();
+      scheduleFinderResultFilterLoad();
+    });
+    $('#finder-result-threshold').addEventListener('change', () => {
+      window.clearTimeout(state.finderResultThresholdTimer);
+      state.finderResultThresholdTimer = null;
+      loadFinderResults({ quiet: true, page: 1 });
+    });
     $('#finder-scan-select').addEventListener('change', event => selectFinderScan(event.currentTarget.value));
     $('#finder-start').addEventListener('click', startFinderScan);
     $('#finder-extend-pages').addEventListener('input', () => updateFinderExtendSummary());
@@ -4751,9 +4856,25 @@
     $('#finder-resume').addEventListener('click', event => performFinderScanAction('resume', event.currentTarget));
     $('#finder-cancel').addEventListener('click', cancelFinderScan);
     $$('[data-finder-review]').forEach(button => button.addEventListener('click', () => {
+      if (button.dataset.finderReview === state.finderReview) return;
       state.finderReview = button.dataset.finderReview;
+      state.finderResultPage = 1;
+      const total = Math.max(0, Number(state.finderReviewCounts?.[state.finderReview] || 0));
+      state.finderResultTotal = total;
+      state.finderResultPageCount = Math.max(1, Math.ceil(total / FINDER_RESULTS_PAGE_SIZE));
       renderFinderResults();
+      loadFinderResults({ quiet: true, page: 1 });
     }));
+    $('#finder-page-previous').addEventListener('click', async () => {
+      const currentPage = state.finderResultPage;
+      await loadFinderResults({ page: currentPage - 1 });
+      if (state.finderResultPage !== currentPage) scrollToFinderResults();
+    });
+    $('#finder-page-next').addEventListener('click', async () => {
+      const currentPage = state.finderResultPage;
+      await loadFinderResults({ page: currentPage + 1 });
+      if (state.finderResultPage !== currentPage) scrollToFinderResults();
+    });
     $('#finder-result-grid').addEventListener('click', event => {
       const button = event.target.closest('[data-finder-action]');
       if (!button) return;
