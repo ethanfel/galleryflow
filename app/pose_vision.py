@@ -39,6 +39,25 @@ RTMO_L_ARCHIVE_MEMBER = "end2end.onnx"
 RTMO_INPUT_SIZE = 640
 RTMO_KEYPOINT_COUNT = 17
 
+# RTMO uses 0.15 as its default visible-joint threshold. Geometry must use
+# the same floor so weak heatmap noise is not promoted to pose evidence.
+POSE_GEOMETRY_EVIDENCE_THRESHOLD = 0.15
+
+# ``reliable`` intentionally remains the broad, backwards-compatible signal.
+# ``precise`` is the stricter signal for high-precision ranking: every matched
+# person needs enough torso anchors and articulated limbs to describe a pose,
+# rather than merely a face or a handful of coincident body points.
+PRECISE_MIN_BODY_COMMON_JOINTS = 7
+PRECISE_MIN_CORE_ANCHORS = 2
+PRECISE_MIN_DISTAL_LIMB_JOINTS = 3
+PRECISE_MIN_SUPPORTED_LIMB_SEGMENTS = 2
+PRECISE_MIN_BODY_COVERAGE = 0.60
+PRECISE_MIN_MEAN_JOINT_CONFIDENCE = 0.35
+PRECISE_MIN_MATCHED_PERSON_QUALITY = 0.45
+PRECISE_MIN_SUPPORTED_ARTICULATIONS = 3
+PRECISE_MIN_ARTICULATION_SCORE = 0.55
+PRECISE_MIN_PRECISION_SCORE = 0.68
+
 DEFAULT_MAX_IMAGE_BYTES = 20 * 1024 * 1024
 DEFAULT_MAX_IMAGE_PIXELS = 40_000_000
 DEFAULT_MAX_ARCHIVE_BYTES = 180 * 1024 * 1024
@@ -73,6 +92,37 @@ COCO_LEFT_RIGHT_PAIRS = (
     (11, 12),
     (13, 14),
     (15, 16),
+)
+COCO_CORE_ANCHORS = (5, 6, 11, 12)
+COCO_SHOULDER_ANCHORS = (5, 6)
+COCO_HIP_ANCHORS = (11, 12)
+COCO_DISTAL_LIMB_JOINTS = (7, 8, 9, 10, 13, 14, 15, 16)
+COCO_ARM_LIMB_SEGMENTS = (
+    (5, 7),
+    (7, 9),
+    (6, 8),
+    (8, 10),
+)
+COCO_LEG_LIMB_SEGMENTS = (
+    (11, 13),
+    (13, 15),
+    (12, 14),
+    (14, 16),
+)
+COCO_LIMB_SEGMENTS = COCO_ARM_LIMB_SEGMENTS + COCO_LEG_LIMB_SEGMENTS
+# Each triplet is (outer, pivot, outer). Shoulder and hip triplets retain
+# limb direction relative to the torso; elbow and knee triplets retain limb
+# flexion. Joint angles are inherently translation/scale invariant, and
+# mirroring is handled before geometry is evaluated.
+COCO_ARTICULATION_TRIPLETS = (
+    (6, 5, 7),
+    (5, 7, 9),
+    (5, 6, 8),
+    (6, 8, 10),
+    (12, 11, 13),
+    (11, 13, 15),
+    (11, 12, 14),
+    (12, 14, 16),
 )
 
 
@@ -246,6 +296,21 @@ class PoseGeometryMatch:
     common_joints: int
     mean_joint_confidence: float
     minimum_body_confidence: float
+    body_common_joints: int = 0
+    core_anchor_joints: int = 0
+    distal_limb_joints: int = 0
+    supported_limb_segments: int = 0
+    body_coverage: float = 0.0
+    matched_person_quality: float = 0.0
+    supported_articulations: int = 0
+    articulation_score: float = 0.0
+    shoulder_anchor_joints: int = 0
+    hip_anchor_joints: int = 0
+    supported_arm_segments: int = 0
+    supported_leg_segments: int = 0
+    supported_arm_articulations: int = 0
+    supported_leg_articulations: int = 0
+    minimum_person_shape_score: float = 0.0
 
     @property
     def reliable(self) -> bool:
@@ -257,9 +322,68 @@ class PoseGeometryMatch:
             and self.minimum_body_confidence >= 0.15
         )
 
+    @property
+    def precision_ready(self) -> bool:
+        """Whether both detections contain enough evidence for strict scoring."""
+
+        return bool(
+            self.reliable
+            and self.reference_count == self.candidate_count
+            and len(self.matched_pairs) == self.reference_count
+            and self.body_common_joints >= PRECISE_MIN_BODY_COMMON_JOINTS
+            and self.core_anchor_joints >= PRECISE_MIN_CORE_ANCHORS
+            and self.distal_limb_joints >= PRECISE_MIN_DISTAL_LIMB_JOINTS
+            and self.supported_limb_segments
+            >= PRECISE_MIN_SUPPORTED_LIMB_SEGMENTS
+            and self.body_coverage >= PRECISE_MIN_BODY_COVERAGE
+            and self.mean_joint_confidence
+            >= PRECISE_MIN_MEAN_JOINT_CONFIDENCE
+            and self.matched_person_quality
+            >= PRECISE_MIN_MATCHED_PERSON_QUALITY
+            and self.supported_articulations
+            >= PRECISE_MIN_SUPPORTED_ARTICULATIONS
+            and self.shoulder_anchor_joints >= 1
+            and self.hip_anchor_joints >= 1
+            and self.supported_arm_segments >= 1
+            and self.supported_leg_segments >= 1
+            and self.supported_arm_articulations >= 1
+            and self.supported_leg_articulations >= 1
+        )
+
+    @property
+    def precise(self) -> bool:
+        """Whether the evidence also agrees strongly enough to be a pose hit."""
+
+        return bool(
+            self.precision_ready
+            and self.articulation_score >= PRECISE_MIN_ARTICULATION_SCORE
+            and self.precision_score >= PRECISE_MIN_PRECISION_SCORE
+        )
+
+    @property
+    def precision_score(self) -> float:
+        """Strict pose score, excluding the uninformative solo layout bonus."""
+
+        if not self.supported_articulations:
+            return 0.0
+        shape = max(0.0, min(1.0, self.minimum_person_shape_score))
+        articulation = max(0.0, min(1.0, self.articulation_score))
+        layout = 1.0
+        if (
+            self.reference_count >= 2
+            and self.reference_count == self.candidate_count
+        ):
+            layout = max(0.0, min(1.0, self.group_score))
+        return (
+            math.sqrt(shape * articulation)
+            * max(0.0, min(1.0, self.count_score))
+            * layout
+        )
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "score": self.score,
+            "precision_score": self.precision_score,
             "shape_score": self.shape_score,
             "group_score": self.group_score,
             "coverage": self.coverage,
@@ -272,6 +396,35 @@ class PoseGeometryMatch:
             "mean_joint_confidence": self.mean_joint_confidence,
             "minimum_body_confidence": self.minimum_body_confidence,
             "reliable": self.reliable,
+            "precision_ready": self.precision_ready,
+            "precise": self.precise,
+            "diagnostics": {
+                "evidence_threshold": POSE_GEOMETRY_EVIDENCE_THRESHOLD,
+                "exact_person_count": (
+                    self.reference_count == self.candidate_count
+                ),
+                "body_common_joints": self.body_common_joints,
+                "core_anchor_joints": self.core_anchor_joints,
+                "distal_limb_joints": self.distal_limb_joints,
+                "supported_limb_segments": self.supported_limb_segments,
+                "body_coverage": self.body_coverage,
+                "matched_person_quality": self.matched_person_quality,
+                "supported_articulations": self.supported_articulations,
+                "articulation_score": self.articulation_score,
+                "shoulder_anchor_joints": self.shoulder_anchor_joints,
+                "hip_anchor_joints": self.hip_anchor_joints,
+                "supported_arm_segments": self.supported_arm_segments,
+                "supported_leg_segments": self.supported_leg_segments,
+                "supported_arm_articulations": (
+                    self.supported_arm_articulations
+                ),
+                "supported_leg_articulations": (
+                    self.supported_leg_articulations
+                ),
+                "minimum_person_shape_score": (
+                    self.minimum_person_shape_score
+                ),
+            },
         }
 
 
@@ -879,8 +1032,11 @@ def _person_similarity(
     cand_conf: np.ndarray,
 ) -> tuple[float, float, int, float]:
     # Very low-confidence joints are missing observations, not coordinates at
-    # (0, 0). Confidence remains continuous above this numerical floor.
-    mask = (ref_conf >= 0.05) & (cand_conf >= 0.05)
+    # (0, 0). Confidence remains continuous above RTMO's evidence floor.
+    mask = (
+        (ref_conf >= POSE_GEOMETRY_EVIDENCE_THRESHOLD)
+        & (cand_conf >= POSE_GEOMETRY_EVIDENCE_THRESHOLD)
+    )
     common_joints = int(mask.sum())
     if common_joints < 3:
         return 0.0, 0.0, common_joints, 0.0
@@ -954,7 +1110,7 @@ def _person_centers_and_scales(frame: PoseFrame) -> tuple[np.ndarray, np.ndarray
     centers: list[np.ndarray] = []
     scales: list[float] = []
     for points, confidence in zip(frame.keypoints, frame.confidences, strict=True):
-        mask = confidence >= 0.05
+        mask = confidence >= POSE_GEOMETRY_EVIDENCE_THRESHOLD
         weights = confidence[mask]
         selected = points[mask]
         if selected.size:
@@ -999,6 +1155,163 @@ def _group_similarity(
     return math.exp(-((center_rmse / 0.8) ** 2) - ((scale_rmse / 0.55) ** 2))
 
 
+@dataclass(frozen=True, slots=True)
+class _PersonPrecisionEvidence:
+    body_common_joints: int
+    core_anchor_joints: int
+    distal_limb_joints: int
+    supported_limb_segments: int
+    body_coverage: float
+    matched_person_quality: float
+    supported_articulations: int
+    articulation_score: float
+    shoulder_anchor_joints: int
+    hip_anchor_joints: int
+    supported_arm_segments: int
+    supported_leg_segments: int
+    supported_arm_articulations: int
+    supported_leg_articulations: int
+
+
+def _person_articulation_similarity(
+    ref_points: np.ndarray,
+    ref_conf: np.ndarray,
+    cand_points: np.ndarray,
+    cand_conf: np.ndarray,
+) -> tuple[int, float, int, int]:
+    """Compare confident shoulder/elbow/hip/knee angles for one person."""
+
+    weighted_score = 0.0
+    total_weight = 0.0
+    supported = 0
+    supported_arm = 0
+    supported_leg = 0
+    for index, (outer_a, pivot, outer_b) in enumerate(
+        COCO_ARTICULATION_TRIPLETS
+    ):
+        indices = np.asarray((outer_a, pivot, outer_b))
+        if not (
+            np.all(ref_conf[indices] >= POSE_GEOMETRY_EVIDENCE_THRESHOLD)
+            and np.all(cand_conf[indices] >= POSE_GEOMETRY_EVIDENCE_THRESHOLD)
+        ):
+            continue
+        ref_a = ref_points[outer_a] - ref_points[pivot]
+        ref_b = ref_points[outer_b] - ref_points[pivot]
+        cand_a = cand_points[outer_a] - cand_points[pivot]
+        cand_b = cand_points[outer_b] - cand_points[pivot]
+        ref_norm = float(np.linalg.norm(ref_a) * np.linalg.norm(ref_b))
+        cand_norm = float(np.linalg.norm(cand_a) * np.linalg.norm(cand_b))
+        if ref_norm <= 1e-8 or cand_norm <= 1e-8:
+            continue
+        ref_angle = math.acos(
+            float(np.clip(np.dot(ref_a, ref_b) / ref_norm, -1.0, 1.0))
+        )
+        cand_angle = math.acos(
+            float(np.clip(np.dot(cand_a, cand_b) / cand_norm, -1.0, 1.0))
+        )
+        confidence = math.sqrt(
+            float(
+                np.min(np.clip(ref_conf[indices], 0, 1))
+                * np.min(np.clip(cand_conf[indices], 0, 1))
+            )
+        )
+        delta = abs(ref_angle - cand_angle)
+        # About 30 degrees of disagreement is meaningful while allowing
+        # normal keypoint jitter from the detector.
+        weighted_score += confidence * math.exp(-((delta / 0.55) ** 2))
+        total_weight += confidence
+        supported += 1
+        if index < 4:
+            supported_arm += 1
+        else:
+            supported_leg += 1
+    if not supported or total_weight <= 1e-8:
+        return supported, 0.0, supported_arm, supported_leg
+    return (
+        supported,
+        max(0.0, min(1.0, weighted_score / total_weight)),
+        supported_arm,
+        supported_leg,
+    )
+
+
+def _person_precision_evidence(
+    reference: PoseFrame,
+    candidate: PoseFrame,
+    reference_index: int,
+    candidate_index: int,
+) -> _PersonPrecisionEvidence:
+    """Return strict evidence for one assigned person pair."""
+
+    ref_conf = reference.confidences[reference_index]
+    cand_conf = candidate.confidences[candidate_index]
+    ref_visible = ref_conf >= POSE_GEOMETRY_EVIDENCE_THRESHOLD
+    cand_visible = cand_conf >= POSE_GEOMETRY_EVIDENCE_THRESHOLD
+    common = ref_visible & cand_visible
+
+    body_common_joints = int(common[5:].sum())
+    core_anchor_joints = int(common[np.asarray(COCO_CORE_ANCHORS)].sum())
+    distal_limb_joints = int(
+        common[np.asarray(COCO_DISTAL_LIMB_JOINTS)].sum()
+    )
+    supported_limb_segments = sum(
+        bool(common[start] and common[end])
+        for start, end in COCO_LIMB_SEGMENTS
+    )
+    supported_arm_segments = sum(
+        bool(common[start] and common[end])
+        for start, end in COCO_ARM_LIMB_SEGMENTS
+    )
+    supported_leg_segments = sum(
+        bool(common[start] and common[end])
+        for start, end in COCO_LEG_LIMB_SEGMENTS
+    )
+    body_denominator = max(
+        int(ref_visible[5:].sum()),
+        int(cand_visible[5:].sum()),
+    )
+    body_coverage = (
+        body_common_joints / body_denominator if body_denominator else 0.0
+    )
+    matched_person_quality = math.sqrt(
+        float(
+            np.clip(reference.person_scores[reference_index], 0, 1)
+            * np.clip(candidate.person_scores[candidate_index], 0, 1)
+        )
+    )
+    (
+        supported_articulations,
+        articulation_score,
+        supported_arm_articulations,
+        supported_leg_articulations,
+    ) = (
+        _person_articulation_similarity(
+            reference.keypoints[reference_index],
+            ref_conf,
+            candidate.keypoints[candidate_index],
+            cand_conf,
+        )
+    )
+    return _PersonPrecisionEvidence(
+        body_common_joints=body_common_joints,
+        core_anchor_joints=core_anchor_joints,
+        distal_limb_joints=distal_limb_joints,
+        supported_limb_segments=supported_limb_segments,
+        body_coverage=body_coverage,
+        matched_person_quality=matched_person_quality,
+        supported_articulations=supported_articulations,
+        articulation_score=articulation_score,
+        shoulder_anchor_joints=int(
+            common[np.asarray(COCO_SHOULDER_ANCHORS)].sum()
+        ),
+        hip_anchor_joints=int(common[np.asarray(COCO_HIP_ANCHORS)].sum()),
+        supported_arm_segments=supported_arm_segments,
+        supported_leg_segments=supported_leg_segments,
+        supported_arm_articulations=supported_arm_articulations,
+        supported_leg_articulations=supported_leg_articulations,
+    )
+
+
 def _geometry_one_direction(reference: PoseFrame, candidate: PoseFrame) -> PoseGeometryMatch:
     r_count = reference.person_count
     c_count = candidate.person_count
@@ -1029,10 +1342,17 @@ def _geometry_one_direction(reference: PoseFrame, candidate: PoseFrame) -> PoseG
             0, 0, 0, 0, 0, False, (), r_count, c_count, 0, 0, 0
         )
     shape = float(np.mean([similarities[r, c] for r, c in pairs]))
+    minimum_person_shape_score = min(
+        float(similarities[r, c]) for r, c in pairs
+    )
     coverage = float(np.mean([coverages[r, c] for r, c in pairs]))
     group = _group_similarity(reference, candidate, pairs)
     count_score = math.exp(-0.55 * abs(r_count - c_count))
     score = (0.78 * shape + 0.22 * group) * count_score
+    precision_evidence = [
+        _person_precision_evidence(reference, candidate, r, c)
+        for r, c in pairs
+    ]
     return PoseGeometryMatch(
         score=max(0.0, min(1.0, score)),
         shape_score=shape,
@@ -1054,6 +1374,47 @@ def _geometry_one_direction(reference: PoseFrame, candidate: PoseFrame) -> PoseG
             )
             for r, c in pairs
         ),
+        body_common_joints=min(
+            item.body_common_joints for item in precision_evidence
+        ),
+        core_anchor_joints=min(
+            item.core_anchor_joints for item in precision_evidence
+        ),
+        distal_limb_joints=min(
+            item.distal_limb_joints for item in precision_evidence
+        ),
+        supported_limb_segments=min(
+            item.supported_limb_segments for item in precision_evidence
+        ),
+        body_coverage=min(item.body_coverage for item in precision_evidence),
+        matched_person_quality=min(
+            item.matched_person_quality for item in precision_evidence
+        ),
+        supported_articulations=min(
+            item.supported_articulations for item in precision_evidence
+        ),
+        articulation_score=min(
+            item.articulation_score for item in precision_evidence
+        ),
+        shoulder_anchor_joints=min(
+            item.shoulder_anchor_joints for item in precision_evidence
+        ),
+        hip_anchor_joints=min(
+            item.hip_anchor_joints for item in precision_evidence
+        ),
+        supported_arm_segments=min(
+            item.supported_arm_segments for item in precision_evidence
+        ),
+        supported_leg_segments=min(
+            item.supported_leg_segments for item in precision_evidence
+        ),
+        supported_arm_articulations=min(
+            item.supported_arm_articulations for item in precision_evidence
+        ),
+        supported_leg_articulations=min(
+            item.supported_leg_articulations for item in precision_evidence
+        ),
+        minimum_person_shape_score=minimum_person_shape_score,
     )
 
 
@@ -1069,7 +1430,21 @@ def pose_geometry_match(
     if not allow_mirror or not reference.person_count or not candidate.person_count:
         return direct
     mirrored = _geometry_one_direction(reference, mirror_pose_frame(candidate))
-    if mirrored.score <= direct.score:
+    direct_rank = (
+        direct.precise,
+        direct.precision_ready,
+        direct.precision_score,
+        direct.score,
+        direct.coverage,
+    )
+    mirrored_rank = (
+        mirrored.precise,
+        mirrored.precision_ready,
+        mirrored.precision_score,
+        mirrored.score,
+        mirrored.coverage,
+    )
+    if mirrored_rank <= direct_rank:
         return direct
     return PoseGeometryMatch(
         score=mirrored.score,
@@ -1084,6 +1459,21 @@ def pose_geometry_match(
         common_joints=mirrored.common_joints,
         mean_joint_confidence=mirrored.mean_joint_confidence,
         minimum_body_confidence=mirrored.minimum_body_confidence,
+        body_common_joints=mirrored.body_common_joints,
+        core_anchor_joints=mirrored.core_anchor_joints,
+        distal_limb_joints=mirrored.distal_limb_joints,
+        supported_limb_segments=mirrored.supported_limb_segments,
+        body_coverage=mirrored.body_coverage,
+        matched_person_quality=mirrored.matched_person_quality,
+        supported_articulations=mirrored.supported_articulations,
+        articulation_score=mirrored.articulation_score,
+        shoulder_anchor_joints=mirrored.shoulder_anchor_joints,
+        hip_anchor_joints=mirrored.hip_anchor_joints,
+        supported_arm_segments=mirrored.supported_arm_segments,
+        supported_leg_segments=mirrored.supported_leg_segments,
+        supported_arm_articulations=mirrored.supported_arm_articulations,
+        supported_leg_articulations=mirrored.supported_leg_articulations,
+        minimum_person_shape_score=mirrored.minimum_person_shape_score,
     )
 
 

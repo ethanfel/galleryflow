@@ -177,7 +177,7 @@ def build_visual_app(
         "corpus_images_scored": 8156,
         "candidate_count": 2,
         "minimum_score": 0.65,
-        "ranking_version": "pose-first-v1",
+        "ranking_version": "pose-precision-v2",
         "ranking_current": True,
         "continuable": finder_source_exhausted,
         "progress_percent": 100,

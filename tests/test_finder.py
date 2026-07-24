@@ -309,12 +309,18 @@ def pose_first_match(
     exact: float = 0,
     pose: float | None = None,
     reliable: bool = False,
+    precision_ready: bool | None = None,
+    precise: bool | None = None,
     coverage: float = 0.9,
     body_confidence: float = 0.9,
 ) -> dict[str, object]:
     diagnostics = {
         "pose_score": pose,
         "pose_reliable": reliable,
+        "pose_precision_ready": (
+            reliable if precision_ready is None else precision_ready
+        ),
+        "pose_precise": reliable if precise is None else precise,
         "pose_coverage": coverage,
         "pose_body_confidence": body_confidence,
     }
@@ -1240,9 +1246,32 @@ def test_pose_first_ranking_orders_exact_pose_fallback_then_mismatch() -> None:
     correct_pose = pose_first_match(2, appearance=0.10, pose=0.72, reliable=True)
     visual_fallback = pose_first_match(3, appearance=0.98, pose=0.99, reliable=False)
     wrong_pose = pose_first_match(4, appearance=1.0, pose=0.54, reliable=True)
+    broad_only = pose_first_match(
+        5,
+        appearance=0.20,
+        pose=0.99,
+        reliable=True,
+        precision_ready=False,
+        precise=False,
+    )
+    articulation_mismatch = pose_first_match(
+        6,
+        appearance=1.0,
+        pose=0.85,
+        reliable=True,
+        precision_ready=True,
+        precise=False,
+    )
 
     matches = FinderService._normalized_top_matches(
-        [wrong_pose, visual_fallback, correct_pose, exact],
+        [
+            articulation_mismatch,
+            wrong_pose,
+            broad_only,
+            visual_fallback,
+            correct_pose,
+            exact,
+        ],
         ranking_version=finder_module.CURRENT_RANKING_VERSION,
     )
 
@@ -1253,6 +1282,10 @@ def test_pose_first_ranking_orders_exact_pose_fallback_then_mismatch() -> None:
     assert matches[2]["score"] == pytest.approx(0.98)
     assert wrong_pose["ranking_tier"] == 0
     assert wrong_pose["score"] == pytest.approx(0.54)
+    assert broad_only["ranking_tier"] == 1
+    assert broad_only["score"] == pytest.approx(0.20)
+    assert articulation_mismatch["ranking_tier"] == 0
+    assert articulation_mismatch["score"] < finder_module.POSE_MATCH_FLOOR
 
 
 def test_pose_first_uses_evidence_then_appearance_only_as_tiebreakers() -> None:
@@ -1311,12 +1344,12 @@ def test_pose_first_persists_gallery_tier_and_uses_leading_lane_threshold(
         pose_tag_id=tag_id,
         source_url=ROOT,
         page_limit=1,
-        minimum_score=0.65,
+        minimum_score=0.75,
     )
     assert scan["ranking_version"] == finder_module.CURRENT_RANKING_VERSION
     assert scan["ranking_current"] is True
 
-    pose_hit = pose_first_match(1, appearance=0.1, pose=0.6, reliable=True)
+    pose_hit = pose_first_match(1, appearance=0.1, pose=0.72, reliable=True)
     same_gallery_fallback = pose_first_match(2, appearance=0.99)
     service._save_result(
         scan["id"],
@@ -1382,7 +1415,7 @@ def test_pose_first_persists_gallery_tier_and_uses_leading_lane_threshold(
     }
     pose_gallery = results[1]
     assert pose_gallery["ranking_tier"] == 2
-    assert pose_gallery["score"] == pytest.approx(0.6)
+    assert pose_gallery["score"] == pytest.approx(0.72)
     assert pose_gallery["best_ordinal"] == 1
     assert pose_gallery["above_threshold"] is False
     service.set_review(scan["id"], pose_gallery["id"], "maybe")
@@ -2451,7 +2484,7 @@ def test_finder_schema_migrates_legacy_metadata_and_matches_safely(
     assert legacy_scan["ranking_version"] == finder_module.LEGACY_RANKING_VERSION
     assert frozen_scan["ranking_version"] == finder_module.LEGACY_RANKING_VERSION
     assert frozen_scan["status"] == "failed"
-    assert "legacy appearance ranking" in frozen_scan["error"]
+    assert "earlier ranking model" in frozen_scan["error"]
     assert migrated_result["ranking_tier"] == 1
     assert "idx_finder_results_rank" in indexes
     assert "idx_finder_results_review_rank" in indexes
@@ -3537,22 +3570,22 @@ def test_finder_feedback_pose_reranker_is_bounded_and_preserves_lanes(
     )
     positive_score, positive_adjustment = FinderService._feedback_adjusted_score(
         ranking_tier=2,
-        base_score=0.6,
+        base_score=0.75,
         pose=pose,
         candidate_metadata=candidate_metadata,
         feedback=accepted,
     )
-    assert positive_score > 0.6
+    assert positive_score > 0.75
     assert 0 < positive_adjustment <= finder_module.MAX_FEEDBACK_ADJUSTMENT
 
     negative_score, negative_adjustment = FinderService._feedback_adjusted_score(
         ranking_tier=2,
-        base_score=0.6,
+        base_score=0.75,
         pose=pose,
         candidate_metadata=candidate_metadata,
         feedback=rejected,
     )
-    assert finder_module.POSE_MATCH_FLOOR <= negative_score < 0.6
+    assert finder_module.POSE_MATCH_FLOOR <= negative_score < 0.75
     assert -finder_module.MAX_FEEDBACK_ADJUSTMENT <= negative_adjustment < 0
 
     mismatch_score, _ = FinderService._feedback_adjusted_score(
@@ -3592,6 +3625,53 @@ def test_finder_feedback_pose_reranker_is_bounded_and_preserves_lanes(
         frame,
         (("couple-a", couple), ("couple-b", couple)),
     ) == (None, 0)
+
+
+def test_pose_precision_hard_negatives_can_demote_a_false_positive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = FakePoseEstimator().infer_bytes(b"")
+    candidate_metadata = {"pose": frame.as_dict()}
+    pose = {"pose_reliable": True, "pose_precise": True}
+    rejected = finder_module._FeedbackProfile(
+        revision=8,
+        rejected=(("gallery-a", frame), ("gallery-b", frame)),
+    )
+
+    monkeypatch.setattr(
+        FinderService,
+        "_feedback_pose_affinity",
+        staticmethod(
+            lambda _candidate, exemplars: (
+                0.90,
+                len({gallery for gallery, _ in exemplars}),
+            )
+        ),
+    )
+
+    tier, score, adjustment = FinderService._feedback_adjusted_rank(
+        ranking_version=finder_module.CURRENT_RANKING_VERSION,
+        ranking_tier=2,
+        base_score=0.80,
+        pose=pose,
+        candidate_metadata=candidate_metadata,
+        feedback=rejected,
+    )
+    assert tier == 0
+    assert score < finder_module.POSE_MATCH_FLOOR
+    assert adjustment == pytest.approx(score - 0.80)
+    assert adjustment < -finder_module.MAX_FEEDBACK_ADJUSTMENT
+
+    legacy_tier, legacy_score, _ = FinderService._feedback_adjusted_rank(
+        ranking_version=finder_module.POSE_FIRST_RANKING_VERSION,
+        ranking_tier=2,
+        base_score=0.80,
+        pose=pose,
+        candidate_metadata=candidate_metadata,
+        feedback=rejected,
+    )
+    assert legacy_tier == 2
+    assert legacy_score >= finder_module.POSE_MATCH_FLOOR
 
 
 def test_finder_feedback_effective_samples_ignore_empty_and_dedupe_sources(

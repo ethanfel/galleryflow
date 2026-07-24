@@ -588,6 +588,21 @@ def test_three_joint_match_is_available_but_not_marked_reliable() -> None:
     assert match.reliable is False
 
 
+def test_five_body_joint_match_stays_reliable_but_is_not_precise() -> None:
+    sparse_confidence = np.zeros((17,), dtype=np.float32)
+    sparse_confidence[[5, 6, 7, 8, 11]] = 0.9
+    sparse = frame_from_people([person_pose()], [sparse_confidence])
+
+    match = pose_geometry_match(sparse, sparse)
+
+    assert match.reliable is True
+    assert match.precise is False
+    assert match.body_common_joints == 5
+    assert match.core_anchor_joints == 3
+    assert match.distal_limb_joints == 2
+    assert match.supported_limb_segments == 2
+
+
 def test_face_heavy_sparse_body_match_cannot_be_reliable() -> None:
     # Six mutually confident joints satisfy the common-joint rule, but five
     # are facial points and only one describes the body pose. This mirrors the
@@ -602,6 +617,117 @@ def test_face_heavy_sparse_body_match_cannot_be_reliable() -> None:
     assert match.mean_joint_confidence > 0.8
     assert match.minimum_body_confidence < 0.15
     assert match.reliable is False
+    assert match.precise is False
+    assert match.body_common_joints == 1
+    assert match.core_anchor_joints == 1
+    assert match.distal_limb_joints == 0
+    assert match.supported_limb_segments == 0
+
+
+def test_person_count_mismatch_can_be_reliable_but_not_precise() -> None:
+    reference = frame_from_people([person_pose()])
+    candidate = frame_from_people(
+        [person_pose(), person_pose(offset_x=0.3, bend=0.08)]
+    )
+
+    match = pose_geometry_match(reference, candidate)
+
+    assert match.reliable is True
+    assert match.reference_count == 1
+    assert match.candidate_count == 2
+    assert match.precise is False
+    assert match.as_dict()["diagnostics"]["exact_person_count"] is False
+
+
+def test_well_observed_same_mirrored_and_couple_matches_are_precise() -> None:
+    solo = frame_from_people([person_pose(bend=0.10)])
+    same = pose_geometry_match(solo, solo)
+    mirrored = pose_geometry_match(solo, mirror_pose_frame(solo))
+
+    first = person_pose(offset_x=-0.22, bend=0.08)
+    second = person_pose(offset_x=0.28, bend=-0.06)
+    couple = frame_from_people([first, second])
+    reordered_couple = frame_from_people([second, first])
+    coupled = pose_geometry_match(couple, reordered_couple)
+
+    assert same.precise is True
+    assert mirrored.precise is True
+    assert coupled.precise is True
+    assert same.precision_ready is True
+    assert mirrored.precision_ready is True
+    assert coupled.precision_ready is True
+    assert same.precision_score == pytest.approx(1.0, abs=1e-6)
+    assert mirrored.precision_score == pytest.approx(1.0, abs=1e-6)
+    assert coupled.precision_score == pytest.approx(1.0, abs=1e-6)
+    serialized = same.as_dict()
+    diagnostics = serialized["diagnostics"]
+    assert serialized["precise"] is True
+    assert serialized["precision_score"] == pytest.approx(1.0, abs=1e-6)
+    assert diagnostics["evidence_threshold"] == 0.15
+    assert diagnostics["exact_person_count"] is True
+    assert diagnostics["body_common_joints"] == 12
+    assert diagnostics["core_anchor_joints"] == 4
+    assert diagnostics["distal_limb_joints"] == 8
+    assert diagnostics["supported_limb_segments"] == 8
+    assert diagnostics["body_coverage"] == pytest.approx(1.0)
+    assert diagnostics["matched_person_quality"] == pytest.approx(0.9)
+    assert diagnostics["supported_articulations"] == 8
+    assert diagnostics["articulation_score"] == pytest.approx(1.0)
+
+
+def test_full_confidence_materially_different_limbs_fail_strict_pose() -> None:
+    reference_pose = person_pose()
+    crouched_pose = reference_pose.copy()
+    crouched_pose[13] = (0.30, 0.62)
+    crouched_pose[15] = (0.53, 0.64)
+    crouched_pose[14] = (0.71, 0.64)
+    crouched_pose[16] = (0.49, 0.65)
+
+    match = pose_geometry_match(
+        frame_from_people([reference_pose]),
+        frame_from_people([crouched_pose]),
+    )
+
+    assert match.reliable is True
+    assert match.score > 0.75
+    assert match.group_score == pytest.approx(1.0, abs=1e-6)
+    assert match.supported_articulations == 8
+    assert match.articulation_score < 0.55
+    assert match.precision_score < 0.68
+    assert match.precision_ready is True
+    assert match.precise is False
+
+
+def test_upper_body_only_evidence_cannot_certify_a_lower_body_pose() -> None:
+    reference_pose = person_pose()
+    different_legs = reference_pose.copy()
+    different_legs[12:17] = np.asarray(
+        [
+            (0.95, 0.20),
+            (0.95, 0.30),
+            (0.95, 0.40),
+            (0.95, 0.50),
+            (0.95, 0.60),
+        ],
+        dtype=np.float32,
+    )
+    upper_body_only = np.zeros((17,), dtype=np.float32)
+    upper_body_only[[5, 6, 7, 8, 9, 10, 11]] = 0.9
+
+    match = pose_geometry_match(
+        frame_from_people([reference_pose], [upper_body_only]),
+        frame_from_people([different_legs], [upper_body_only]),
+        allow_mirror=False,
+    )
+
+    assert match.reliable is True
+    assert match.body_common_joints == 7
+    assert match.supported_arm_segments == 4
+    assert match.supported_leg_segments == 0
+    assert match.supported_arm_articulations == 4
+    assert match.supported_leg_articulations == 0
+    assert match.precision_ready is False
+    assert match.precise is False
 
 
 def test_geometry_recovers_mirror_with_anatomical_left_right_swap() -> None:
@@ -614,6 +740,48 @@ def test_geometry_recovers_mirror_with_anatomical_left_right_swap() -> None:
     assert recovered.mirrored is True
     assert recovered.score == pytest.approx(1.0, abs=1e-6)
     assert recovered.score > direct.score + 0.04
+
+
+def test_mirror_selection_prefers_precise_geometry_over_broad_score() -> None:
+    reference = frame_from_people([person_pose()])
+    candidate_points = np.asarray(
+        [
+            (0.52598333, 0.00103116),
+            (0.47431767, 0.03500512),
+            (0.52972382, 0.05612449),
+            (0.40849948, 0.05729276),
+            (0.62922585, 0.06604739),
+            (0.42855254, 0.27139166),
+            (0.60385656, 0.23031610),
+            (0.34114105, 0.59475112),
+            (0.73778933, 0.49734229),
+            (0.31179625, 0.55855912),
+            (0.84925157, 0.54867351),
+            (0.36852688, 0.63012546),
+            (0.57604337, 0.58683676),
+            (0.38067541, 0.76787132),
+            (0.88369548, 0.69137156),
+            (0.31091189, 0.97841054),
+            (0.69913018, 0.93092066),
+        ],
+        dtype=np.float32,
+    )
+    candidate = frame_from_people([candidate_points])
+
+    direct = pose_geometry_match(reference, candidate, allow_mirror=False)
+    mirrored = pose_geometry_match(
+        reference,
+        mirror_pose_frame(candidate),
+        allow_mirror=False,
+    )
+    selected = pose_geometry_match(reference, candidate, allow_mirror=True)
+
+    assert direct.precise is True
+    assert mirrored.score > direct.score
+    assert mirrored.precise is False
+    assert selected.precise is True
+    assert selected.mirrored is False
+    assert selected.precision_score == pytest.approx(direct.precision_score)
 
 
 def test_couple_assignment_is_order_independent_and_count_aware() -> None:
@@ -647,6 +815,36 @@ def test_group_geometry_penalizes_wrong_relative_person_layout() -> None:
     assert correct.group_score == pytest.approx(1.0, abs=1e-6)
     assert wrong.group_score < correct.group_score
     assert wrong.score < correct.score
+    assert correct.precise is True
+    assert wrong.precision_score < 0.68
+    assert wrong.precision_ready is True
+    assert wrong.precise is False
+
+
+def test_one_correct_person_cannot_hide_a_wrong_couple_member() -> None:
+    base = person_pose()
+    centered = (base - base.mean(axis=0)) * 0.45
+    first = centered + np.asarray((0.27, 0.50), dtype=np.float32)
+    second = centered + np.asarray((0.73, 0.50), dtype=np.float32)
+    rotation = np.asarray(((0.0, -1.0), (1.0, 0.0)), dtype=np.float32)
+    rotated_second = (
+        (second - second.mean(axis=0)) @ rotation.T
+        + second.mean(axis=0)
+    )
+
+    match = pose_geometry_match(
+        frame_from_people([first, second]),
+        frame_from_people([first, rotated_second]),
+        allow_mirror=False,
+    )
+
+    assert match.precision_ready is True
+    assert match.shape_score > 0.50
+    assert match.articulation_score == pytest.approx(1.0, abs=1e-6)
+    assert match.group_score == pytest.approx(1.0, abs=1e-6)
+    assert match.minimum_person_shape_score < 0.01
+    assert match.precision_score < 0.10
+    assert match.precise is False
 
 
 def test_skeleton_overlay_is_safe_compact_and_self_contained() -> None:

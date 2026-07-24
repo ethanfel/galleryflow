@@ -34,11 +34,15 @@ TERMINAL_STATUSES = {"completed", "completed_with_errors", "failed", "canceled"}
 REVIEW_STATES = {"pending", "maybe", "accepted", "rejected"}
 ANALYZER_VERSION = "hybrid-spatial-pyramid-v1+rtmo-l-geometry-v1+phash64-gate-v1"
 LEGACY_RANKING_VERSION = "appearance-v1"
-CURRENT_RANKING_VERSION = "pose-first-v1"
+POSE_FIRST_RANKING_VERSION = "pose-first-v1"
+CURRENT_RANKING_VERSION = "pose-precision-v2"
+POSE_RANKING_VERSIONS = frozenset(
+    {POSE_FIRST_RANKING_VERSION, CURRENT_RANKING_VERSION}
+)
 CORPUS_BACKFILL_VERSION = "top-matches-v1"
 CORPUS_SCAN_GUARD_VERSION = "pre-corpus-scans-v1"
 FEEDBACK_BACKFILL_VERSION = "curated-top-matches-v1"
-POSE_MATCH_FLOOR = 0.55
+POSE_MATCH_FLOOR = 0.68
 EXACT_HASH_MAX_DISTANCE = 8
 MAX_SCAN_PAGES = 500
 MAX_EXTEND_PAGES = 50
@@ -47,6 +51,8 @@ MAX_FEEDBACK_GALLERIES_PER_STATE = 8
 MAX_FEEDBACK_SAMPLES_PER_STATE = 8
 MAX_FEEDBACK_DECISIONS_PER_POSE = 256
 MAX_FEEDBACK_ADJUSTMENT = 0.08
+HARD_NEGATIVE_MIN_AFFINITY = 0.82
+HARD_NEGATIVE_MARGIN = 0.04
 
 try:
     from .vision import perceptual_hash_bytes as _perceptual_hash_bytes
@@ -170,7 +176,7 @@ class FinderService:
                     page_limit INTEGER NOT NULL,
                     pages_completed INTEGER NOT NULL DEFAULT 0,
                     minimum_score REAL NOT NULL,
-                    ranking_version TEXT NOT NULL DEFAULT 'pose-first-v1',
+                    ranking_version TEXT NOT NULL DEFAULT 'pose-precision-v2',
                     status TEXT NOT NULL,
                     total_galleries INTEGER NOT NULL DEFAULT 0,
                     processed_galleries INTEGER NOT NULL DEFAULT 0,
@@ -268,7 +274,7 @@ class FinderService:
                     gallery_key TEXT NOT NULL,
                     decision TEXT NOT NULL
                         CHECK (decision IN ('accepted', 'rejected')),
-                    ranking_version TEXT NOT NULL DEFAULT 'pose-first-v1',
+                    ranking_version TEXT NOT NULL DEFAULT 'pose-precision-v2',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -469,8 +475,8 @@ class FinderService:
                 (
                     now,
                     now,
-                    "This Finder scan uses legacy appearance ranking and cannot "
-                    "continue after the pose-first ranking upgrade. Start a new scan.",
+                    "This Finder scan uses an earlier ranking model and cannot "
+                    "continue after the pose-precision upgrade. Start a new scan.",
                     CURRENT_RANKING_VERSION,
                 ),
             )
@@ -1085,7 +1091,8 @@ class FinderService:
         try:
             from .pose_vision import pose_geometry_match
 
-            if not pose_geometry_match(frame, frame, allow_mirror=False).reliable:
+            match = pose_geometry_match(frame, frame, allow_mirror=False)
+            if not bool(getattr(match, "precise", False)):
                 return None
         except (ImportError, TypeError, ValueError):
             return None
@@ -1972,7 +1979,13 @@ class FinderService:
             if not image_url or not preview:
                 continue
             optional_scores: dict[str, float] = {}
-            for name in ("pose_coverage", "pose_body_confidence"):
+            for name in (
+                "pose_broad_score",
+                "pose_coverage",
+                "pose_body_coverage",
+                "pose_articulation_score",
+                "pose_body_confidence",
+            ):
                 try:
                     value = float(item[name])
                 except (KeyError, TypeError, ValueError):
@@ -1983,12 +1996,20 @@ class FinderService:
                 common_joints = max(0, int(item.get("pose_common_joints", 0)))
             except (TypeError, ValueError):
                 common_joints = 0
+            integer_diagnostics: dict[str, int] = {}
+            for name in ("pose_body_joints", "pose_limb_segments"):
+                try:
+                    integer_diagnostics[name] = max(0, int(item.get(name, 0)))
+                except (TypeError, ValueError):
+                    integer_diagnostics[name] = 0
             try:
                 ranking_tier = max(0, min(3, int(item.get("ranking_tier", 1))))
             except (TypeError, ValueError):
                 ranking_tier = 1
             overlay = str(item.get("skeleton_overlay_url") or "")
             pose_reliable = bool(item.get("pose_reliable"))
+            pose_precision_ready = bool(item.get("pose_precision_ready"))
+            pose_precise = bool(item.get("pose_precise"))
             if (
                 not pose_reliable
                 or not overlay.startswith("data:image/svg+xml;base64,")
@@ -2003,7 +2024,7 @@ class FinderService:
                 "score": max(0.0, min(1.0, score)),
                 "base_score": max(0.0, min(1.0, base_score)),
                 "feedback_adjustment": max(
-                    -MAX_FEEDBACK_ADJUSTMENT,
+                    -1.0,
                     min(MAX_FEEDBACK_ADJUSTMENT, feedback_adjustment),
                 ),
                 "feedback_revision": feedback_revision,
@@ -2016,9 +2037,20 @@ class FinderService:
                     None if person_count is None else max(0, person_count)
                 ),
                 "pose_reliable": pose_reliable,
+                "pose_precision_ready": pose_precision_ready,
+                "pose_precise": pose_precise,
+                "pose_broad_score": optional_scores.get("pose_broad_score"),
                 "pose_coverage": optional_scores.get("pose_coverage"),
+                "pose_body_coverage": optional_scores.get("pose_body_coverage"),
+                "pose_articulation_score": optional_scores.get(
+                    "pose_articulation_score"
+                ),
                 "pose_body_confidence": optional_scores.get("pose_body_confidence"),
                 "pose_common_joints": common_joints,
+                "pose_body_joints": integer_diagnostics["pose_body_joints"],
+                "pose_limb_segments": integer_diagnostics[
+                    "pose_limb_segments"
+                ],
                 "pose_mirrored": bool(item.get("pose_mirrored")),
                 "skeleton_overlay_url": overlay,
                 "is_exact": exact > 0,
@@ -2040,7 +2072,7 @@ class FinderService:
             }
             normalized_item["pose_evidence"] = cls._pose_evidence(normalized_item)
             normalized.append(normalized_item)
-        if ranking_version == CURRENT_RANKING_VERSION:
+        if ranking_version in POSE_RANKING_VERSIONS:
             normalized.sort(
                 key=lambda item: (
                     -item["ranking_tier"],
@@ -2183,7 +2215,7 @@ class FinderService:
         where = " AND ".join(clauses)
         order_by = (
             "ranking_tier DESC, score DESC, discovered_order, id"
-            if scan.get("ranking_version") == CURRENT_RANKING_VERSION
+            if scan.get("ranking_version") in POSE_RANKING_VERSIONS
             else "score DESC, discovered_order, id"
         )
         with self._lock, self.database.connect() as db:
@@ -3591,7 +3623,25 @@ class FinderService:
             self._metadata_pose(self._decode_metadata(row["metadata_json"]))
             for row in rows
         ]
-        return tuple(frame for frame in frames if frame is not None)
+        try:
+            from .pose_vision import pose_geometry_match
+        except ImportError:
+            return ()
+        precise: list[Any] = []
+        for frame in frames:
+            if frame is None:
+                continue
+            try:
+                self_match = pose_geometry_match(
+                    frame,
+                    frame,
+                    allow_mirror=False,
+                )
+            except (TypeError, ValueError):
+                continue
+            if bool(getattr(self_match, "precise", False)):
+                precise.append(frame)
+        return tuple(precise)
 
     @staticmethod
     def _pose_diagnostics(
@@ -3602,6 +3652,8 @@ class FinderService:
             return {
                 "pose_score": None,
                 "pose_reliable": False,
+                "pose_precision_ready": False,
+                "pose_precise": False,
                 "person_count": None,
                 "skeleton_overlay_url": "",
             }
@@ -3609,6 +3661,8 @@ class FinderService:
             return {
                 "pose_score": None,
                 "pose_reliable": False,
+                "pose_precision_ready": False,
+                "pose_precise": False,
                 "person_count": candidate.person_count,
                 "skeleton_overlay_url": "",
             }
@@ -3625,13 +3679,18 @@ class FinderService:
             return {
                 "pose_score": None,
                 "pose_reliable": False,
+                "pose_precision_ready": False,
+                "pose_precise": False,
                 "person_count": candidate.person_count,
                 "skeleton_overlay_url": "",
             }
         best = max(
             matches,
             key=lambda match: (
+                bool(getattr(match, "precise", False)),
+                bool(getattr(match, "precision_ready", False)),
                 bool(match.reliable),
+                float(getattr(match, "precision_score", 0.0)),
                 float(match.score),
                 float(match.coverage),
             ),
@@ -3648,11 +3707,35 @@ class FinderService:
                 )
             except (ImportError, ValueError, TypeError):
                 overlay = ""
+        precision_score = float(
+            getattr(best, "precision_score", best.score)
+        )
         return {
-            "pose_score": max(0.0, min(1.0, float(best.score))),
+            "pose_score": max(0.0, min(1.0, precision_score)),
+            "pose_broad_score": max(0.0, min(1.0, float(best.score))),
             "pose_reliable": bool(best.reliable),
+            "pose_precision_ready": bool(
+                getattr(best, "precision_ready", False)
+            ),
+            "pose_precise": bool(getattr(best, "precise", False)),
             "pose_coverage": max(0.0, min(1.0, float(best.coverage))),
             "pose_common_joints": max(0, int(best.common_joints)),
+            "pose_body_joints": max(
+                0,
+                int(getattr(best, "body_common_joints", 0)),
+            ),
+            "pose_body_coverage": max(
+                0.0,
+                min(1.0, float(getattr(best, "body_coverage", 0.0))),
+            ),
+            "pose_limb_segments": max(
+                0,
+                int(getattr(best, "supported_limb_segments", 0)),
+            ),
+            "pose_articulation_score": max(
+                0.0,
+                min(1.0, float(getattr(best, "articulation_score", 0.0))),
+            ),
             "pose_body_confidence": max(
                 0.0,
                 min(
@@ -3735,7 +3818,7 @@ class FinderService:
     ) -> tuple[int, float]:
         appearance = max(0.0, min(1.0, float(appearance_score)))
         exact = max(0.0, min(1.0, float(exact_score)))
-        if ranking_version != CURRENT_RANKING_VERSION:
+        if ranking_version not in POSE_RANKING_VERSIONS:
             return 1, cls._combined_score(appearance, exact, pose)
         if exact > 0:
             return 3, exact
@@ -3744,10 +3827,22 @@ class FinderService:
             normalized_pose = float(pose_score)
         except (TypeError, ValueError):
             normalized_pose = float("nan")
-        if pose.get("pose_reliable") and np.isfinite(normalized_pose):
+        if ranking_version == CURRENT_RANKING_VERSION:
+            pose_qualified = bool(pose.get("pose_precision_ready"))
+        else:
+            pose_qualified = bool(pose.get("pose_reliable"))
+        if pose_qualified and np.isfinite(normalized_pose):
             normalized_pose = max(0.0, min(1.0, normalized_pose))
-            tier = 2 if normalized_pose >= POSE_MATCH_FLOOR else 0
-            return tier, normalized_pose
+            is_match = (
+                normalized_pose >= POSE_MATCH_FLOOR
+                and (
+                    ranking_version != CURRENT_RANKING_VERSION
+                    or pose.get("pose_precise")
+                )
+            )
+            if is_match:
+                return 2, normalized_pose
+            return 0, min(normalized_pose, POSE_MATCH_FLOOR - 1e-6)
         return 1, appearance
 
     @staticmethod
@@ -3773,11 +3868,15 @@ class FinderService:
                 match = pose_geometry_match(reference, candidate, allow_mirror=True)
             except (ValueError, TypeError):
                 continue
-            if not match.reliable or not np.isfinite(float(match.score)):
+            affinity = float(getattr(match, "precision_score", match.score))
+            if (
+                not bool(getattr(match, "precise", False))
+                or not np.isfinite(affinity)
+            ):
                 continue
             by_gallery[gallery] = max(
                 by_gallery.get(gallery, 0.0),
-                max(0.0, min(1.0, float(match.score))),
+                max(0.0, min(1.0, affinity)),
             )
             strongest = sorted(by_gallery.values(), reverse=True)[:3]
             if len(strongest) == 3 and min(strongest) >= 0.97:
@@ -3849,6 +3948,68 @@ class FinderService:
             adjusted = max(0.0, min(POSE_MATCH_FLOOR - 1e-6, adjusted))
         applied = adjusted - base
         return adjusted, applied
+
+    @classmethod
+    def _feedback_adjusted_rank(
+        cls,
+        *,
+        ranking_version: str,
+        ranking_tier: int,
+        base_score: float,
+        pose: dict[str, Any],
+        candidate_metadata: dict[str, Any],
+        feedback: _FeedbackProfile,
+    ) -> tuple[int, float, float]:
+        """Apply soft feedback, then let strong hard negatives veto v2 hits.
+
+        Earlier ranking versions deliberately kept feedback inside a lane.
+        Precision-v2 instead treats two independently rejected galleries as
+        evidence that a candidate is a known false-positive shape, but only
+        when that negative affinity beats both the original examples and any
+        accepted feedback by a clear margin.
+        """
+
+        score, adjustment = cls._feedback_adjusted_score(
+            ranking_tier=ranking_tier,
+            base_score=base_score,
+            pose=pose,
+            candidate_metadata=candidate_metadata,
+            feedback=feedback,
+        )
+        if (
+            ranking_version != CURRENT_RANKING_VERSION
+            or ranking_tier != 2
+            or not pose.get("pose_precise")
+            or not feedback.active
+        ):
+            return ranking_tier, score, adjustment
+        candidate = cls._metadata_pose(candidate_metadata)
+        if candidate is None:
+            return ranking_tier, score, adjustment
+        negative, negative_galleries = cls._feedback_pose_affinity(
+            candidate,
+            feedback.rejected,
+        )
+        if (
+            negative is None
+            or negative_galleries < MIN_FEEDBACK_GALLERIES_PER_STATE
+            or negative < HARD_NEGATIVE_MIN_AFFINITY
+        ):
+            return ranking_tier, score, adjustment
+        positive, positive_galleries = cls._feedback_pose_affinity(
+            candidate,
+            feedback.accepted,
+        )
+        positive_anchor = max(0.0, min(1.0, float(base_score)))
+        if (
+            positive is not None
+            and positive_galleries >= MIN_FEEDBACK_GALLERIES_PER_STATE
+        ):
+            positive_anchor = max(positive_anchor, float(positive))
+        if float(negative) - positive_anchor < HARD_NEGATIVE_MARGIN - 1e-9:
+            return ranking_tier, score, adjustment
+        demoted = min(score, POSE_MATCH_FLOOR - 1e-6)
+        return 0, demoted, demoted - float(base_score)
 
     def _claim_scan(self, scan_id: str) -> bool:
         with self._lock, self.database.connect() as db:
@@ -4072,7 +4233,9 @@ class FinderService:
         matches = self._normalized_top_matches(
             top_matches, ranking_version=ranking_version
         )
-        ranking_tier = 1 if ranking_version == LEGACY_RANKING_VERSION else 0
+        ranking_tier = (
+            0 if ranking_version in POSE_RANKING_VERSIONS else 1
+        )
         if matches:
             leading = matches[0]
             best = {
@@ -4396,12 +4559,15 @@ class FinderService:
                 ranking_version=ranking_version,
             )
             base_score = score
-            score, feedback_adjustment = self._feedback_adjusted_score(
-                ranking_tier=ranking_tier,
-                base_score=base_score,
-                pose=pose,
-                candidate_metadata=metadata,
-                feedback=feedback,
+            ranking_tier, score, feedback_adjustment = (
+                self._feedback_adjusted_rank(
+                    ranking_version=ranking_version,
+                    ranking_tier=ranking_tier,
+                    base_score=base_score,
+                    pose=pose,
+                    candidate_metadata=metadata,
+                    feedback=feedback,
+                )
             )
             scored_by_source[(str(row["gallery_key"]), str(row["source_key"]))] = {
                 "image_url": str(row["image_url"]),
@@ -4619,12 +4785,15 @@ class FinderService:
                     ranking_version=ranking_version,
                 )
                 base_score = score
-                score, feedback_adjustment = self._feedback_adjusted_score(
-                    ranking_tier=ranking_tier,
-                    base_score=base_score,
-                    pose=pose,
-                    candidate_metadata=candidate.metadata,
-                    feedback=feedback,
+                ranking_tier, score, feedback_adjustment = (
+                    self._feedback_adjusted_rank(
+                        ranking_version=ranking_version,
+                        ranking_tier=ranking_tier,
+                        base_score=base_score,
+                        pose=pose,
+                        candidate_metadata=candidate.metadata,
+                        feedback=feedback,
+                    )
                 )
                 return {
                     "image_url": original,

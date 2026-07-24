@@ -114,7 +114,7 @@
   const FINDER_TERMINAL_STATES = ['completed', 'completed_with_errors', 'complete', 'done', 'failed', 'cancelled', 'canceled'];
   const FINDER_MAX_PAGES = 500;
   const FINDER_RESULTS_PAGE_SIZE = 24;
-  const FINDER_RANKING_VERSION = 'pose-first-v1';
+  const FINDER_RANKING_VERSION = 'pose-precision-v2';
   const poseRoleLabel = role => ({ solo: 'Solo', couple: 'Couple', group: 'Group' }[role] || 'Solo');
 
   class ApiError extends Error {
@@ -2356,7 +2356,7 @@
       acceptedCount: Number(scan.accepted_count ?? reviewCounts.accepted ?? 0),
       maybeCount: Number(scan.maybe_count ?? reviewCounts.maybe ?? 0),
       rejectedCount: Number(scan.rejected_count ?? reviewCounts.rejected ?? 0),
-      minSimilarity: Number(scan.minimum_score ?? scan.min_similarity ?? scan.minimum_similarity ?? config.minimum_score ?? config.min_similarity ?? config.minimum_similarity ?? 0.65),
+      minSimilarity: Number(scan.minimum_score ?? scan.min_similarity ?? scan.minimum_similarity ?? config.minimum_score ?? config.min_similarity ?? config.minimum_similarity ?? 0.68),
       percentage: Math.max(0, Math.min(100, percentage)),
       error: String(scan.error || scan.error_message || ''),
       createdAt: scan.created_at || scan.started_at || '',
@@ -2798,7 +2798,7 @@
           ? 'Choose an existing pose to see its reversible ranking feedback.'
           : tag.id == null
             ? 'Feedback begins after this pose is created and you review candidates. It is scoped to this pose and reversible.'
-            : `${progress}Checked suggestions become pose feedback; unchecked suggestions are excluded. Reviews adjust future ranking only—the vision models are not retrained.`;
+            : `${progress}Checked suggestions become pose feedback; unchecked suggestions are excluded. Reviews can adjust or veto future pose ranking—the vision models are not retrained.`;
   }
 
   function renderFinderStatus() {
@@ -3140,9 +3140,9 @@
       matchKind.hidden = !kindCopy;
       matchKind.textContent = kindCopy;
       matchKind.title = result.rankingTier === 1
-        ? 'RTMO could not confirm enough joints, so this candidate is ranked by visual layout below reliable pose matches.'
+        ? 'RTMO could not confirm matching person counts and enough body-and-limb evidence, so this candidate is ranked by visual layout below high-precision pose matches.'
         : result.rankingTier === 0
-          ? 'RTMO found reliable joints, but their geometry did not reach the pose-match floor.'
+          ? 'RTMO found high-precision body evidence, but its geometry did not reach the pose-match floor.'
           : '';
       $('.finder-card-title', card).textContent = result.title;
       const matchCopy = `${formatNumber(result.matchCount)} ${result.matchCount === 1 ? 'image' : 'images'} compared`;
@@ -3380,7 +3380,7 @@
     const sourceUrl = /^https?:\/\//i.test(sourceInput) ? safeUrl(sourceInput) : '';
     const requestedPages = Number.parseInt($('#finder-pages').value || '5', 10);
     const pageLimit = Math.max(1, Math.min(50, Number.isFinite(requestedPages) ? requestedPages : 5));
-    const minimumScore = Math.max(0.4, Math.min(0.95, Number($('#finder-min-similarity').value || 0.65)));
+    const minimumScore = Math.max(0.4, Math.min(0.95, Number($('#finder-min-similarity').value || 0.68)));
     if (validate && !exampleDirectory) {
       const root = state.finderStatus?.folderRoot || 'the library root';
       toast('Enter an examples folder', `Use any folder inside ${root}, as a relative path or full container path.`, 'info');
