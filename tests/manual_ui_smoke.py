@@ -293,6 +293,11 @@ def build_visual_app(
         "cancelled_next_url": "",
     }
     finder_retry_state = {"retry_calls": 0}
+    finder_pagination_state: dict[str, object] = {
+        "reviews": {},
+        "results_calls": 0,
+        "review_calls": 0,
+    }
     finder_tag_state: dict[str, object] = {"created": False, "payload": None}
     finder_tag_index_state = {
         "status": "idle",
@@ -368,6 +373,8 @@ def build_visual_app(
     if finder_modal_review:
         finder_scan["status"] = "running"
         finder_scan["candidate_count"] = 3
+    if finder_pagination:
+        finder_scan["candidate_count"] = 49
 
     async def fake_finder_status(**kwargs: object) -> dict:
         return {
@@ -1199,6 +1206,9 @@ def build_visual_app(
                 "has_next": offset + len(page_items) < len(filtered),
             }
         if finder_pagination:
+            finder_pagination_state["results_calls"] = (
+                int(finder_pagination_state["results_calls"]) + 1
+            )
             all_results = [
                 {
                     **results[0],
@@ -1208,8 +1218,27 @@ def build_visual_app(
                     "title": f"Paged pose candidate {index + 1:02d}",
                     "rank": index + 1,
                     "score": 0.96 - index / 1000,
-                    "review": "pending",
+                    "review": str(
+                        finder_pagination_state["reviews"].get(
+                            f"visual-result-{index + 1}", "pending"
+                        )
+                    ),
                     "feedback_image_urls": [],
+                    "top_matches": [
+                        {
+                            **results[0]["top_matches"][0],
+                            "image_url": (
+                                "https://example.test/"
+                                f"paged-candidate-{index + 1}-1.jpg"
+                            ),
+                            "preview_url": media(
+                                f"paged-candidate-{index + 1}-1"
+                            ),
+                            "skeleton_overlay_url": media(
+                                f"paged-overlay-{index + 1}-1"
+                            ),
+                        },
+                    ],
                 }
                 for index in range(49)
             ]
@@ -1224,16 +1253,15 @@ def build_visual_app(
             offset = max(0, int(kwargs.get("offset") or 0))
             limit = max(1, int(kwargs.get("limit") or 24))
             page_items = filtered[offset : offset + limit]
+            counts = {
+                review: sum(item["review"] == review for item in all_results)
+                for review in ("pending", "accepted", "maybe", "rejected")
+            }
+            counts["total"] = len(all_results)
             return {
                 "items": page_items,
                 "total": len(filtered),
-                "counts": {
-                    "pending": len(filtered),
-                    "accepted": 0,
-                    "maybe": 0,
-                    "rejected": 0,
-                    "total": len(filtered),
-                },
+                "counts": counts,
                 "limit": limit,
                 "offset": offset,
                 "page": offset // limit + 1,
@@ -1271,6 +1299,24 @@ def build_visual_app(
                 }
             )
             return {"result": finder_modal_review_result(result_id)}
+        if finder_pagination:
+            # Keep the optimistic render observable before the authoritative
+            # PATCH response triggers its own workspace reconciliation.
+            await asyncio.sleep(0.1)
+            finder_pagination_state["review_calls"] = (
+                int(finder_pagination_state["review_calls"]) + 1
+            )
+            finder_pagination_state["reviews"][result_id] = str(payload.review)
+            return {
+                "result": {
+                    "id": result_id,
+                    "rank": 1,
+                    "score": 0.96,
+                    "ranking_tier": 2,
+                    "review": str(payload.review),
+                    "feedback_image_urls": list(payload.feedback_image_urls or []),
+                }
+            }
         await asyncio.sleep(0.6 if finder_race else 0)
         finder_race_state["review"] = payload.review
         selected = list(payload.feedback_image_urls or [])
@@ -1353,6 +1399,17 @@ def build_visual_app(
             "require_preview_cancellation": not mobile,
         }
 
+    async def fake_finder_pagination_state() -> dict:
+        retained_url = "https://example.test/paged-candidate-2-1.jpg"
+        return {
+            "retained_media_calls": gallery_preview_calls.get(retained_url, 0),
+            "results_calls": int(finder_pagination_state["results_calls"]),
+            "review_calls": int(finder_pagination_state["review_calls"]),
+            "reviewed_result": str(
+                finder_pagination_state["reviews"].get("visual-result-1", "")
+            ),
+        }
+
     def finder_modal_pose_export_job() -> dict:
         calls = finder_modal_review_state["pose_export_calls"]
         pose_revision = int(calls[0].get("expected_revision") or 0) if calls else 0
@@ -1426,7 +1483,72 @@ def build_visual_app(
         if open_gallery:
             script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const button=document.querySelector('.gallery-open');if(button){button.click();clearInterval(poll)}},50)});"
         if open_lightbox:
-            script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const button=document.querySelector('.image-preview-button');if(button){button.click();clearInterval(poll)}},50)});"
+            script += """
+window.addEventListener('load', () => {
+  let phase = 'open';
+  let preview = null;
+  const ownedObjectUrl = image => {
+    const symbol = Object.getOwnPropertySymbols(image || {}).find(
+      item => item.description === 'galleryflow-media-object-url'
+    );
+    return symbol ? image[symbol] : '';
+  };
+  const poll = setInterval(() => {
+    const modal = document.querySelector('#lightbox-modal');
+    const image = document.querySelector('#lightbox-image');
+    document.documentElement.dataset.lightboxMediaCleanupDebug = [
+      phase,
+      Boolean(modal?.open),
+      Boolean(image?.hasAttribute('src')),
+      image?.complete,
+      image?.naturalWidth || 0,
+      Boolean(ownedObjectUrl(image)),
+    ].join('|');
+    if (phase === 'open') {
+      preview = document.querySelector('.image-preview-button');
+      if (!preview) return;
+      preview.click();
+      phase = 'loaded';
+    } else if (
+      phase === 'loaded'
+      && modal?.open
+      && image?.src.startsWith('blob:')
+      && image.complete
+      && image.naturalWidth > 0
+      && ownedObjectUrl(image)
+    ) {
+      modal.querySelector('[data-close-modal]')?.click();
+      phase = 'closed';
+    } else if (phase === 'closed' && modal && !modal.open) {
+      const released = (
+        !image?.hasAttribute('src')
+        && !ownedObjectUrl(image)
+      );
+      if (!released) return;
+      if (!preview?.isConnected) {
+        phase = 'preview-lost';
+        return;
+      }
+      preview.click();
+      phase = 'reopened';
+    } else if (
+      phase === 'reopened'
+      && modal?.open
+      && image?.complete
+      && image.naturalWidth > 0
+    ) {
+      document.documentElement.dataset.lightboxMediaCleanup = 'pass';
+      clearInterval(poll);
+    }
+  }, 50);
+  setTimeout(() => {
+    if (!document.documentElement.dataset.lightboxMediaCleanup) {
+      document.documentElement.dataset.lightboxMediaCleanup = 'fail';
+      clearInterval(poll);
+    }
+  }, 4000);
+});
+"""
         if open_pose:
             script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const modal=document.querySelector('#gallery-modal');const button=document.querySelector('[data-gallery-mode=pose]');const image=document.querySelector('.image-option:not(.skeleton-image)');if(modal?.open&&button&&image){button.click();clearInterval(poll)}},50)});"
         if open_finder and not finder_tag:
@@ -1829,7 +1951,201 @@ window.addEventListener('load', () => {
 });
 """
         if finder_pagination:
-            script += "window.addEventListener('load',()=>{let clicked=false;const poll=setInterval(()=>{const status=document.querySelector('#finder-page-status')?.textContent;const cards=document.querySelectorAll('#finder-result-grid .finder-card');if(!clicked&&status==='Page 1 of 3'&&cards.length===24){document.querySelector('#finder-page-next')?.click();clicked=true}else if(clicked&&status==='Page 2 of 3'&&cards.length===24&&cards[0]?.querySelector('.finder-rank')?.textContent==='#25'){document.documentElement.dataset.finderPagination='pass';clearInterval(poll)}},50);setTimeout(()=>{if(!document.documentElement.dataset.finderPagination)document.documentElement.dataset.finderPagination='fail'},4500)});"
+            script += """
+window.addEventListener('load', () => {
+  let phase = 'capture';
+  let retainedImage = null;
+  let discardedImage = null;
+  let retainedSource = '';
+  let retainedMediaCalls = -1;
+  let stateRequestPending = false;
+  let lastRetainedFacts = '';
+  let lostRetainedFacts = '';
+  const setDebug = value => {
+    document.documentElement.dataset.finderReviewStabilityDebug = value;
+  };
+  const resultCard = key => document.querySelector(
+    `#finder-result-grid .finder-card[data-finder-result="${key}"]`
+  );
+  const managedSource = image => {
+    const sourceSymbol = Object.getOwnPropertySymbols(image || {}).find(
+      symbol => symbol.description === 'galleryflow-media-source'
+    );
+    return sourceSymbol ? image[sourceSymbol] : '';
+  };
+  const ownedObjectUrl = image => {
+    const objectUrlSymbol = Object.getOwnPropertySymbols(image || {}).find(
+      symbol => symbol.description === 'galleryflow-media-object-url'
+    );
+    return objectUrlSymbol ? image[objectUrlSymbol] : '';
+  };
+  const imageFacts = image => [
+    Boolean(image),
+    Boolean(image?.hidden),
+    Boolean(image?.hasAttribute('src')),
+    Boolean(image?.complete),
+    Number(image?.naturalWidth || 0),
+    image?.src || '',
+  ].join(',');
+  const poll = setInterval(() => {
+    const cards = document.querySelectorAll(
+      '#finder-result-grid .finder-card'
+    );
+    const status = document.querySelector('#finder-page-status')?.textContent;
+    const currentRetained = resultCard('visual-result-2')?.querySelector(
+      '.finder-match-image'
+    );
+    if (currentRetained === retainedImage) {
+      lastRetainedFacts = imageFacts(retainedImage);
+    }
+    setDebug([
+      phase,
+      status,
+      cards.length,
+      document.querySelector('#finder-pending-count')?.textContent,
+      document.querySelector('#finder-rejected-count')?.textContent,
+      Boolean(resultCard('visual-result-1')),
+      Boolean(resultCard('visual-result-25')),
+      managedSource(retainedImage),
+      managedSource(currentRetained),
+      retainedImage?.className || '',
+      currentRetained?.className || '',
+      lostRetainedFacts || lastRetainedFacts,
+      imageFacts(currentRetained),
+    ].join('|'));
+    if (phase === 'capture') {
+      if (status !== 'Page 1 of 3' || cards.length !== 24) return;
+      const image = resultCard('visual-result-2')?.querySelector(
+        '.finder-match-image'
+      );
+      if (
+        !image
+        || !image.complete
+        || image.naturalWidth <= 0
+        || !image.src.startsWith('blob:')
+      ) return;
+      retainedImage = image;
+      retainedSource = image.src;
+      phase = 'baseline';
+    } else if (phase === 'baseline' && !stateRequestPending) {
+      stateRequestPending = true;
+      fetch('/manual/finder-pagination/state')
+        .then(response => response.json())
+        .then(data => {
+          retainedMediaCalls = Number(data.retained_media_calls);
+          phase = 'review';
+        })
+        .catch(() => {
+          phase = 'state-failed';
+        })
+        .finally(() => {
+          stateRequestPending = false;
+        });
+    } else if (phase === 'review') {
+      const reject = resultCard('visual-result-1')?.querySelector(
+        '.finder-reject:not(:disabled)'
+      );
+      if (!reject) return;
+      discardedImage = resultCard('visual-result-1')?.querySelector(
+        '.finder-match-image'
+      );
+      if (
+        resultCard('visual-result-2')?.querySelector('.finder-match-image')
+        !== retainedImage
+      ) {
+        lostRetainedFacts = lastRetainedFacts;
+        phase = 'pre-review-media-replaced';
+        return;
+      }
+      reject.click();
+      if (
+        resultCard('visual-result-2')?.querySelector('.finder-match-image')
+        !== retainedImage
+      ) {
+        lostRetainedFacts = lastRetainedFacts;
+        phase = 'optimistic-media-replaced';
+        return;
+      }
+      phase = 'settle';
+    } else if (phase === 'settle' && !stateRequestPending) {
+      const currentImage = resultCard('visual-result-2')?.querySelector(
+        '.finder-match-image'
+      );
+      if (currentImage && currentImage !== retainedImage) {
+        lostRetainedFacts = lastRetainedFacts;
+        phase = resultCard('visual-result-25')
+          ? 'refill-media-replaced'
+          : 'patch-media-replaced';
+        return;
+      }
+      const settled = (
+        status === 'Page 1 of 2'
+        && cards.length === 24
+        && !resultCard('visual-result-1')
+        && Boolean(resultCard('visual-result-25'))
+        && document.querySelector('#finder-pending-count')?.textContent === '48'
+        && document.querySelector('#finder-rejected-count')?.textContent === '1'
+      );
+      if (!settled) return;
+      const mediaStable = (
+        currentImage === retainedImage
+        && currentImage?.src === retainedSource
+        && currentImage?.complete
+        && currentImage?.naturalWidth > 0
+        && !discardedImage?.isConnected
+        && !ownedObjectUrl(discardedImage)
+      );
+      if (!mediaStable) {
+        phase = 'media-replaced';
+        return;
+      }
+      stateRequestPending = true;
+      fetch('/manual/finder-pagination/state')
+        .then(response => response.json())
+        .then(data => {
+          const serverStable = (
+            Number(data.retained_media_calls) === retainedMediaCalls
+            && Number(data.review_calls) === 1
+            && Number(data.results_calls) >= 2
+            && data.reviewed_result === 'rejected'
+          );
+          document.documentElement.dataset.finderReviewStability = (
+            serverStable ? 'pass' : 'fail'
+          );
+          if (!serverStable) {
+            phase = 'server-state-invalid';
+            return;
+          }
+          document.querySelector('#finder-page-next')?.click();
+          phase = 'page-two';
+        })
+        .catch(() => {
+          phase = 'state-failed';
+        })
+        .finally(() => {
+          stateRequestPending = false;
+        });
+    } else if (
+      phase === 'page-two'
+      && status === 'Page 2 of 2'
+      && cards.length === 24
+      && cards[0]?.querySelector('.finder-rank')?.textContent === '#25'
+    ) {
+      document.documentElement.dataset.finderPagination = 'pass';
+      phase = 'complete';
+      clearInterval(poll);
+    }
+  }, 50);
+  setTimeout(() => {
+    if (!document.documentElement.dataset.finderReviewStability) {
+      document.documentElement.dataset.finderReviewStability = 'fail';
+    }
+    if (!document.documentElement.dataset.finderPagination) {
+      document.documentElement.dataset.finderPagination = 'fail';
+    }
+  }, 6500);
+});
+"""
         if finder_modal_review:
             script += """
 const finderModalFetchEvents = [];
@@ -3122,6 +3438,12 @@ window.addEventListener('load', () => {
             fake_finder_switch_source_state,
             methods=["GET"],
         )
+    if finder_pagination:
+        app.add_api_route(
+            "/manual/finder-pagination/state",
+            fake_finder_pagination_state,
+            methods=["GET"],
+        )
     if finder_modal_review:
         app.add_api_route(
             "/manual/finder-modal-review/boundary",
@@ -3314,14 +3636,15 @@ def main() -> None:
             "--disable-sync",
             "--force-prefers-reduced-motion",
             "--no-first-run",
-            f"--virtual-time-budget={80000 if args.finder_modal_review else 8500 if args.finder_tag or args.finder_switch_source else 7500 if args.finder_unusable_save or args.finder_continue else 6500 if args.finder_direct_assign else 6000 if args.finder_retry else 4500 if args.finder_race else 4000 if args.finder_pose_flow else 3000 if args.lightbox or args.pose else 2000 if finder_mode else 1000}",
+            f"--virtual-time-budget={80000 if args.finder_modal_review else 8500 if args.finder_tag or args.finder_switch_source else 7500 if args.finder_unusable_save or args.finder_continue or args.finder_pagination else 6500 if args.finder_direct_assign else 6000 if args.finder_retry else 4500 if args.finder_race or args.lightbox else 4000 if args.finder_pose_flow else 3000 if args.pose else 2000 if finder_mode else 1000}",
             f"--user-data-dir={Path(directory) / 'chrome-profile'}",
             f"--window-size={viewport}",
             f"--screenshot={output}",
             f"http://127.0.0.1:18101/{'#finder' if finder_mode else '#sort' if args.sort else ''}",
         ]
         if (
-            args.finder_race
+            args.lightbox
+            or args.finder_race
             or args.finder_direct_assign
             or args.finder_unusable_save
             or args.finder_continue
@@ -3337,7 +3660,8 @@ def main() -> None:
             check=True,
             timeout=45,
             capture_output=(
-                args.finder_race
+                args.lightbox
+                or args.finder_race
                 or args.finder_direct_assign
                 or args.finder_unusable_save
                 or args.finder_continue
@@ -3348,7 +3672,8 @@ def main() -> None:
                 or args.finder_modal_review
             ),
             text=(
-                args.finder_race
+                args.lightbox
+                or args.finder_race
                 or args.finder_direct_assign
                 or args.finder_unusable_save
                 or args.finder_continue
@@ -3359,6 +3684,17 @@ def main() -> None:
                 or args.finder_modal_review
             ),
         )
+        if (
+            args.lightbox
+            and 'data-lightbox-media-cleanup="pass"' not in completed.stdout
+        ):
+            debug = completed.stdout.partition(
+                'data-lightbox-media-cleanup-debug="'
+            )[2].partition('"')[0]
+            raise AssertionError(
+                "closing the lightbox did not release its completed media Blob "
+                f"(debug={debug or 'none'})"
+            )
         if args.finder_race and 'data-finder-race="pass"' not in completed.stdout:
             raise AssertionError("stale Finder results overwrote the completed review")
         if (
@@ -3396,6 +3732,17 @@ def main() -> None:
                 "cancelled JoyTag Finder scan did not switch source in place "
                 "while retaining its cursor, candidates, and reviews "
                 f"(phase={phase or 'unknown'}, debug={debug or 'none'})"
+            )
+        if (
+            args.finder_pagination
+            and 'data-finder-review-stability="pass"' not in completed.stdout
+        ):
+            debug = completed.stdout.partition(
+                'data-finder-review-stability-debug="'
+            )[2].partition('"')[0]
+            raise AssertionError(
+                "Finder review replaced or re-requested a retained card image "
+                f"during page refill (debug={debug or 'none'})"
             )
         if (
             args.finder_pagination

@@ -51,6 +51,7 @@
     mediaLoadActive: new Set(),
     mediaLoadObserved: new Set(),
     mediaLoadByImage: new WeakMap(),
+    mediaObjectUrlImages: new Set(),
     mediaLoadDrainScheduled: false,
     mediaLoadLazyObserver: null,
     mediaLoadDomObserver: null,
@@ -169,6 +170,8 @@
   const GALLERY_PREVIEW_WARM_CONCURRENCY = 2;
   const GALLERY_PREVIEW_WARM_LIMIT = 1;
   const GALLERY_PREVIEW_CACHE_LIMIT = 24;
+  const MEDIA_SOURCE = Symbol('galleryflow-media-source');
+  const MEDIA_OBJECT_URL = Symbol('galleryflow-media-object-url');
   const FINDER_RANKING_VERSION = 'pose-precision-v2';
   const FINDER_JOYTAG_RANKING_VERSION = 'joytag-v1';
   const poseRoleLabel = role => ({ solo: 'Solo', couple: 'Couple', group: 'Group' }[role] || 'Solo');
@@ -866,7 +869,8 @@
   function renderGalleries() {
     const grid = $('#gallery-grid');
     const galleries = filteredGalleries();
-    grid.replaceChildren();
+    const availableMedia = reusableMedia(grid);
+    const renderedCards = [];
     grid.classList.toggle('is-compact', state.density === 'compact');
     galleries.forEach(gallery => {
       const fragment = $('#gallery-card-template').content.cloneNode(true);
@@ -887,8 +891,10 @@
       ignoreButton.title = gallery.ignored ? 'Unignore gallery' : 'Ignore gallery';
       ignoreButton.setAttribute('aria-label', ignoreButton.title);
       card.querySelectorAll('.gallery-open, .gallery-open-text').forEach(button => button.dataset.galleryId = String(gallery.id));
-      grid.append(fragment);
+      transplantReusableMedia(card, availableMedia);
+      renderedCards.push(card);
     });
+    grid.replaceChildren(...renderedCards);
 
     $('#gallery-empty').hidden = Boolean(galleries.length);
     const hiddenCount = state.galleries.length - galleries.length;
@@ -988,7 +994,7 @@
   }
 
   function hasDomBoundMediaLoadTasks() {
-    return [
+    return state.mediaObjectUrlImages.size > 0 || [
       ...state.mediaLoadActive,
       ...state.mediaLoadQueue,
       ...state.mediaLoadObserved
@@ -1002,9 +1008,13 @@
   function observeMediaLoadDomRemovals() {
     if (!('MutationObserver' in window)) return;
     if (!state.mediaLoadDomObserver) {
-      state.mediaLoadDomObserver = new MutationObserver(
-        scheduleMediaLoadDrain
-      );
+      state.mediaLoadDomObserver = new MutationObserver(() => {
+        state.mediaObjectUrlImages.forEach(image => {
+          if (!image.isConnected) revokeMediaElementObjectUrl(image);
+        });
+        scheduleMediaLoadDrain();
+        maybeDisconnectMediaLoadDomObserver();
+      });
     }
     state.mediaLoadDomObserver.observe(document.documentElement, {
       childList: true,
@@ -1029,6 +1039,33 @@
     if (!objectUrl) return;
     task.objectUrl = '';
     URL.revokeObjectURL(objectUrl);
+  }
+
+  function revokeMediaElementObjectUrl(image) {
+    const objectUrl = image?.[MEDIA_OBJECT_URL];
+    if (!objectUrl) return;
+    image[MEDIA_OBJECT_URL] = '';
+    state.mediaObjectUrlImages.delete(image);
+    URL.revokeObjectURL(objectUrl);
+  }
+
+  function releaseMediaElement(image, { drain = true } = {}) {
+    if (!image) return;
+    cancelMediaLoadForImage(image, { drain: false });
+    revokeMediaElementObjectUrl(image);
+    image[MEDIA_SOURCE] = '';
+    image.removeAttribute('src');
+    if (drain) {
+      maybeDisconnectMediaLoadDomObserver();
+      scheduleMediaLoadDrain();
+    }
+  }
+
+  function releaseMediaTree(root) {
+    if (!root) return;
+    $$('img', root).forEach(image => releaseMediaElement(image, { drain: false }));
+    maybeDisconnectMediaLoadDomObserver();
+    scheduleMediaLoadDrain();
   }
 
   function mediaLoadAttemptIsActive(task, attemptToken) {
@@ -1122,21 +1159,37 @@
     task.onLoad = null;
     task.onError = null;
     task.abortController = null;
-    revokeMediaLoadObjectUrl(task);
     task.state = 'done';
     if (state.mediaLoadByImage.get(task.image) === task) {
       state.mediaLoadByImage.delete(task.image);
     }
     if (loaded) {
+      if (task.objectUrl) {
+        revokeMediaElementObjectUrl(task.image);
+        task.image[MEDIA_OBJECT_URL] = task.objectUrl;
+        task.objectUrl = '';
+        if (task.kind !== 'warm') {
+          state.mediaObjectUrlImages.add(task.image);
+          observeMediaLoadDomRemovals();
+        }
+      }
       task.image.previousElementSibling?.classList.add('is-loaded');
       if (task.kind === 'warm') {
+        const previous = state.galleryPreviewWarmups.get(task.url);
+        if (previous && previous !== task.image) {
+          revokeMediaElementObjectUrl(previous);
+        }
         state.galleryPreviewWarmups.delete(task.url);
         state.galleryPreviewWarmups.set(task.url, task.image);
         while (state.galleryPreviewWarmups.size > GALLERY_PREVIEW_CACHE_LIMIT) {
-          state.galleryPreviewWarmups.delete(state.galleryPreviewWarmups.keys().next().value);
+          const oldestUrl = state.galleryPreviewWarmups.keys().next().value;
+          const oldestImage = state.galleryPreviewWarmups.get(oldestUrl);
+          state.galleryPreviewWarmups.delete(oldestUrl);
+          revokeMediaElementObjectUrl(oldestImage);
         }
       }
     } else {
+      revokeMediaLoadObjectUrl(task);
       task.image.hidden = true;
       task.image.removeAttribute('src');
     }
@@ -1274,7 +1327,26 @@
     const url = safeUrl(source);
     image.alt = alt;
     const previous = state.mediaLoadByImage.get(image);
+    const sameSource = Boolean(url) && image[MEDIA_SOURCE] === url;
+    if (
+      sameSource
+      && previous
+      && previous.url === url
+      && previous.kind === kind
+      && previous.generation === generation
+      && mediaLoadTaskIsCurrent(previous)
+    ) return previous;
+    if (
+      sameSource
+      && !previous
+      && !image.hidden
+      && image.hasAttribute('src')
+      && image.complete
+      && image.naturalWidth > 0
+    ) return null;
     if (previous) cancelMediaLoadTask(previous, { drain: false });
+    revokeMediaElementObjectUrl(image);
+    image[MEDIA_SOURCE] = url;
     if (!url) {
       image.removeAttribute('src');
       image.hidden = true;
@@ -1335,7 +1407,8 @@
     });
     state.mediaLoadQueue = [];
     state.mediaLoadObserved.clear();
-    state.mediaLoadDomObserver?.disconnect();
+    if (hasDomBoundMediaLoadTasks()) observeMediaLoadDomRemovals();
+    else state.mediaLoadDomObserver?.disconnect();
     state.mediaLoadPeak = 0;
     state.galleryForegroundPeak = 0;
     state.galleryPreviewWarmPeak = 0;
@@ -1882,6 +1955,10 @@
         state.galleryPreviewWarmups.set(url, existing);
         return;
       }
+      if (existing) {
+        state.galleryPreviewWarmups.delete(url);
+        revokeMediaElementObjectUrl(existing);
+      }
       const duplicate = [...state.mediaLoadActive, ...state.mediaLoadQueue]
         .some(task => task.kind === 'warm' && task.url === url);
       if (duplicate) return;
@@ -2164,19 +2241,22 @@
     const gallery = state.gallery;
     if (!gallery) return;
     const cover = $('#summary-cover');
-    cover.replaceChildren();
+    const availableMedia = reusableMedia(cover);
+    const nextCover = document.createDocumentFragment();
     const placeholder = document.createElement('div');
     placeholder.className = 'image-placeholder';
     placeholder.innerHTML = '<svg><use href="#i-image"></use></svg>';
-    cover.append(placeholder);
+    nextCover.append(placeholder);
     const image = document.createElement('img');
-    cover.append(image);
+    nextCover.append(image);
     loadImage(
       image,
       gallery.thumbnailUrl || gallery.images?.[0]?.previewUrl,
       gallery.title,
       { kind: 'foreground', lazy: false }
     );
+    transplantReusableMedia(nextCover, availableMedia);
+    cover.replaceChildren(nextCover);
     const status = galleryStatus(gallery);
     $('#summary-status').innerHTML = `<span class="status-badge ${status.className}">${status.label}</span>`;
     $('#summary-image-count').textContent = gallery.imageCount ? formatNumber(gallery.imageCount) : '—';
@@ -2797,7 +2877,8 @@
 
   function renderImages() {
     const grid = $('#image-grid');
-    grid.replaceChildren();
+    const availableMedia = reusableMedia(grid);
+    const renderedOptions = [];
     const images = state.gallery?.images || [];
     const activeSelection = state.galleryMode === 'feedback'
       ? state.finderFeedbackGallerySelection
@@ -2883,8 +2964,10 @@
           : Number.isFinite(score) ? `Finder · ${score.toFixed(2)} similarity` : 'Finder suggestion';
         option.append(badge);
       }
-      grid.append(option);
+      transplantReusableMedia(option, availableMedia);
+      renderedOptions.push(option);
     });
+    grid.replaceChildren(...renderedOptions);
     updateSelectionUi();
   }
 
@@ -2923,8 +3006,7 @@
     display.id = 'lightbox-image';
     display.alt = `${image.filename}, full-resolution preview`;
     display.decoding = 'async';
-    cancelMediaLoadForImage(previous, { drain: false });
-    previous.removeAttribute('src');
+    releaseMediaElement(previous, { drain: false });
     previous.replaceWith(display);
 
     const candidates = [...new Set([safeUrl(image.fullUrl), safeUrl(image.previewUrl)].filter(Boolean))];
@@ -2981,8 +3063,7 @@
     state.lightboxTrigger = null;
     setLightboxZoom(false);
     const image = $('#lightbox-image');
-    cancelMediaLoadForImage(image);
-    image?.removeAttribute('src');
+    releaseMediaElement(image);
     $('#lightbox-stage .image-placeholder')?.classList.remove('is-loaded', 'is-error');
     if ($('#gallery-modal').open && trigger?.isConnected) trigger.focus({ preventScroll: true });
   }
@@ -3311,7 +3392,8 @@
   function renderJobs() {
     const list = $('#job-list');
     const jobs = state.jobs.filter(jobFilterMatch);
-    list.replaceChildren();
+    const availableMedia = reusableMedia(list);
+    const renderedJobs = [];
     jobs.forEach(job => {
       const fragment = $('#job-template').content.cloneNode(true);
       const row = $('.job-row', fragment);
@@ -3344,8 +3426,10 @@
       $('.job-toggle', row).hidden = true;
       $('.job-remove', row).title = isTerminalJob(job) ? 'Remove' : job.kind === 'pose_export' ? 'Cancel pose export' : 'Cancel download';
       $('.job-remove', row).setAttribute('aria-label', $('.job-remove', row).title);
-      list.append(fragment);
+      transplantReusableMedia(row, availableMedia);
+      renderedJobs.push(row);
     });
+    list.replaceChildren(...renderedJobs);
 
     const active = state.jobs.filter(job => !isTerminalJob(job));
     const downloading = state.jobs.filter(isActiveJob).length;
@@ -4657,7 +4741,8 @@
         : 'Choose any tag to inspect its reference scores.';
 
     const grid = $('#finder-joytag-reference-grid');
-    grid.replaceChildren();
+    const availableMedia = reusableMedia(grid);
+    const renderedReferences = [];
     analysis.images.forEach(image => {
       const score = selected ? normalizeFinderScore(image.scores[selected.tag]) : null;
       const reference = document.createElement('article');
@@ -4685,8 +4770,10 @@
       value.textContent = score === null ? '—' : score.toFixed(3);
       copy.append(name, value);
       reference.append(preview, copy);
-      grid.append(reference);
+      transplantReusableMedia(reference, availableMedia);
+      renderedReferences.push(reference);
     });
+    grid.replaceChildren(...renderedReferences);
   }
 
   async function analyzeFinderReferences() {
@@ -5296,6 +5383,7 @@
       const overlayUrl = safeUrl(match.overlayUrl);
       if (overlayUrl) {
         const overlay = $('.finder-skeleton-overlay', button);
+        overlay[MEDIA_SOURCE] = overlayUrl;
         overlay.hidden = false;
         if (overlayUrl.startsWith('data:')) overlay.src = overlayUrl;
         else loadImage(overlay, overlayUrl, '', { kind: 'normal' });
@@ -5434,6 +5522,56 @@
     next.setAttribute('aria-label', `Next Finder results page, page ${Math.min(pageCount, page + 1)}`);
   }
 
+  function mediaReuseKey(image) {
+    const source = image[MEDIA_SOURCE] || '';
+    if (!source) return '';
+    const role = [...image.classList]
+      .filter(className => !['is-loaded', 'is-loading', 'is-error'].includes(className))
+      .sort()
+      .join(' ');
+    return JSON.stringify([role, source]);
+  }
+
+  function reusableMedia(root) {
+    const reusable = new Map();
+    $$('img', root).forEach(image => {
+      const task = state.mediaLoadByImage.get(image);
+      const loaded = (
+        !image.hidden
+        && image.hasAttribute('src')
+        && image.complete
+        && image.naturalWidth > 0
+      );
+      const key = mediaReuseKey(image);
+      if (!key || (!task && !loaded)) return;
+      const matches = reusable.get(key) || [];
+      matches.push(image);
+      reusable.set(key, matches);
+    });
+    return reusable;
+  }
+
+  function transplantReusableMedia(root, reusable) {
+    $$('img', root).forEach(image => {
+      const key = mediaReuseKey(image);
+      const matches = key ? reusable.get(key) : null;
+      const previous = matches?.shift();
+      if (!previous) return;
+      if (!matches.length) reusable.delete(key);
+      cancelMediaLoadForImage(image, { drain: false });
+      const nextPlaceholder = image.previousElementSibling;
+      const previousPlaceholder = previous.previousElementSibling;
+      if (
+        nextPlaceholder?.classList.contains('image-placeholder')
+        && previousPlaceholder?.classList.contains('image-placeholder')
+      ) {
+        nextPlaceholder.replaceWith(previousPlaceholder);
+      }
+      previous.alt = image.alt;
+      image.replaceWith(previous);
+    });
+  }
+
   function scrollToFinderResults() {
     const results = $('#finder-results');
     if (!results) return;
@@ -5480,7 +5618,8 @@
     $('#finder-filter-output').textContent = threshold.toFixed(2);
     const results = ranked.filter(result => result.review === state.finderReview && result.score >= threshold);
     const grid = $('#finder-result-grid');
-    grid.replaceChildren();
+    const availableMedia = reusableMedia(grid);
+    const renderedCards = [];
     results.forEach(result => {
       const fragment = $('#finder-card-template').content.cloneNode(true);
       const card = $('.finder-card', fragment);
@@ -5597,8 +5736,10 @@
       saveSelection.title = result.review === 'accepted' && !savedFeedbackCount
         ? 'Accepted feedback needs at least one selected image'
         : result.feedbackSelectionDirty ? 'Save the edited feedback image selection' : 'Selection is already saved';
-      grid.append(fragment);
+      transplantReusableMedia(card, availableMedia);
+      renderedCards.push(card);
     });
+    grid.replaceChildren(...renderedCards);
     const empty = $('#finder-empty');
     empty.hidden = Boolean(results.length) || state.finderResultLoading;
     if (!results.length) {
@@ -7559,7 +7700,9 @@
     if (!session.current) return;
     const current = session.current;
     const targetImage = $('#sort-target-preview');
-    targetImage.previousElementSibling?.classList.remove('is-loaded');
+    if (targetImage[MEDIA_SOURCE] !== safeUrl(current.previewUrl)) {
+      targetImage.previousElementSibling?.classList.remove('is-loaded');
+    }
     loadImage(targetImage, current.previewUrl, current.name);
     $('#sort-target-date').textContent = formatSortDate(current.modifiedAt);
     $('#sort-target-name').textContent = current.name;
@@ -7569,12 +7712,13 @@
     $('#sort-match-summary').textContent = session.matches.length ? `${session.matches.length} likely ${session.matches.length === 1 ? 'match' : 'matches'}, ranked closest first.` : 'No likely reference image was found.';
 
     const grid = $('#sort-match-grid');
-    grid.replaceChildren();
+    const availableMedia = reusableMedia(grid);
+    const renderedMatches = [];
     if (!session.matches.length) {
       const empty = document.createElement('div');
       empty.className = 'sort-match-empty';
       empty.innerHTML = '<svg><use href="#i-search"></use></svg><span>No candidates inside this threshold</span>';
-      grid.append(empty);
+      renderedMatches.push(empty);
     } else {
       session.matches.forEach((match, index) => {
         const card = document.createElement('article');
@@ -7589,9 +7733,11 @@
         $('p', card).textContent = match.path;
         $('p', card).title = match.path;
         $$('.sort-match-actions button', card).forEach(button => { button.dataset.sortMatchIndex = String(index); });
-        grid.append(card);
+        transplantReusableMedia(card, availableMedia);
+        renderedMatches.push(card);
       });
     }
+    grid.replaceChildren(...renderedMatches);
     $$('.sort-action-bar .button, .sort-match-actions .button').forEach(button => { button.disabled = state.sortBusy; });
   }
 
@@ -7745,6 +7891,11 @@
       && (state.finderFeedbackGalleryDirty || state.finderFeedbackGallerySaving)
       && !confirmDiscardFinderFeedbackGalleryChanges('Close the gallery and discard the unsaved Finder feedback selection?')
     ) return false;
+    if (dialog?.id === 'lightbox-modal' && dialog.open) {
+      dialog.close();
+      resetLightbox();
+      return true;
+    }
     if (dialog?.open) dialog.close();
     return true;
   }
@@ -8130,7 +8281,9 @@
       renderPoseWorkspace();
       announce(`${image.filename} assignment removed`);
     });
-    $('#lightbox-modal').addEventListener('close', resetLightbox);
+    $('#lightbox-modal').addEventListener('close', event => {
+      if (!event.currentTarget.open && state.lightboxIndex >= 0) resetLightbox();
+    });
     $('#gallery-modal').addEventListener('close', () => {
       state.galleryDetailRequest += 1;
       state.galleryNavigationRequest += 1;
@@ -8148,6 +8301,7 @@
       state.poseApplying = false;
       state.poseExporting = false;
       setButtonBusy($('#pose-export'), false);
+      releaseMediaTree($('#gallery-modal'));
       renderFinderGalleryReview();
       if (state.view === 'finder') renderFinderResults();
       else if (state.view === 'discover') renderGalleries();
