@@ -1683,12 +1683,44 @@ window.addEventListener('load', () => {
         && document.querySelector('.pose-output-badge')
         && document.querySelector('#summary-pose-outputs-row:not([hidden])');
       document.documentElement.dataset.poseLibrary = passed ? 'pass' : 'fail';
+      const picker = document.querySelector('.image-picker');
+      const toolbar = document.querySelector('#pose-toolbar');
+      const check = document.querySelector('#image-grid .image-check');
+      if (picker && toolbar && check) {
+        picker.scrollTop = Math.min(
+          picker.scrollHeight - picker.clientHeight,
+          picker.scrollTop + 160
+        );
+        const toolbarRect = toolbar.getBoundingClientRect();
+        const checkRect = check.getBoundingClientRect();
+        const hit = document.elementFromPoint(
+          checkRect.left + checkRect.width / 2,
+          checkRect.top + checkRect.height / 2
+        );
+        const movedUnderToolbar = (
+          checkRect.top < toolbarRect.bottom
+          && checkRect.bottom > toolbarRect.top
+        );
+        document.documentElement.dataset.poseToolbarLayerDebug = [
+          Math.round(toolbarRect.top),
+          Math.round(toolbarRect.bottom),
+          Math.round(checkRect.top),
+          Math.round(checkRect.bottom),
+          hit?.className || hit?.tagName || 'none'
+        ].join(':');
+        document.documentElement.dataset.poseToolbarLayer = (
+          movedUnderToolbar && toolbar.contains(hit)
+        ) ? 'pass' : 'fail';
+      }
       clearInterval(poll);
     }
   }, 50);
   setTimeout(() => {
     if (!document.documentElement.dataset.poseLibrary) {
       document.documentElement.dataset.poseLibrary = 'fail';
+    }
+    if (!document.documentElement.dataset.poseToolbarLayer) {
+      document.documentElement.dataset.poseToolbarLayer = 'fail';
     }
   }, 2600);
 });
@@ -3989,6 +4021,14 @@ def main() -> None:
         if args.pose and 'data-pose-library="pass"' not in completed.stdout:
             raise AssertionError(
                 "saved pose suggestions or gallery export history were not visible"
+            )
+        if args.pose and 'data-pose-toolbar-layer="pass"' not in completed.stdout:
+            debug = completed.stdout.partition(
+                'data-pose-toolbar-layer-debug="'
+            )[2].partition('"')[0]
+            raise AssertionError(
+                "image-card selection controls painted through the sticky pose toolbar "
+                f"(debug={debug or 'none'})"
             )
         if (
             args.lightbox
