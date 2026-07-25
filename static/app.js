@@ -3307,9 +3307,12 @@
         badge.className = 'finder-suggestion-badge';
         const score = Number(finderSuggestion?.score);
         badge.innerHTML = '<svg><use href="#i-spark"></use></svg><span></span>';
-        $('span', badge).textContent = finderFeedbackCandidate
+        const badgeText = finderFeedbackCandidate
           ? 'Finder target candidate'
           : Number.isFinite(score) ? `Finder · ${score.toFixed(2)} similarity` : 'Finder suggestion';
+        $('span', badge).textContent = badgeText;
+        badge.setAttribute('aria-label', badgeText);
+        badge.title = badgeText;
         option.append(badge);
       }
       transplantReusableMedia(option, availableMedia);
