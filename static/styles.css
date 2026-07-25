@@ -867,9 +867,12 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .finder-empty { margin: 18px; }
 .image-option.is-finder-suggestion { border-color: var(--violet); box-shadow: 0 0 0 3px rgba(155,123,250,.16); }
 .image-option.is-selected.is-finder-suggestion { border-color: var(--violet); }
-.finder-suggestion-badge { position: absolute; z-index: 4; bottom: 32px; left: 7px; display: inline-flex; max-width: calc(100% - 14px); min-height: 22px; padding: 0 7px; gap: 5px; align-items: center; overflow: hidden; border: 1px solid rgba(155,123,250,.35); border-radius: 7px; background: rgba(8,8,12,.86); color: #d7cdff; font-size: 8px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; pointer-events: none; backdrop-filter: blur(8px); }
-.finder-suggestion-badge svg { width: 11px; height: 11px; flex: none; }
-.finder-suggestion-badge span { overflow: hidden; text-overflow: ellipsis; }
+.finder-suggestion-badge { position: absolute; z-index: 4; top: 7px; left: 7px; display: inline-flex; width: 24px; height: 24px; padding: 0; align-items: center; justify-content: center; overflow: hidden; border: 1px solid rgba(155,123,250,.35); border-radius: 7px; background: rgba(8,8,12,.86); color: #d7cdff; pointer-events: none; backdrop-filter: blur(8px); }
+.finder-suggestion-badge svg { width: 12px; height: 12px; flex: none; }
+.finder-suggestion-badge span { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
+.image-option.is-feedback-manual-only .finder-suggestion-badge,
+.gallery-modal.is-pose-mode .image-option.has-pose-target .finder-suggestion-badge,
+.gallery-modal.is-pose-mode .image-option.has-pose-control .finder-suggestion-badge { top: 36px; }
 .finder-feedback-manual-badge { position: absolute; z-index: 4; top: 7px; left: 7px; display: inline-flex; max-width: calc(100% - 54px); min-height: 22px; padding: 0 7px; align-items: center; overflow: hidden; border: 1px solid rgba(255,196,92,.38); border-radius: 7px; background: rgba(48,35,13,.88); color: #ffd98f; font-size: 8px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; pointer-events: none; backdrop-filter: blur(8px); }
 
 .mobile-nav { display: none; }
@@ -1051,11 +1054,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .gallery-modal.is-pose-mode .image-option.is-selected { border-color: var(--violet); }
 .gallery-modal.is-pose-mode .image-option.is-selected .image-check::before { border-color: var(--violet); background: var(--violet); }
 .gallery-modal.is-pose-mode .image-option.is-finder-feedback-candidate { border-color: #b49cff; box-shadow: 0 0 0 3px rgba(155,123,250,.3), inset 0 0 0 1px rgba(255,255,255,.12); }
-.gallery-modal.is-pose-mode .image-option.is-finder-feedback-candidate .finder-suggestion-badge { top: 7px; bottom: auto; width: 24px; height: 24px; min-height: 24px; padding: 0; justify-content: center; border-color: rgba(180,156,255,.65); border-radius: 7px; background: rgba(57,42,104,.9); color: #f0ecff; }
-.gallery-modal.is-pose-mode .image-option.is-finder-feedback-candidate .finder-suggestion-badge svg { width: 12px; height: 12px; }
-.gallery-modal.is-pose-mode .image-option.is-finder-feedback-candidate .finder-suggestion-badge span { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
-.gallery-modal.is-pose-mode .image-option.is-finder-feedback-candidate.has-pose-target .finder-suggestion-badge,
-.gallery-modal.is-pose-mode .image-option.is-finder-feedback-candidate.has-pose-control .finder-suggestion-badge { top: 36px; }
+.gallery-modal.is-pose-mode .image-option.is-finder-feedback-candidate .finder-suggestion-badge { border-color: rgba(180,156,255,.65); background: rgba(57,42,104,.9); color: #f0ecff; }
 .image-option.is-downloaded::after { position: absolute; z-index: 4; inset: 0; border: 1px solid rgba(79,210,160,.3); border-radius: 7px; content: ""; pointer-events: none; }
 .image-preview-hint { position: absolute; z-index: 3; top: 50%; left: 50%; display: inline-flex; min-height: 31px; padding: 0 10px; gap: 6px; align-items: center; border: 1px solid rgba(255,255,255,.16); border-radius: 999px; background: rgba(8,8,12,.78); color: white; font-size: 9px; font-weight: 650; opacity: 0; pointer-events: none; transform: translate(-50%, -42%); transition: opacity .16s, transform .16s; backdrop-filter: blur(8px); }
 .image-preview-hint svg { width: 13px; height: 13px; }
