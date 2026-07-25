@@ -15,7 +15,7 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import HTTPException
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from PIL import Image
 
 from app.config import AppConfig
@@ -43,6 +43,7 @@ def build_visual_app(
     finder_tag: bool = False,
     finder_retry: bool = False,
     finder_modal_review: bool = False,
+    mobile: bool = False,
 ):
     finder_source_exhausted = finder_exhausted or finder_continue
     finder_pose_mode = open_finder_pose_flow or finder_direct_assign
@@ -133,11 +134,21 @@ def build_visual_app(
     app.state.scraper.browse = fake_browse
     gallery_detail_calls: dict[str, int] = {}
     gallery_preview_calls: dict[str, int] = {}
+    gallery_preview_concurrency = {
+        "active": 0,
+        "peak": 0,
+        "cancelled": 0,
+    }
     gallery_detail_concurrency = {"active": 0, "peak": 0}
     prefetch_neighbor_urls = {
         galleries[2]["url"],
         galleries[4]["url"],
     }
+    prefetch_slow_preview_fragments = {
+        f"/{galleries[2]['url'].rstrip('/').rsplit('/', 1)[-1]}/001.jpg",
+        f"/{galleries[4]['url'].rstrip('/').rsplit('/', 1)[-1]}/007.jpg",
+    }
+    claimed_slow_previews: set[str] = set()
 
     async def fake_gallery(url: str) -> dict:
         gallery_detail_calls[url] = gallery_detail_calls.get(url, 0) + 1
@@ -148,7 +159,9 @@ def build_visual_app(
                 gallery_detail_concurrency["peak"],
                 gallery_detail_concurrency["active"],
             )
-            await asyncio.sleep(0.04)
+            # Let the current gallery's foreground previews settle before
+            # both intentionally stalled adjacent warmups are admitted.
+            await asyncio.sleep(0.25)
         boundary_marker = "/galleries/manual-boundary-"
         if boundary_marker in url:
             boundary_name = url.split(boundary_marker, 1)[1].split("/", 1)[0]
@@ -191,7 +204,14 @@ def build_visual_app(
     app.state.scraper.gallery = fake_gallery
 
     async def fake_media(request=None, url: str = "", token: str = "") -> Response:
-        gallery_preview_calls[url] = gallery_preview_calls.get(url, 0) + 1
+        slow_preview = finder_modal_review and any(
+            fragment in url for fragment in prefetch_slow_preview_fragments
+        )
+        slow_preview = slow_preview and url not in claimed_slow_previews
+        if slow_preview:
+            claimed_slow_previews.add(url)
+        if not slow_preview:
+            gallery_preview_calls[url] = gallery_preview_calls.get(url, 0) + 1
         if "overlay" in url:
             svg = b"""<svg xmlns='http://www.w3.org/2000/svg' width='800' height='1100'><g fill='none' stroke='#63f2bd' stroke-width='18' stroke-linecap='round' stroke-linejoin='round'><circle cx='400' cy='190' r='58'/><path d='m400 250-20 245m20-180-150 145m150-145 145 110M380 495 245 760m135-265 190 245'/></g><g fill='#ffcf67' stroke='#101017' stroke-width='7'><circle cx='400' cy='250' r='17'/><circle cx='400' cy='315' r='17'/><circle cx='250' cy='460' r='17'/><circle cx='545' cy='425' r='17'/><circle cx='380' cy='495' r='17'/><circle cx='245' cy='760' r='17'/><circle cx='570' cy='740' r='17'/></g></svg>"""
         else:
@@ -203,6 +223,33 @@ def build_visual_app(
                 else "#31295a"
             )
             svg = f"""<svg xmlns='http://www.w3.org/2000/svg' width='800' height='1100'><defs><linearGradient id='g' x2='1' y2='1'><stop stop-color='{color}'/><stop offset='1' stop-color='#121825'/></linearGradient></defs><rect width='800' height='1100' fill='url(#g)'/><circle cx='570' cy='310' r='190' fill='#9b7bfa' opacity='.18'/><path d='M90 860 330 540l150 170 105-125 140 275Z' fill='#ffffff' opacity='.13'/></svg>""".encode()
+        if slow_preview:
+            async def stream_slow_preview():
+                gallery_preview_calls[url] = gallery_preview_calls.get(url, 0) + 1
+                gallery_preview_concurrency["active"] += 1
+                gallery_preview_concurrency["peak"] = max(
+                    gallery_preview_concurrency["peak"],
+                    gallery_preview_concurrency["active"],
+                )
+                try:
+                    # The live failure reproduces with only 500 ms of latency.
+                    # Keep these streams open longer so admission and cancellation
+                    # remain required rather than merely observed.
+                    await asyncio.sleep(0.2 if mobile else 10)
+                    yield svg
+                except asyncio.CancelledError:
+                    gallery_preview_concurrency["cancelled"] += 1
+                    raise
+                finally:
+                    gallery_preview_concurrency["active"] = max(
+                        0,
+                        gallery_preview_concurrency["active"] - 1,
+                    )
+
+            return StreamingResponse(
+                stream_slow_preview(),
+                media_type="image/svg+xml",
+            )
         return Response(svg, media_type="image/svg+xml")
 
     finder_scan = {
@@ -1300,6 +1347,10 @@ def build_visual_app(
                 for key, gallery_url in adjacent.items()
             },
             "background_detail_peak": gallery_detail_concurrency["peak"],
+            "preview_active": gallery_preview_concurrency["active"],
+            "preview_peak": gallery_preview_concurrency["peak"],
+            "preview_cancelled": gallery_preview_concurrency["cancelled"],
+            "require_preview_cancellation": not mobile,
         }
 
     def finder_modal_pose_export_job() -> dict:
@@ -1781,12 +1832,33 @@ window.addEventListener('load', () => {
             script += "window.addEventListener('load',()=>{let clicked=false;const poll=setInterval(()=>{const status=document.querySelector('#finder-page-status')?.textContent;const cards=document.querySelectorAll('#finder-result-grid .finder-card');if(!clicked&&status==='Page 1 of 3'&&cards.length===24){document.querySelector('#finder-page-next')?.click();clicked=true}else if(clicked&&status==='Page 2 of 3'&&cards.length===24&&cards[0]?.querySelector('.finder-rank')?.textContent==='#25'){document.documentElement.dataset.finderPagination='pass';clearInterval(poll)}},50);setTimeout(()=>{if(!document.documentElement.dataset.finderPagination)document.documentElement.dataset.finderPagination='fail'},4500)});"
         if finder_modal_review:
             script += """
+const finderModalFetchEvents = [];
+const finderModalOriginalFetch = window.fetch.bind(window);
+window.fetch = (...args) => {
+  const target = String(args[0]?.url || args[0] || '');
+  const tracked = target.includes('/api/galleries/')
+    && !target.includes('/pose-draft');
+  if (tracked) finderModalFetchEvents.push(`start:${target.slice(-32)}`);
+  return finderModalOriginalFetch(...args).then(response => {
+    if (tracked) {
+      finderModalFetchEvents.push(`headers:${response.status}`);
+      const originalJson = response.json.bind(response);
+      response.json = () => originalJson().then(data => {
+        finderModalFetchEvents.push(`json:${data?.images?.length || 0}`);
+        return data;
+      });
+    }
+    return response;
+  });
+};
 window.addEventListener('load', () => {
   let phase = 'open-first';
+  let phaseAt = performance.now();
   let refreshAt = 0;
   let prefetchRequestPending = false;
   let poseExportStatePending = false;
   let previewBaseline = {};
+  let prefetchGeneration = 0;
   let prefetchDiagnostics = '';
   const optionAt = index =>
     document.querySelectorAll('#image-grid .image-option')[index];
@@ -1799,8 +1871,29 @@ window.addEventListener('load', () => {
   );
   const setPhase = value => {
     phase = value;
+    phaseAt = performance.now();
     document.documentElement.dataset.finderModalReviewPhase = value;
   };
+  const warmNavigationObserver = new MutationObserver(() => {
+    if (phase !== 'prefetch-middle') return;
+    const warmActive = Number(
+      document.documentElement.dataset.galleryWarmActive || 0
+    );
+    const next = document.querySelector('#gallery-review-next');
+    if (warmActive < 1 || !next || next.disabled) return;
+    // Chrome's virtual-time CLI pauses timers while a response body is open.
+    // A mutation callback still runs immediately, so navigate while both
+    // a deliberately stalled warmup is active and requires a real abort.
+    prefetchGeneration = Number(
+      document.documentElement.dataset.galleryMediaGeneration || 0
+    );
+    next.click();
+    setPhase('prefetch-next');
+  });
+  warmNavigationObserver.observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: ['data-gallery-warm-active'],
+  });
   const poll = setInterval(() => {
     const modal = document.querySelector('#gallery-modal');
     const title = document.querySelector('#gallery-modal-title')?.textContent || '';
@@ -1823,6 +1916,7 @@ window.addEventListener('load', () => {
     ].join('/');
     document.documentElement.dataset.finderModalReviewDebug = [
       phase,
+      `${Math.round(phaseAt)}/${Math.round(performance.now())}`,
       title,
       position,
       status,
@@ -1843,6 +1937,7 @@ window.addEventListener('load', () => {
       document.querySelector('#pose-export')?.disabled,
       document.querySelector('#pose-export')?.textContent?.trim(),
       prefetchDiagnostics,
+      finderModalFetchEvents.join(','),
     ].join('|');
 
     if (phase === 'open-first') {
@@ -1852,6 +1947,7 @@ window.addEventListener('load', () => {
       if (
         cards.length === 3
         && document.querySelector('#finder-pending-count')?.textContent === '3'
+        && document.querySelector('#active-profile')?.value === 'Default'
         && !prefetchRequestPending
       ) {
         prefetchRequestPending = true;
@@ -1887,6 +1983,7 @@ window.addEventListener('load', () => {
         .then(response => response.json())
         .then(data => {
           prefetchRequestPending = false;
+          if (phase !== 'prefetch-middle') return;
           const calls = data.detail_calls || {};
           const previewUrls = data.preview_urls || {};
           const markers = data.preview_markers || {};
@@ -1918,20 +2015,46 @@ window.addEventListener('load', () => {
             && nextPreviewDeltas.length > 0
           );
           const previewBoundsOk = (
-            previousPreviewDeltas.length <= 3
-            && nextPreviewDeltas.length <= 3
-            && previousPreviewCount <= 3
-            && nextPreviewCount <= 3
-            && previewCount <= 6
+            previousPreviewDeltas.length <= 1
+            && nextPreviewDeltas.length <= 1
+            && previousPreviewCount <= 1
+            && nextPreviewCount <= 1
+            && previewCount <= 2
             && [...previousPreviewDeltas, ...nextPreviewDeltas]
               .every(item => item.count === 1)
           );
           const backgroundPeak = Number(data.background_detail_peak || 0);
+          const mediaActive = Number(
+            document.documentElement.dataset.galleryMediaActive || 0
+          );
+          const mediaPeak = Number(
+            document.documentElement.dataset.galleryMediaPeak || 0
+          );
+          const foregroundPeak = Number(
+            document.documentElement.dataset.galleryForegroundPeak || 0
+          );
+          const warmActive = Number(
+            document.documentElement.dataset.galleryWarmActive || 0
+          );
+          const warmPeak = Number(
+            document.documentElement.dataset.galleryWarmPeak || 0
+          );
+          const staleMedia = Number(
+            document.documentElement.dataset.galleryMediaStale || 0
+          );
+          prefetchGeneration = Number(
+            document.documentElement.dataset.galleryMediaGeneration || 0
+          );
           prefetchDiagnostics = [
             `detail:${calls.result_1}/${calls.result_2}/${calls.result_3}`,
             `preview:${previousPreviewCount}/${nextPreviewCount}`,
             `urls:${previousPreviewDeltas.length}/${nextPreviewDeltas.length}`,
             `peak:${backgroundPeak}`,
+            `media:${mediaActive}/${mediaPeak}`,
+            `foreground:${foregroundPeak}`,
+            `warm:${warmActive}/${warmPeak}`,
+            `stale:${staleMedia}`,
+            `stream:${data.preview_active}/${data.preview_peak}/${data.preview_cancelled}`,
           ].join(',');
           if (Object.values(calls).some(count => count > 1)) {
             setPhase('prefetch-detail-duplicated-before-navigation');
@@ -1942,7 +2065,19 @@ window.addEventListener('load', () => {
             setPhase('prefetch-preview-bounds-failed');
             return;
           }
-          if (backgroundPeak < 1 || backgroundPeak > 2) {
+          if (
+            mediaActive > 3
+            || mediaPeak > 3
+            || foregroundPeak > 2
+            || warmActive > 2
+            || warmPeak > 2
+            || staleMedia !== 0
+            || Number(data.preview_peak || 0) > 2
+          ) {
+            setPhase('prefetch-media-concurrency-failed');
+            return;
+          }
+          if (backgroundPeak < 1 || backgroundPeak > 1) {
             setPhase('prefetch-concurrency-bound-failed');
             return;
           }
@@ -1976,8 +2111,99 @@ window.addEventListener('load', () => {
         .then(response => response.json())
         .then(data => {
           prefetchRequestPending = false;
-          if (data.detail_calls?.result_3 !== 1) {
-            setPhase('prefetch-next-refetched-detail');
+          const calls = data.detail_calls || {};
+          const previewUrls = data.preview_urls || {};
+          const markers = data.preview_markers || {};
+          const deltasFor = key => Object.entries(previewUrls)
+            .filter(([url]) => url.includes(
+              `/460/manual/${markers[key]}/`
+            ))
+            .map(([url, count]) => ({
+              url,
+              count: Math.max(
+                0,
+                Number(count || 0) - Number(previewBaseline[url] || 0)
+              ),
+            }))
+            .filter(item => item.count > 0);
+          const previousPreviewDeltas = deltasFor('result_1');
+          const nextPreviewDeltas = deltasFor('result_3');
+          const previousPreviewCount = previousPreviewDeltas.reduce(
+            (total, item) => total + item.count,
+            0
+          );
+          const nextPreviewCount = nextPreviewDeltas.reduce(
+            (total, item) => total + item.count,
+            0
+          );
+          const previewBoundsOk = (
+            previousPreviewDeltas.length === 1
+            && previousPreviewCount === 1
+          );
+          const backgroundPeak = Number(data.background_detail_peak || 0);
+          const staleMedia = Number(
+            document.documentElement.dataset.galleryMediaStale || 0
+          );
+          const mediaActive = Number(
+            document.documentElement.dataset.galleryMediaActive || 0
+          );
+          const mediaPeak = Number(
+            document.documentElement.dataset.galleryMediaPeak || 0
+          );
+          const foregroundPeak = Number(
+            document.documentElement.dataset.galleryForegroundPeak || 0
+          );
+          const warmPeak = Number(
+            document.documentElement.dataset.galleryWarmPeak || 0
+          );
+          const currentGeneration = Number(
+            document.documentElement.dataset.galleryMediaGeneration || 0
+          );
+          prefetchDiagnostics = [
+            `detail:${calls.result_1}/${calls.result_2}/${calls.result_3}`,
+            `preview:${previousPreviewCount}/${nextPreviewCount}`,
+            `urls:${previousPreviewDeltas.length}/${nextPreviewDeltas.length}`,
+            `peak:${backgroundPeak}`,
+            `media:${mediaActive}/${mediaPeak}`,
+            `foreground:${foregroundPeak}`,
+            `warm:0/${warmPeak}`,
+            `stale:${staleMedia}`,
+            `stream:${data.preview_active}/${data.preview_peak}/${data.preview_cancelled}`,
+          ].join(',');
+          if (
+            calls.result_1 !== 1
+            || calls.result_2 !== 1
+            || calls.result_3 !== 1
+          ) {
+            setPhase('prefetch-detail-duplicated-before-navigation');
+            return;
+          }
+          if (!previewBoundsOk) {
+            setPhase('prefetch-preview-bounds-failed');
+            return;
+          }
+          if (backgroundPeak !== 1) {
+            setPhase('prefetch-concurrency-bound-failed');
+            return;
+          }
+          if (
+            (
+              data.require_preview_cancellation
+              && Number(data.preview_cancelled || 0) < 1
+            )
+            || Number(data.preview_active || 0) > 3
+          ) {
+            return;
+          }
+          if (
+            staleMedia !== 0
+            || mediaActive > 3
+            || mediaPeak > 3
+            || foregroundPeak > 2
+            || warmPeak > 2
+            || currentGeneration <= prefetchGeneration
+          ) {
+            setPhase('prefetch-stale-media-failed');
             return;
           }
           const previous = document.querySelector('#gallery-review-previous');
@@ -2525,6 +2751,7 @@ window.addEventListener('load', () => {
         .then(data => {
           if (data.backward_probe_seen) {
             document.documentElement.dataset.finderModalReview = 'pass';
+            warmNavigationObserver.disconnect();
             clearInterval(poll);
           } else {
             setPhase('boundary-probe-missing');
@@ -2537,7 +2764,7 @@ window.addEventListener('load', () => {
     if (!document.documentElement.dataset.finderModalReview) {
       document.documentElement.dataset.finderModalReview = 'fail';
     }
-  }, 16500);
+  }, 70000);
 });
 """
         if finder_switch_source:
@@ -3055,6 +3282,7 @@ def main() -> None:
                     finder_tag=args.finder_tag,
                     finder_retry=args.finder_retry,
                     finder_modal_review=args.finder_modal_review,
+                    mobile=args.mobile,
                 ),
                 host="127.0.0.1",
                 port=18101,
@@ -3086,7 +3314,7 @@ def main() -> None:
             "--disable-sync",
             "--force-prefers-reduced-motion",
             "--no-first-run",
-            f"--virtual-time-budget={18000 if args.finder_modal_review else 8500 if args.finder_tag or args.finder_switch_source else 7500 if args.finder_unusable_save or args.finder_continue else 6500 if args.finder_direct_assign else 6000 if args.finder_retry else 4500 if args.finder_race else 4000 if args.finder_pose_flow else 3000 if args.lightbox or args.pose else 2000 if finder_mode else 1000}",
+            f"--virtual-time-budget={80000 if args.finder_modal_review else 8500 if args.finder_tag or args.finder_switch_source else 7500 if args.finder_unusable_save or args.finder_continue else 6500 if args.finder_direct_assign else 6000 if args.finder_retry else 4500 if args.finder_race else 4000 if args.finder_pose_flow else 3000 if args.lightbox or args.pose else 2000 if finder_mode else 1000}",
             f"--user-data-dir={Path(directory) / 'chrome-profile'}",
             f"--window-size={viewport}",
             f"--screenshot={output}",

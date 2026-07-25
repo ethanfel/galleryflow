@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -15,6 +16,152 @@ from app.security import encode_gallery_id, verify_media_signature
 
 
 GALLERY = "https://www.pornpics.com/galleries/sample-79186222/"
+
+
+def initialized_app(tmp_path: Path):
+    config = AppConfig(
+        data_dir=tmp_path / "data",
+        download_root=tmp_path / "downloads",
+        sqlite_vfs=None,
+    )
+    config.ensure_directories()
+    app = create_app(config)
+    app.state.db.initialize()
+    return app
+
+
+@pytest.mark.asyncio
+async def test_gallery_persistence_does_not_block_other_requests(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = initialized_app(tmp_path)
+    original_status_for_urls = app.state.db.status_for_urls
+    original_image_statuses = app.state.db.image_statuses
+    persistence_started = threading.Event()
+    release_persistence = threading.Event()
+    persistence_calls: list[tuple[str, int]] = []
+    event_loop_thread = threading.get_ident()
+
+    async def fake_gallery(url: str) -> dict:
+        return {
+            "id": encode_gallery_id(url),
+            "url": url,
+            "title": "Slow persistence",
+            "images": [
+                {
+                    "url": "https://cdni.pornpics.com/1280/slow.jpg",
+                    "preview_remote_url": "https://cdni.pornpics.com/460/slow.jpg",
+                    "filename": "slow.jpg",
+                    "ordinal": 1,
+                }
+            ],
+        }
+
+    def blocked_register(_: str, __: list[dict]) -> None:
+        persistence_calls.append(("register", threading.get_ident()))
+        persistence_started.set()
+        release_persistence.wait(timeout=5)
+
+    def tracked_index(_: dict) -> bool:
+        persistence_calls.append(("index", threading.get_ident()))
+        return True
+
+    def tracked_status(urls: list[str], profile: str) -> dict:
+        persistence_calls.append(("status", threading.get_ident()))
+        return original_status_for_urls(urls, profile)
+
+    def tracked_image_statuses(profile: str, gallery_url: str) -> set[str]:
+        persistence_calls.append(("images", threading.get_ident()))
+        return original_image_statuses(profile, gallery_url)
+
+    monkeypatch.setattr(app.state.scraper, "gallery", fake_gallery)
+    monkeypatch.setattr(app.state.db, "register_gallery_images", blocked_register)
+    monkeypatch.setattr(app.state.finder, "index_gallery_detail", tracked_index)
+    monkeypatch.setattr(app.state.db, "status_for_urls", tracked_status)
+    monkeypatch.setattr(app.state.db, "image_statuses", tracked_image_statuses)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        detail_task = asyncio.create_task(
+            client.get(
+                f"/api/galleries/{encode_gallery_id(GALLERY)}",
+                params={"profile": "Default"},
+            )
+        )
+        safety_release = threading.Timer(5, release_persistence.set)
+        safety_release.start()
+        try:
+            assert await asyncio.wait_for(
+                asyncio.to_thread(persistence_started.wait), timeout=2
+            )
+            health = await asyncio.wait_for(client.get("/api/health"), timeout=2)
+            assert health.status_code == 200
+            assert not release_persistence.is_set()
+        finally:
+            release_persistence.set()
+            safety_release.cancel()
+        detail = await asyncio.wait_for(detail_task, timeout=2)
+
+    assert detail.status_code == 200
+    assert [name for name, _ in persistence_calls] == [
+        "register",
+        "index",
+        "status",
+        "images",
+    ]
+    persistence_threads = {thread_id for _, thread_id in persistence_calls}
+    assert len(persistence_threads) == 1
+    assert event_loop_thread not in persistence_threads
+
+
+@pytest.mark.asyncio
+async def test_slow_health_database_read_does_not_block_the_event_loop(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = initialized_app(tmp_path)
+    health_read_started = threading.Event()
+    release_health_read = threading.Event()
+    event_loop_thread = threading.get_ident()
+    worker_threads: list[int] = []
+
+    def blocked_job_summaries(_: int) -> list[dict]:
+        worker_threads.append(threading.get_ident())
+        health_read_started.set()
+        release_health_read.wait(timeout=5)
+        return []
+
+    monkeypatch.setattr(
+        app.state.db,
+        "list_job_summaries",
+        blocked_job_summaries,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        # Generate and cache the schema before deliberately blocking the DB read.
+        assert (await client.get("/openapi.json")).status_code == 200
+        health_task = asyncio.create_task(client.get("/api/health"))
+        safety_release = threading.Timer(5, release_health_read.set)
+        safety_release.start()
+        try:
+            assert await asyncio.wait_for(
+                asyncio.to_thread(health_read_started.wait), timeout=2
+            )
+            unrelated = await asyncio.wait_for(
+                client.get("/openapi.json"), timeout=2
+            )
+            assert unrelated.status_code == 200
+            assert not release_health_read.is_set()
+        finally:
+            release_health_read.set()
+            safety_release.cancel()
+        health = await asyncio.wait_for(health_task, timeout=2)
+
+    assert health.status_code == 200
+    assert worker_threads and event_loop_thread not in worker_threads
 
 
 @pytest.mark.asyncio

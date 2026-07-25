@@ -47,6 +47,17 @@
     galleryDetailRevisions: new Map(),
     galleryPreviewWarmups: new Map(),
     galleryPreviewWarmGeneration: 0,
+    mediaLoadQueue: [],
+    mediaLoadActive: new Set(),
+    mediaLoadObserved: new Set(),
+    mediaLoadByImage: new WeakMap(),
+    mediaLoadDrainScheduled: false,
+    mediaLoadLazyObserver: null,
+    mediaLoadDomObserver: null,
+    mediaLoadPeak: 0,
+    mediaLoadCancelled: 0,
+    galleryForegroundPeak: 0,
+    galleryPreviewWarmPeak: 0,
     galleryNavigationRequest: 0,
     galleryMode: 'download',
     poseSelectedImages: new Set(),
@@ -153,8 +164,10 @@
   const FINDER_JOYTAG_CATALOG_RENDER_LIMIT = 80;
   const GALLERY_DETAIL_CACHE_LIMIT = 8;
   const GALLERY_DETAIL_CACHE_TTL = 60_000;
-  const GALLERY_DETAIL_PREFETCH_CONCURRENCY = 2;
-  const GALLERY_PREVIEW_WARM_LIMIT = 3;
+  const GALLERY_DETAIL_PREFETCH_CONCURRENCY = 1;
+  const MEDIA_LOAD_CONCURRENCY = 3;
+  const GALLERY_PREVIEW_WARM_CONCURRENCY = 2;
+  const GALLERY_PREVIEW_WARM_LIMIT = 1;
   const GALLERY_PREVIEW_CACHE_LIMIT = 24;
   const FINDER_RANKING_VERSION = 'pose-precision-v2';
   const FINDER_JOYTAG_RANKING_VERSION = 'joytag-v1';
@@ -904,23 +917,430 @@
       : `All available results loaded through page ${state.page}`;
   }
 
-  function loadImage(image, source, alt = '') {
+  function syncMediaLoadDiagnostics() {
+    const tasks = [
+      ...state.mediaLoadActive,
+      ...state.mediaLoadQueue,
+      ...state.mediaLoadObserved
+    ];
+    const activeForeground = [...state.mediaLoadActive]
+      .filter(task => task.kind === 'foreground').length;
+    const activeWarm = [...state.mediaLoadActive].filter(task => task.kind === 'warm').length;
+    const queuedWarm = state.mediaLoadQueue.filter(task => task.kind === 'warm').length;
+    const stale = tasks.filter(task => task.generation !== state.galleryPreviewWarmGeneration).length;
+    state.mediaLoadPeak = Math.max(state.mediaLoadPeak, state.mediaLoadActive.size);
+    state.galleryForegroundPeak = Math.max(
+      state.galleryForegroundPeak,
+      activeForeground
+    );
+    state.galleryPreviewWarmPeak = Math.max(state.galleryPreviewWarmPeak, activeWarm);
+    const root = document.documentElement;
+    root.dataset.galleryMediaActive = String(state.mediaLoadActive.size);
+    root.dataset.galleryMediaPeak = String(state.mediaLoadPeak);
+    root.dataset.galleryForegroundActive = String(activeForeground);
+    root.dataset.galleryForegroundPeak = String(state.galleryForegroundPeak);
+    root.dataset.galleryWarmActive = String(activeWarm);
+    root.dataset.galleryWarmQueued = String(queuedWarm);
+    root.dataset.galleryWarmPeak = String(state.galleryPreviewWarmPeak);
+    root.dataset.galleryMediaStale = String(stale);
+    root.dataset.galleryMediaCancelled = String(state.mediaLoadCancelled);
+    root.dataset.galleryMediaGeneration = String(state.galleryPreviewWarmGeneration);
+  }
+
+  function mediaLoadTaskIsCurrent(task) {
+    if (
+      !task
+      || task.cancelled
+      || task.generation !== state.galleryPreviewWarmGeneration
+    ) return false;
+    if (task.kind === 'warm') return true;
+    if (!task.image.isConnected) return false;
+    const galleryOpen = Boolean($('#gallery-modal')?.open);
+    if (task.kind === 'critical') {
+      return galleryOpen && (
+        Boolean($('#lightbox-modal')?.open)
+        || state.lightboxIndex >= 0
+      );
+    }
+    if (task.kind === 'foreground') return galleryOpen || state.loadingDetail;
+    return !galleryOpen;
+  }
+
+  function scheduleMediaLoadDrain() {
+    if (state.mediaLoadDrainScheduled) return;
+    state.mediaLoadDrainScheduled = true;
+    window.queueMicrotask(() => {
+      state.mediaLoadDrainScheduled = false;
+      drainMediaLoadQueue();
+    });
+  }
+
+  function removeQueuedMediaLoad(task) {
+    const index = state.mediaLoadQueue.indexOf(task);
+    if (index >= 0) state.mediaLoadQueue.splice(index, 1);
+  }
+
+  function removeObservedMediaLoad(task) {
+    if (!task) return false;
+    const removed = state.mediaLoadObserved.delete(task);
+    state.mediaLoadLazyObserver?.unobserve(task.image);
+    return removed;
+  }
+
+  function hasDomBoundMediaLoadTasks() {
+    return [
+      ...state.mediaLoadActive,
+      ...state.mediaLoadQueue,
+      ...state.mediaLoadObserved
+    ].some(task => task.kind !== 'warm');
+  }
+
+  function maybeDisconnectMediaLoadDomObserver() {
+    if (!hasDomBoundMediaLoadTasks()) state.mediaLoadDomObserver?.disconnect();
+  }
+
+  function observeMediaLoadDomRemovals() {
+    if (!('MutationObserver' in window)) return;
+    if (!state.mediaLoadDomObserver) {
+      state.mediaLoadDomObserver = new MutationObserver(
+        scheduleMediaLoadDrain
+      );
+    }
+    state.mediaLoadDomObserver.observe(document.documentElement, {
+      childList: true,
+      subtree: true
+    });
+  }
+
+  function mediaLoadUsesAbortableFetch(url) {
+    try {
+      const parsed = new URL(url, window.location.href);
+      return (
+        ['http:', 'https:'].includes(parsed.protocol)
+        && parsed.origin === window.location.origin
+      );
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function revokeMediaLoadObjectUrl(task) {
+    const objectUrl = task?.objectUrl;
+    if (!objectUrl) return;
+    task.objectUrl = '';
+    URL.revokeObjectURL(objectUrl);
+  }
+
+  function mediaLoadAttemptIsActive(task, attemptToken) {
+    return Boolean(
+      task
+      && !task.cancelled
+      && task.state === 'active'
+      && attemptToken === task.attemptToken
+    );
+  }
+
+  async function fetchMediaLoadTask(task, attemptToken, controller) {
+    try {
+      const response = await fetch(task.url, {
+        signal: controller.signal,
+        credentials: 'same-origin',
+        cache: 'force-cache'
+      });
+      if (
+        !mediaLoadAttemptIsActive(task, attemptToken)
+        || task.abortController !== controller
+      ) return;
+      if (!response.ok) {
+        throw new Error(`Media request failed (${response.status})`);
+      }
+      const blob = await response.blob();
+      if (
+        !mediaLoadAttemptIsActive(task, attemptToken)
+        || task.abortController !== controller
+      ) return;
+      const objectUrl = URL.createObjectURL(blob);
+      if (!mediaLoadAttemptIsActive(task, attemptToken)) {
+        URL.revokeObjectURL(objectUrl);
+        return;
+      }
+      task.abortController = null;
+      task.objectUrl = objectUrl;
+      task.image.src = objectUrl;
+    } catch (_) {
+      if (
+        controller.signal.aborted
+        || !mediaLoadAttemptIsActive(task, attemptToken)
+      ) return;
+      if (task.abortController === controller) task.abortController = null;
+      finishMediaLoadTask(task, false, attemptToken);
+    }
+  }
+
+  function cancelMediaLoadTask(task, { drain = true } = {}) {
+    if (!task || task.cancelled || task.state === 'done') return;
+    const wasActive = state.mediaLoadActive.delete(task);
+    removeQueuedMediaLoad(task);
+    removeObservedMediaLoad(task);
+    task.attemptToken += 1;
+    task.abortController?.abort();
+    task.abortController = null;
+    if (task.onLoad) task.image.removeEventListener('load', task.onLoad);
+    if (task.onError) task.image.removeEventListener('error', task.onError);
+    task.onLoad = null;
+    task.onError = null;
+    revokeMediaLoadObjectUrl(task);
+    if (wasActive) {
+      state.mediaLoadCancelled += 1;
+      task.image.removeAttribute('src');
+    }
+    task.cancelled = true;
+    task.state = 'cancelled';
+    if (state.mediaLoadByImage.get(task.image) === task) {
+      state.mediaLoadByImage.delete(task.image);
+    }
+    maybeDisconnectMediaLoadDomObserver();
+    syncMediaLoadDiagnostics();
+    if (drain) scheduleMediaLoadDrain();
+  }
+
+  function cancelMediaLoadForImage(image, options = {}) {
+    const task = image && state.mediaLoadByImage.get(image);
+    if (task) cancelMediaLoadTask(task, options);
+  }
+
+  function finishMediaLoadTask(task, loaded, attemptToken) {
+    if (
+      !task
+      || task.cancelled
+      || task.state !== 'active'
+      || attemptToken !== task.attemptToken
+    ) return;
+    state.mediaLoadActive.delete(task);
+    task.image.removeEventListener('load', task.onLoad);
+    task.image.removeEventListener('error', task.onError);
+    task.onLoad = null;
+    task.onError = null;
+    task.abortController = null;
+    revokeMediaLoadObjectUrl(task);
+    task.state = 'done';
+    if (state.mediaLoadByImage.get(task.image) === task) {
+      state.mediaLoadByImage.delete(task.image);
+    }
+    if (loaded) {
+      task.image.previousElementSibling?.classList.add('is-loaded');
+      if (task.kind === 'warm') {
+        state.galleryPreviewWarmups.delete(task.url);
+        state.galleryPreviewWarmups.set(task.url, task.image);
+        while (state.galleryPreviewWarmups.size > GALLERY_PREVIEW_CACHE_LIMIT) {
+          state.galleryPreviewWarmups.delete(state.galleryPreviewWarmups.keys().next().value);
+        }
+      }
+    } else {
+      task.image.hidden = true;
+      task.image.removeAttribute('src');
+    }
+    const failureCallback = !loaded && typeof task.failureCallback === 'function'
+      ? task.failureCallback
+      : null;
+    maybeDisconnectMediaLoadDomObserver();
+    syncMediaLoadDiagnostics();
+    scheduleMediaLoadDrain();
+    if (failureCallback) window.queueMicrotask(failureCallback);
+  }
+
+  function startMediaLoadTask(task) {
+    if (!mediaLoadTaskIsCurrent(task)) {
+      cancelMediaLoadTask(task, { drain: false });
+      return false;
+    }
+    task.state = 'active';
+    state.mediaLoadActive.add(task);
+    const attemptToken = ++task.attemptToken;
+    task.onLoad = () => finishMediaLoadTask(task, true, attemptToken);
+    task.onError = () => finishMediaLoadTask(task, false, attemptToken);
+    task.image.addEventListener('load', task.onLoad, { once: true });
+    task.image.addEventListener('error', task.onError, { once: true });
+    task.image.hidden = false;
+    task.image.removeAttribute('src');
+    if (mediaLoadUsesAbortableFetch(task.url)) {
+      const controller = new AbortController();
+      task.abortController = controller;
+      fetchMediaLoadTask(task, attemptToken, controller);
+    } else {
+      task.image.src = task.url;
+    }
+    syncMediaLoadDiagnostics();
+    return true;
+  }
+
+  function nextMediaLoadTask() {
+    const critical = state.mediaLoadQueue.findIndex(task => task.kind === 'critical');
+    const foreground = state.mediaLoadQueue.findIndex(task => task.kind === 'foreground');
+    const normal = state.mediaLoadQueue.findIndex(task => task.kind === 'normal');
+    const warm = state.mediaLoadQueue.findIndex(task => task.kind === 'warm');
+    const activeForeground = [...state.mediaLoadActive]
+      .filter(task => task.kind === 'foreground').length;
+    const activeWarm = [...state.mediaLoadActive]
+      .filter(task => task.kind === 'warm').length;
+    if (critical >= 0) return state.mediaLoadQueue.splice(critical, 1)[0];
+    if (foreground >= 0 && activeForeground < 2) {
+      return state.mediaLoadQueue.splice(foreground, 1)[0];
+    }
+    if (normal >= 0) return state.mediaLoadQueue.splice(normal, 1)[0];
+    if (warm >= 0 && activeWarm < GALLERY_PREVIEW_WARM_CONCURRENCY) {
+      return state.mediaLoadQueue.splice(warm, 1)[0];
+    }
+    return null;
+  }
+
+  function drainMediaLoadQueue() {
+    [...state.mediaLoadActive].forEach(task => {
+      if (!mediaLoadTaskIsCurrent(task)) cancelMediaLoadTask(task, { drain: false });
+    });
+    [...state.mediaLoadObserved].forEach(task => {
+      if (!mediaLoadTaskIsCurrent(task)) cancelMediaLoadTask(task, { drain: false });
+    });
+    [...state.mediaLoadQueue].forEach(task => {
+      if (!mediaLoadTaskIsCurrent(task)) cancelMediaLoadTask(task, { drain: false });
+    });
+    while (state.mediaLoadActive.size < MEDIA_LOAD_CONCURRENCY) {
+      const task = nextMediaLoadTask();
+      if (!task) break;
+      startMediaLoadTask(task);
+    }
+    syncMediaLoadDiagnostics();
+  }
+
+  function enqueueMediaLoadTask(task) {
+    if (!mediaLoadTaskIsCurrent(task)) {
+      cancelMediaLoadTask(task);
+      return;
+    }
+    removeObservedMediaLoad(task);
+    task.state = 'queued';
+    if (task.kind !== 'warm') observeMediaLoadDomRemovals();
+    if (
+      ['critical', 'foreground'].includes(task.kind)
+      && state.mediaLoadActive.size >= MEDIA_LOAD_CONCURRENCY
+    ) {
+      const warm = [...state.mediaLoadActive].find(item => item.kind === 'warm');
+      if (warm) cancelMediaLoadTask(warm, { drain: false });
+    }
+    state.mediaLoadQueue.push(task);
+    syncMediaLoadDiagnostics();
+    scheduleMediaLoadDrain();
+  }
+
+  function observeLazyMediaLoad(task) {
+    if (!('IntersectionObserver' in window)) {
+      enqueueMediaLoadTask(task);
+      return;
+    }
+    if (!state.mediaLoadLazyObserver) {
+      state.mediaLoadLazyObserver = new IntersectionObserver(entries => {
+        entries.forEach(entry => {
+          const pending = state.mediaLoadByImage.get(entry.target);
+          if (!entry.target.isConnected) {
+            if (pending) cancelMediaLoadTask(pending);
+            else state.mediaLoadLazyObserver.unobserve(entry.target);
+            return;
+          }
+          if (!entry.isIntersecting) return;
+          if (pending) removeObservedMediaLoad(pending);
+          else state.mediaLoadLazyObserver.unobserve(entry.target);
+          if (pending?.state === 'observing') enqueueMediaLoadTask(pending);
+        });
+      }, { rootMargin: '600px 300px' });
+    }
+    task.state = 'observing';
+    state.mediaLoadObserved.add(task);
+    state.mediaLoadLazyObserver.observe(task.image);
+    observeMediaLoadDomRemovals();
+    syncMediaLoadDiagnostics();
+  }
+
+  function queueMediaLoad(
+    image,
+    source,
+    alt = '',
+    {
+      kind = 'normal',
+      lazy = image.loading === 'lazy',
+      generation = state.galleryPreviewWarmGeneration,
+      onError = null
+    } = {}
+  ) {
     const url = safeUrl(source);
     image.alt = alt;
+    const previous = state.mediaLoadByImage.get(image);
+    if (previous) cancelMediaLoadTask(previous, { drain: false });
     if (!url) {
       image.removeAttribute('src');
       image.hidden = true;
-      return;
+      return null;
+    }
+    if (kind === 'normal' && $('#gallery-modal')?.open) {
+      // The Finder grid is re-rendered when the modal closes. Avoid letting
+      // thumbnails behind the dialog compete with review actions in the meantime.
+      image.removeAttribute('src');
+      image.hidden = false;
+      return null;
     }
     image.hidden = false;
-    image.src = url;
-    image.addEventListener('load', () => {
-      image.previousElementSibling?.classList.add('is-loaded');
-    }, { once: true });
-    image.addEventListener('error', () => {
-      image.hidden = true;
-      image.removeAttribute('src');
-    }, { once: true });
+    const task = {
+      image,
+      url,
+      kind,
+      generation,
+      state: 'new',
+      cancelled: false,
+      attemptToken: 0,
+      abortController: null,
+      objectUrl: '',
+      onLoad: null,
+      onError: null,
+      failureCallback: onError
+    };
+    state.mediaLoadByImage.set(image, task);
+    if (kind !== 'warm') {
+      observeMediaLoadDomRemovals();
+      window.queueMicrotask(() => {
+        if (state.mediaLoadByImage.get(image) !== task) return;
+        if (!mediaLoadTaskIsCurrent(task)) {
+          cancelMediaLoadTask(task);
+          return;
+        }
+        if (lazy) observeLazyMediaLoad(task);
+        else enqueueMediaLoadTask(task);
+      });
+    } else {
+      enqueueMediaLoadTask(task);
+    }
+    return task;
+  }
+
+  function loadImage(image, source, alt = '', options = {}) {
+    return queueMediaLoad(image, source, alt, options);
+  }
+
+  function advanceGalleryMediaGeneration() {
+    state.galleryPreviewWarmGeneration += 1;
+    [
+      ...state.mediaLoadActive,
+      ...state.mediaLoadQueue,
+      ...state.mediaLoadObserved
+    ].forEach(task => {
+      cancelMediaLoadTask(task, { drain: false });
+    });
+    state.mediaLoadQueue = [];
+    state.mediaLoadObserved.clear();
+    state.mediaLoadDomObserver?.disconnect();
+    state.mediaLoadPeak = 0;
+    state.galleryForegroundPeak = 0;
+    state.galleryPreviewWarmPeak = 0;
+    syncMediaLoadDiagnostics();
+    return state.galleryPreviewWarmGeneration;
   }
 
   async function handleSourceSubmit(event) {
@@ -1397,7 +1817,7 @@
   }
 
   function cancelAdjacentGalleryPrefetches({ includeForeground = false } = {}) {
-    state.galleryPreviewWarmGeneration += 1;
+    advanceGalleryMediaGeneration();
     [...state.galleryDetailPrefetchQueued.values()].forEach(task => {
       task.cancelled = true;
       const error = new Error('Adjacent gallery prefetch cancelled');
@@ -1433,8 +1853,9 @@
     drainGalleryDetailPrefetchQueue();
   }
 
-  function warmGalleryPreviews(data, result = null) {
+  function warmGalleryPreviews(data, result = null, generation = state.galleryPreviewWarmGeneration) {
     if (!data) return;
+    if (generation !== state.galleryPreviewWarmGeneration) return;
     const connection = navigator.connection;
     if (
       document.visibilityState !== 'visible'
@@ -1456,26 +1877,25 @@
     )].slice(0, GALLERY_PREVIEW_WARM_LIMIT);
     urls.forEach(url => {
       const existing = state.galleryPreviewWarmups.get(url);
-      if (existing) {
+      if (existing?.complete && existing.naturalWidth > 0) {
         state.galleryPreviewWarmups.delete(url);
         state.galleryPreviewWarmups.set(url, existing);
         return;
       }
+      const duplicate = [...state.mediaLoadActive, ...state.mediaLoadQueue]
+        .some(task => task.kind === 'warm' && task.url === url);
+      if (duplicate) return;
       const image = new Image();
       image.decoding = 'async';
       image.fetchPriority = 'low';
-      image.src = url;
-      state.galleryPreviewWarmups.set(url, image);
-      while (state.galleryPreviewWarmups.size > GALLERY_PREVIEW_CACHE_LIMIT) {
-        state.galleryPreviewWarmups.delete(state.galleryPreviewWarmups.keys().next().value);
-      }
+      queueMediaLoad(image, url, '', { kind: 'warm', lazy: false, generation });
     });
   }
 
   function scheduleGalleryPreviewWarm(data, result, generation) {
     const warm = () => {
       if (generation === state.galleryPreviewWarmGeneration) {
-        warmGalleryPreviews(data, result);
+        warmGalleryPreviews(data, result, generation);
       }
     };
     if ('requestIdleCallback' in window) {
@@ -1488,7 +1908,7 @@
   function prefetchAdjacentFinderGalleries(context = state.galleryContext) {
     const queue = context?.finderReviewQueue;
     if (!queue?.results?.length) return;
-    const generation = ++state.galleryPreviewWarmGeneration;
+    const generation = state.galleryPreviewWarmGeneration;
     const index = Math.max(0, Math.min(queue.results.length - 1, Number(queue.index || 0)));
     const profile = state.activeProfile;
     const neighbors = [queue.results[index - 1], queue.results[index + 1]]
@@ -1508,6 +1928,35 @@
     });
   }
 
+  function snapshotOpenLightboxMedia() {
+    const dialog = $('#lightbox-modal');
+    if (!dialog?.open || state.lightboxIndex < 0) return null;
+    const image = state.gallery?.images?.[state.lightboxIndex];
+    return {
+      index: state.lightboxIndex,
+      identity: String(image?.url || image?.fullUrl || image?.previewUrl || '')
+    };
+  }
+
+  function reloadOpenLightboxMedia(snapshot) {
+    const dialog = $('#lightbox-modal');
+    if (!snapshot || !dialog?.open) return;
+    const images = state.gallery?.images || [];
+    if (!images.length) {
+      closeModal(dialog);
+      return;
+    }
+    const matchingIndex = snapshot.identity
+      ? images.findIndex(image => (
+        String(image.url || image.fullUrl || image.previewUrl || '') === snapshot.identity
+      ))
+      : -1;
+    state.lightboxIndex = matchingIndex >= 0
+      ? matchingIndex
+      : Math.max(0, Math.min(images.length - 1, snapshot.index));
+    renderLightboxImage();
+  }
+
   async function refreshOpenGalleryDetail(profile = state.activeProfile) {
     const dialog = $('#gallery-modal');
     const galleryId = state.gallery?.id;
@@ -1525,6 +1974,8 @@
         || !dialog.open
         || String(state.gallery?.id) !== String(galleryId)
       ) return false;
+      const lightboxSnapshot = snapshotOpenLightboxMedia();
+      advanceGalleryMediaGeneration();
       const detail = normalizeDetail(data);
       const imageUrls = new Set(detail.images.map(image => image.url));
       state.gallery = detail;
@@ -1553,6 +2004,7 @@
       }
       renderGallerySummary();
       renderImages();
+      reloadOpenLightboxMedia(lightboxSnapshot);
       renderGalleries();
       $('#gallery-modal-kicker').textContent = displayHost(detail.url);
       $('#gallery-modal-title').textContent = detail.title;
@@ -1589,6 +2041,7 @@
     const summarySource = context?.summary || state.galleries.find(item => String(item.id) === String(id));
     const summary = summarySource ? normalizeGallery(summarySource) : null;
     if (!summary) return;
+    advanceGalleryMediaGeneration();
     cancelForegroundGalleryDetailRequests();
     const detailProfile = state.activeProfile;
     const detailRequest = ++state.galleryDetailRequest;
@@ -1718,7 +2171,12 @@
     cover.append(placeholder);
     const image = document.createElement('img');
     cover.append(image);
-    loadImage(image, gallery.thumbnailUrl || gallery.images?.[0]?.previewUrl, gallery.title);
+    loadImage(
+      image,
+      gallery.thumbnailUrl || gallery.images?.[0]?.previewUrl,
+      gallery.title,
+      { kind: 'foreground', lazy: false }
+    );
     const status = galleryStatus(gallery);
     $('#summary-status').innerHTML = `<span class="status-badge ${status.className}">${status.label}</span>`;
     $('#summary-image-count').textContent = gallery.imageCount ? formatNumber(gallery.imageCount) : '—';
@@ -2379,7 +2837,7 @@
       const preview = document.createElement('img');
       preview.loading = 'lazy';
       preview.decoding = 'async';
-      loadImage(preview, image.previewUrl, image.filename);
+      loadImage(preview, image.previewUrl, image.filename, { kind: 'foreground' });
       const previewHint = document.createElement('span');
       previewHint.className = 'image-preview-hint';
       previewHint.innerHTML = '<svg><use href="#i-maximize"></use></svg><span>Full size</span>';
@@ -2465,6 +2923,7 @@
     display.id = 'lightbox-image';
     display.alt = `${image.filename}, full-resolution preview`;
     display.decoding = 'async';
+    cancelMediaLoadForImage(previous, { drain: false });
     previous.removeAttribute('src');
     previous.replaceWith(display);
 
@@ -2473,21 +2932,25 @@
     const loadCandidate = () => {
       const source = candidates[candidateIndex];
       if (!source) {
+        cancelMediaLoadForImage(display);
         display.hidden = true;
         display.removeAttribute('src');
         placeholder.classList.add('is-error');
         return;
       }
       display.hidden = false;
-      display.src = source;
+      loadImage(display, source, display.alt, {
+        kind: 'critical',
+        lazy: false,
+        onError: () => {
+          if (loadToken !== state.lightboxLoadToken) return;
+          candidateIndex += 1;
+          loadCandidate();
+        }
+      });
     };
     display.addEventListener('load', () => {
       if (loadToken === state.lightboxLoadToken) placeholder.classList.add('is-loaded');
-    });
-    display.addEventListener('error', () => {
-      if (loadToken !== state.lightboxLoadToken) return;
-      candidateIndex += 1;
-      loadCandidate();
     });
     loadCandidate();
     renderLightboxPoseDock();
@@ -2518,6 +2981,7 @@
     state.lightboxTrigger = null;
     setLightboxZoom(false);
     const image = $('#lightbox-image');
+    cancelMediaLoadForImage(image);
     image?.removeAttribute('src');
     $('#lightbox-stage .image-placeholder')?.classList.remove('is-loaded', 'is-error');
     if ($('#gallery-modal').open && trigger?.isConnected) trigger.focus({ preventScroll: true });
@@ -4833,7 +5297,8 @@
       if (overlayUrl) {
         const overlay = $('.finder-skeleton-overlay', button);
         overlay.hidden = false;
-        overlay.src = overlayUrl;
+        if (overlayUrl.startsWith('data:')) overlay.src = overlayUrl;
+        else loadImage(overlay, overlayUrl, '', { kind: 'normal' });
         overlay.addEventListener('error', () => {
           overlay.hidden = true;
           overlay.removeAttribute('src');
@@ -7684,6 +8149,8 @@
       state.poseExporting = false;
       setButtonBusy($('#pose-export'), false);
       renderFinderGalleryReview();
+      if (state.view === 'finder') renderFinderResults();
+      else if (state.view === 'discover') renderGalleries();
     });
     $('#gallery-modal').addEventListener('cancel', event => {
       if (!state.finderFeedbackGalleryDirty && !state.finderFeedbackGallerySaving) return;

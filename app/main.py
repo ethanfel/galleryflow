@@ -201,6 +201,18 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
         result["gallery_id"] = encode_gallery_id(result["gallery_url"])
         return result
 
+    def persist_gallery_detail(
+        detail: dict, profile: str
+    ) -> tuple[dict, set[str]]:
+        """Persist one fetched gallery without blocking the ASGI event loop."""
+
+        gallery_url = detail["url"]
+        database.register_gallery_images(gallery_url, detail["images"])
+        finder.index_gallery_detail(detail)
+        status = database.status_for_urls([gallery_url], profile)[gallery_url]
+        downloaded_images = database.image_statuses(profile, gallery_url)
+        return status, downloaded_images
+
     async def pose_gallery_images(gallery_url: str) -> list[dict]:
         images = database.gallery_images(gallery_url)
         if images:
@@ -257,7 +269,7 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
 
     @app.get("/api/health")
     async def health() -> dict:
-        jobs = database.list_job_summaries(100)
+        jobs = await asyncio.to_thread(database.list_job_summaries, 100)
         active = sum(
             j["status"] in {"queued", "starting", "downloading", "canceling"}
             for j in jobs
@@ -306,10 +318,11 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
         gallery_url = validate_source_url(decode_gallery_id(gallery_id))
         profile = clean_profile_name(profile)
         detail = await scraper.gallery(gallery_url)
-        database.register_gallery_images(detail["url"], detail["images"])
-        await asyncio.to_thread(finder.index_gallery_detail, detail)
-        status = database.status_for_urls([detail["url"]], profile)[detail["url"]]
-        downloaded_images = database.image_statuses(profile, detail["url"])
+        status, downloaded_images = await asyncio.to_thread(
+            persist_gallery_detail,
+            detail,
+            profile,
+        )
         for image in detail["images"]:
             remote = image.pop("preview_remote_url")
             image["preview_url"] = media_url(remote)
