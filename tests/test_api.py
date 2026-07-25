@@ -12,7 +12,7 @@ from PIL import Image
 
 from app.config import AppConfig
 from app.main import create_app
-from app.security import encode_gallery_id, verify_media_signature
+from app.security import encode_gallery_id, sign_media_url, verify_media_signature
 
 
 GALLERY = "https://www.pornpics.com/galleries/sample-79186222/"
@@ -28,6 +28,153 @@ def initialized_app(tmp_path: Path):
     app = create_app(config)
     app.state.db.initialize()
     return app
+
+
+class SequenceMediaClient:
+    def __init__(self, outcomes: list[object]):
+        self.outcomes = list(outcomes)
+        self.requests: list[httpx.Request] = []
+
+    def build_request(self, method: str, url: str, **kwargs) -> httpx.Request:
+        return httpx.Request(method, url, headers=kwargs.get("headers"))
+
+    async def send(self, request: httpx.Request, **_: object) -> httpx.Response:
+        self.requests.append(request)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        if callable(outcome):
+            return outcome(request)
+        assert isinstance(outcome, httpx.Response)
+        return outcome
+
+
+@pytest.mark.asyncio
+async def test_media_proxy_retries_then_reports_connect_timeout_cleanly(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = initialized_app(tmp_path)
+    remote = "https://cdni.pornpics.com/460/slow.jpg"
+    request = httpx.Request("GET", remote)
+    upstream = SequenceMediaClient(
+        [
+            httpx.ConnectTimeout("connect timed out", request=request),
+            httpx.ConnectTimeout("connect timed out", request=request),
+        ]
+    )
+    app.state.media_client = upstream
+    monkeypatch.setattr("app.main.MEDIA_PROXY_RETRY_DELAYS", (0,))
+    monkeypatch.setattr("app.main.validate_public_media_url", lambda value: value)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        response = await client.get(
+            "/api/media",
+            params={
+                "url": remote,
+                "token": sign_media_url(remote, app.state.config.media_signing_key),
+            },
+        )
+
+    assert response.status_code == 504
+    assert response.json() == {"detail": "Media host timed out"}
+    assert len(upstream.requests) == 2
+    assert upstream.requests[0] is not upstream.requests[1]
+
+
+@pytest.mark.asyncio
+async def test_media_proxy_recovers_from_a_transient_connect_timeout(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = initialized_app(tmp_path)
+    remote = "https://cdni.pornpics.com/460/recovered.jpg"
+    request = httpx.Request("GET", remote)
+    upstream = SequenceMediaClient(
+        [
+            httpx.ConnectTimeout("connect timed out", request=request),
+            lambda current: httpx.Response(
+                200,
+                headers={"content-type": "image/jpeg"},
+                content=b"recovered image",
+                request=current,
+            ),
+        ]
+    )
+    app.state.media_client = upstream
+    monkeypatch.setattr("app.main.MEDIA_PROXY_RETRY_DELAYS", (0,))
+    monkeypatch.setattr("app.main.validate_public_media_url", lambda value: value)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        response = await client.get(
+            "/api/media",
+            params={
+                "url": remote,
+                "token": sign_media_url(remote, app.state.config.media_signing_key),
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.content == b"recovered image"
+    assert len(upstream.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_media_proxy_retry_keeps_redirect_validation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = initialized_app(tmp_path)
+    remote = "https://cdni.pornpics.com/460/redirected.jpg"
+    upstream = SequenceMediaClient(
+        [
+            lambda current: httpx.Response(
+                302,
+                headers={"location": "/1280/redirected.jpg"},
+                request=current,
+            ),
+            lambda current: httpx.Response(
+                200,
+                headers={"content-type": "image/jpeg"},
+                content=b"redirected image",
+                request=current,
+            ),
+        ]
+    )
+    validated: list[str] = []
+
+    def validate(value: str) -> str:
+        validated.append(value)
+        return value
+
+    app.state.media_client = upstream
+    monkeypatch.setattr("app.main.validate_public_media_url", validate)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        response = await client.get(
+            "/api/media",
+            params={
+                "url": remote,
+                "token": sign_media_url(remote, app.state.config.media_signing_key),
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.content == b"redirected image"
+    assert [str(request.url) for request in upstream.requests] == [
+        remote,
+        "https://cdni.pornpics.com/1280/redirected.jpg",
+    ]
+    assert validated == [
+        remote,
+        "https://cdni.pornpics.com/1280/redirected.jpg",
+    ]
 
 
 @pytest.mark.asyncio

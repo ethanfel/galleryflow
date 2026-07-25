@@ -281,6 +281,8 @@ Environment variables:
 
 Concurrency and theme can also be adjusted in the WebUI. A changed gallery-worker count takes effect after restart; image concurrency and request timeout apply immediately.
 
+Proxied gallery previews use an 8-second connection ceiling and retry one transient CDN connection failure. If the upstream image host remains unavailable, the proxy returns a clean `504` timeout or `502` connection response; the failed thumbnail remains isolated and does not interrupt the WebUI request handler.
+
 Only one GalleryFlow container may use a given `/data` database. On Linux, the default share-safe `unix-dotfile` mode creates `/data/pornpic_webui.sqlite3.lock/`. A killed container or interrupted host move can leave that lock directory behind. If startup reports that the database is locked, stop every GalleryFlow container and SQLite tool using the database first. Only after all of them are stopped, remove the stale **lock directory** with `rmdir`; never remove `pornpic_webui.sqlite3`. Startup automatically retries brief container-replacement overlap for roughly 30–40 seconds and reports the exact lock path if it remains blocked.
 
 `PORNPIC_WEBUI_SQLITE_VFS=default` enables WAL and is preferable when `/data` is guaranteed to be on a local filesystem such as a Docker-managed volume or local XFS/ext4 cache. Stop every instance before changing VFS, and use the same setting consistently for every process that opens the database. Default Unix and `unix-dotfile` locking must not be mixed concurrently.

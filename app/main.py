@@ -63,6 +63,11 @@ from .security import (
 from .sorter import SortConflict, SorterService, SortNotFound
 
 
+MEDIA_PROXY_CONNECT_TIMEOUT = 8.0
+MEDIA_PROXY_RETRY_DELAYS = (0.25,)
+MEDIA_PROXY_TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
+
+
 def create_app(app_config: AppConfig | None = None) -> FastAPI:
     app_config = app_config or default_config
     database = Database(app_config.db_path, app_config.sqlite_vfs)
@@ -173,7 +178,12 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
             confined_path(app_config.download_root, profile["directory"]).mkdir(
                 parents=True, exist_ok=True
             )
-        media_client = httpx.AsyncClient(timeout=app_config.image_timeout)
+        media_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                app_config.image_timeout,
+                connect=min(MEDIA_PROXY_CONNECT_TIMEOUT, app_config.image_timeout),
+            )
+        )
         application.state.media_client = media_client
         try:
             await downloads.start()
@@ -774,19 +784,47 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
         current = await asyncio.to_thread(validate_public_media_url, url)
         client: httpx.AsyncClient = request.app.state.media_client
         response: httpx.Response | None = None
-        try:
-            for _ in range(6):
+
+        async def send_upstream(upstream_url: str) -> httpx.Response:
+            attempts = len(MEDIA_PROXY_RETRY_DELAYS) + 1
+            for attempt in range(attempts):
                 upstream_request = client.build_request(
                     "GET",
-                    current,
+                    upstream_url,
                     headers={
                         "User-Agent": app_config.user_agent,
                         "Referer": app_config.source_home,
                     },
                 )
-                response = await client.send(
-                    upstream_request, stream=True, follow_redirects=False
-                )
+                try:
+                    candidate = await client.send(
+                        upstream_request, stream=True, follow_redirects=False
+                    )
+                except httpx.TimeoutException as exc:
+                    if attempt + 1 >= attempts:
+                        raise HTTPException(504, "Media host timed out") from exc
+                    await asyncio.sleep(MEDIA_PROXY_RETRY_DELAYS[attempt])
+                    continue
+                except httpx.TransportError as exc:
+                    if attempt + 1 >= attempts:
+                        raise HTTPException(
+                            502, "Could not connect to media host"
+                        ) from exc
+                    await asyncio.sleep(MEDIA_PROXY_RETRY_DELAYS[attempt])
+                    continue
+                if (
+                    candidate.status_code in MEDIA_PROXY_TRANSIENT_STATUSES
+                    and attempt + 1 < attempts
+                ):
+                    await candidate.aclose()
+                    await asyncio.sleep(MEDIA_PROXY_RETRY_DELAYS[attempt])
+                    continue
+                return candidate
+            raise HTTPException(502, "Could not connect to media host")
+
+        try:
+            for _ in range(6):
+                response = await send_upstream(current)
                 if response.status_code in {301, 302, 303, 307, 308}:
                     location = response.headers.get("location")
                     await response.aclose()
@@ -813,11 +851,17 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
                 async def stream_body():
                     total = 0
                     try:
-                        async for chunk in response.aiter_bytes(256 * 1024):
-                            total += len(chunk)
-                            if total > app_config.max_image_bytes:
-                                break
-                            yield chunk
+                        try:
+                            async for chunk in response.aiter_bytes(256 * 1024):
+                                total += len(chunk)
+                                if total > app_config.max_image_bytes:
+                                    break
+                                yield chunk
+                        except httpx.TransportError:
+                            # Response headers are already committed at this point.
+                            # End the truncated stream cleanly and let the image
+                            # element report a normal load failure.
+                            return
                     finally:
                         await response.aclose()
 
