@@ -93,6 +93,8 @@ docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
 
 State, models, and default downloads are stored in the Docker-managed `galleryflow-data` volume. Keep `/data` on a local Docker volume or local cache-backed path whenever possible. Mount a large or shared image library separately at `/library`, then point the download, sorter, or pose roots there; this keeps SQLite away from Unraid user shares, NFS, and FUSE while the bulk images remain on the desired disk.
 
+On Unraid, do not bind `/mnt/user/appdata/galleryflow` to `/data`: `/mnt/user` passes SQLite's frequent locks and metadata operations through the `shfs` FUSE layer. Use the direct pool path instead, for example `/mnt/cache/appdata/galleryflow:/data` (replace `cache` with the actual pool name), or keep the Docker-managed volume. The image library itself may still use `/mnt/user` or a remote `/library` mount.
+
 An existing sort library can instead be mounted separately:
 
 ```yaml

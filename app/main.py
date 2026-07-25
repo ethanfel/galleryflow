@@ -714,17 +714,18 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
 
     @app.get("/api/downloads")
     async def list_downloads(limit: int = Query(default=100, ge=1, le=500)) -> dict:
+        jobs = await asyncio.to_thread(database.list_job_summaries, limit)
         return {
-            "items": [
-                downloads.public_job(job) for job in database.list_job_summaries(limit)
-            ]
+            "items": [downloads.public_job(job) for job in jobs]
         }
 
     @app.get("/api/downloads/{job_id}/items")
     async def download_items(job_id: str) -> dict:
-        if not database.get_job_summary(job_id):
+        summary = await asyncio.to_thread(database.get_job_summary, job_id)
+        if not summary:
             raise HTTPException(404, "Download job not found")
-        return {"items": database.list_job_items(job_id)}
+        items = await asyncio.to_thread(database.list_job_items, job_id)
+        return {"items": items}
 
     @app.delete("/api/downloads/{job_id}")
     async def cancel_download(job_id: str) -> dict:

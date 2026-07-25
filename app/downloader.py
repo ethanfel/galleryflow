@@ -12,9 +12,11 @@ import stat
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from collections import deque
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Awaitable, Callable, TypeVar
 from urllib.parse import urljoin, urlsplit
 
 import httpx
@@ -71,6 +73,7 @@ _FLOCK_UNAVAILABLE = frozenset(
 )
 _POSE_PUBLISH_PROCESS_LOCK = threading.Lock()
 _POSE_PUBLISH_LOCK_STATE = threading.local()
+WorkItem = TypeVar("WorkItem")
 
 try:
     _LIBC = ctypes.CDLL(None, use_errno=True)
@@ -242,12 +245,15 @@ class DownloadManager:
         self._stopping = False
         self._image_semaphore = asyncio.Semaphore(self.config.image_workers)
         self._client: httpx.AsyncClient | None = None
+        self._cancel_events: dict[str, threading.Event] = {}
+        self._cancel_events_lock = threading.Lock()
 
     async def start(self) -> None:
         self._stopping = False
         self._client = httpx.AsyncClient(timeout=self.config.image_timeout)
         await asyncio.to_thread(self._cleanup_orphan_pose_staging)
-        for job_id in self.db.queued_job_ids():
+        queued_job_ids = await asyncio.to_thread(self.db.queued_job_ids)
+        for job_id in queued_job_ids:
             self.queue.put_nowait(job_id)
         self._workers = [
             asyncio.create_task(self._worker(index), name=f"download-worker-{index}")
@@ -268,6 +274,39 @@ class DownloadManager:
         """Apply a new global media limit to work that has not started yet."""
         self._image_semaphore = asyncio.Semaphore(max(1, count))
 
+    def _cancel_event(self, job_id: str) -> threading.Event:
+        with self._cancel_events_lock:
+            return self._cancel_events.setdefault(job_id, threading.Event())
+
+    def _discard_cancel_event(self, job_id: str) -> None:
+        with self._cancel_events_lock:
+            self._cancel_events.pop(job_id, None)
+
+    async def _run_bounded_image_work(
+        self,
+        work_items: list[tuple[int, WorkItem]],
+        process: Callable[[int, WorkItem], Awaitable[bool]],
+    ) -> None:
+        """Run bounded per-job loops so one large gallery cannot monopolize waiters."""
+
+        pending = deque(work_items)
+
+        async def worker() -> None:
+            while pending:
+                position, item = pending.popleft()
+                if not await process(position, item):
+                    return
+
+        worker_count = min(len(work_items), max(1, self.config.image_workers))
+        workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
+        try:
+            await asyncio.gather(*workers)
+        except BaseException:
+            for task in workers:
+                task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            raise
+
     @staticmethod
     def public_job(job: dict | None) -> dict | None:
         if job is None:
@@ -285,9 +324,6 @@ class DownloadManager:
 
     def _publish_job(self, job: dict | None) -> None:
         self.events.publish({"type": "job", "job": self.public_job(job)})
-
-    def _publish_job_id(self, job_id: str) -> None:
-        self._publish_job(self.db.get_job_summary(job_id))
 
     def _cleanup_orphan_pose_staging(self) -> None:
         pose_root = self.config.pose_root_path
@@ -342,6 +378,7 @@ class DownloadManager:
                 "created_at": created_at,
             }
         )
+        self._cancel_event(job_id)
         self.queue.put_nowait(job_id)
         job = self.db.get_job_summary(job_id) or {}
         self._publish_job(job)
@@ -391,6 +428,7 @@ class DownloadManager:
                 "created_at": created_at,
             }
         )
+        self._cancel_event(job_id)
         self.queue.put_nowait(job_id)
         job = self.db.get_job_summary(job_id) or {}
         self._publish_job(job)
@@ -403,6 +441,7 @@ class DownloadManager:
         terminal = {"completed", "completed_with_errors", "failed", "canceled"}
         if job["status"] in terminal:
             self.db.delete_job(job_id)
+            self._discard_cancel_event(job_id)
             removed = {**job, "deleted": True}
             self._publish_job(removed)
             return self.public_job(removed)
@@ -411,42 +450,59 @@ class DownloadManager:
             values["status"] = "canceled"
         elif job["status"] not in terminal:
             values["status"] = "canceling"
-        self.db.update_job(job_id, **values)
-        job = self.db.get_job_summary(job_id)
+        job = self.db.update_job(job_id, **values)
+        self._cancel_event(job_id).set()
         self._publish_job(job)
         return self.public_job(job)
 
     async def _worker(self, index: int) -> None:
         while not self._stopping:
             job_id = await self.queue.get()
+            cancel_event = self._cancel_event(job_id)
             try:
-                job = self.db.get_job(job_id)
+                job = await asyncio.to_thread(self.db.get_job, job_id)
                 if not job or job["status"] == "canceled" or job["cancel_requested"]:
+                    cancel_event.set()
                     continue
                 if job.get("kind") == "pose_export":
-                    await self._run_pose_export_job(job)
+                    await self._run_pose_export_job(job, cancel_event)
                 else:
-                    await self._run_job(job)
+                    await self._run_job(job, cancel_event)
             except asyncio.CancelledError:
                 raise
             except (
                 Exception
             ) as exc:  # Defensive boundary: a worker must survive one bad job.
-                if self.db.job_cancel_requested(job_id):
-                    self.db.update_job(job_id, status="canceled", error="")
-                else:
-                    self.db.update_job(job_id, status="failed", error=str(exc)[:1000])
-                self._publish_job_id(job_id)
+                values = (
+                    {"status": "canceled", "error": ""}
+                    if cancel_event.is_set()
+                    else {"status": "failed", "error": str(exc)[:1000]}
+                )
+                summary = await asyncio.to_thread(
+                    self.db.finish_job,
+                    job_id,
+                    values["status"],
+                    values["error"],
+                )
+                self._publish_job(summary)
             finally:
+                self._discard_cancel_event(job_id)
                 self.queue.task_done()
 
-    async def _run_job(self, job: dict) -> None:
+    async def _run_job(
+        self, job: dict, cancel_event: threading.Event | None = None
+    ) -> None:
         job_id = job["id"]
-        self.db.update_job(job_id, status="starting", error="")
-        self._publish_job_id(job_id)
+        cancel_event = cancel_event or self._cancel_event(job_id)
+        summary = await asyncio.to_thread(
+            self.db.update_job, job_id, status="starting", error=""
+        )
+        self._publish_job(summary)
 
         detail = await self.scraper.gallery(job["gallery_url"])
-        self.db.register_gallery_images(detail["url"], detail["images"])
+        await asyncio.to_thread(
+            self.db.register_gallery_images, detail["url"], detail["images"]
+        )
         available = {canonicalize_url(item["url"]): item for item in detail["images"]}
         requested = job.get("image_urls")
         if requested:
@@ -464,103 +520,142 @@ class DownloadManager:
 
         if not images:
             raise ScrapeError("Gallery has no downloadable images")
-        self.db.create_job_items(job_id, images)
+        await asyncio.to_thread(self.db.create_job_items, job_id, images)
 
-        profile = self.db.get_profile(job["profile"])
+        profile = await asyncio.to_thread(self.db.get_profile, job["profile"])
         if not profile:
             raise ValueError(f"Unknown profile: {job['profile']}")
-        profile_root = confined_path(self.config.download_root, profile["directory"])
-        profile_root.mkdir(parents=True, exist_ok=True)
+        profile_root = await asyncio.to_thread(
+            confined_path, self.config.download_root, profile["directory"]
+        )
+        await asyncio.to_thread(profile_root.mkdir, parents=True, exist_ok=True)
         folder_base = safe_folder_name(job.get("title") or detail["title"])
         identity = gallery_key(detail["url"]).rsplit(":", 1)[-1]
-        destination = confined_path(profile_root, f"{folder_base}--{identity}")
-        destination.mkdir(parents=True, exist_ok=True)
+        destination = await asyncio.to_thread(
+            confined_path, profile_root, f"{folder_base}--{identity}"
+        )
+        await asyncio.to_thread(destination.mkdir, parents=True, exist_ok=True)
+        existing = {
+            canonicalize_url(url)
+            for url in await asyncio.to_thread(
+                self.db.image_statuses, job["profile"], detail["url"]
+            )
+        }
+        downloaded_urls = set(existing)
 
-        self.db.update_job(
+        summary = await asyncio.to_thread(
+            self.db.update_job,
             job_id,
             title=detail["title"],
             status="downloading",
             total=len(images),
+            completed=0,
+            failed=0,
             destination=str(destination.relative_to(self.config.download_root)),
+            error="",
         )
-        self._publish_job_id(job_id)
+        self._publish_job(summary)
 
         completed = 0
         failed = 0
         errors: list[str] = []
         progress_lock = asyncio.Lock()
 
-        async def download_one(position: int, item: dict) -> None:
+        async def download_one(position: int, item: dict) -> bool:
             nonlocal completed, failed
-            async with self._image_semaphore:
-                if self.db.job_cancel_requested(job_id):
-                    return
-                try:
-                    existing = self.db.image_statuses(job["profile"], detail["url"])
-                    if item["url"] in existing:
-                        self.db.update_job_item(
-                            job_id, item["url"], status="skipped", attempts=0
-                        )
-                        async with progress_lock:
-                            completed += 1
-                        return
-                    self.db.update_job_item(
-                        job_id, item["url"], status="downloading", attempts=1
-                    )
-                    final_path = await self._download_image(
-                        item["url"], destination, position, referer=detail["url"]
-                    )
-                    relative_path = str(
-                        final_path.relative_to(self.config.download_root)
-                    )
-                    byte_count = final_path.stat().st_size
-                    self.db.add_profile_image(
-                        job["profile"],
-                        detail["url"],
-                        item["url"],
-                        relative_path,
-                        byte_count,
-                    )
-                    self.db.update_job_item(
-                        job_id,
-                        item["url"],
-                        status="completed",
-                        byte_count=byte_count,
-                        relative_path=relative_path,
-                        error="",
-                    )
-                    async with progress_lock:
-                        completed += 1
-                except Exception as exc:
-                    self.db.update_job_item(
-                        job_id, item["url"], status="failed", error=str(exc)[:500]
-                    )
-                    async with progress_lock:
-                        failed += 1
-                        errors.append(f"Image {position}: {exc}")
-                finally:
-                    async with progress_lock:
-                        self.db.update_job(
-                            job_id,
-                            completed=completed,
-                            failed=failed,
-                            error="; ".join(errors[-5:])[:1000],
-                        )
-                        self._publish_job_id(job_id)
+            if cancel_event.is_set():
+                return False
 
-        tasks = [
-            asyncio.create_task(download_one(int(item.get("ordinal", index)), item))
+            item_status = "skipped"
+            item_error = ""
+            attempts = 0
+            byte_count = 0
+            relative_path = ""
+            profile_name: str | None = None
+            canonical = canonicalize_url(item["url"])
+            async with self._image_semaphore:
+                if cancel_event.is_set():
+                    return False
+                try:
+                    if canonical not in existing:
+                        attempts = 1
+                        await asyncio.to_thread(
+                            self.db.update_job_item,
+                            job_id,
+                            item["url"],
+                            status="downloading",
+                            attempts=attempts,
+                            error="",
+                        )
+                        if cancel_event.is_set():
+                            return False
+                        final_path = await self._download_image(
+                            item["url"],
+                            destination,
+                            position,
+                            referer=detail["url"],
+                        )
+                        if cancel_event.is_set():
+                            return False
+                        relative_path = str(
+                            final_path.relative_to(self.config.download_root)
+                        )
+                        file_stat = await asyncio.to_thread(final_path.stat)
+                        byte_count = file_stat.st_size
+                        item_status = "completed"
+                        profile_name = job["profile"]
+                except Exception as exc:
+                    item_status = "failed"
+                    item_error = str(exc)[:500]
+
+            if cancel_event.is_set():
+                return False
+            async with progress_lock:
+                if cancel_event.is_set():
+                    return False
+                completed_delta = int(item_status in {"completed", "skipped"})
+                failed_delta = int(item_status == "failed")
+                if failed_delta:
+                    errors.append(f"Image {position}: {item_error}")
+                summary, committed = await asyncio.to_thread(
+                    self.db.record_job_item_result,
+                    job_id,
+                    item["url"],
+                    status=item_status,
+                    completed_delta=completed_delta,
+                    failed_delta=failed_delta,
+                    item_error=item_error,
+                    job_error="; ".join(errors[-5:])[:1000],
+                    attempts=attempts,
+                    byte_count=byte_count,
+                    relative_path=relative_path,
+                    profile=profile_name,
+                    gallery_url=(detail["url"] if profile_name is not None else None),
+                )
+                if not committed:
+                    cancel_event.set()
+                    self._publish_job(summary)
+                    return False
+                completed += completed_delta
+                failed += failed_delta
+                if completed_delta:
+                    downloaded_urls.add(canonical)
+                self._publish_job(summary)
+            return True
+
+        work_items = [
+            (int(item.get("ordinal", index)), item)
             for index, item in enumerate(images, start=1)
         ]
-        await asyncio.gather(*tasks)
+        await self._run_bounded_image_work(work_items, download_one)
 
-        if self.db.job_cancel_requested(job_id):
+        if cancel_event.is_set():
             status = "canceled"
         elif completed == len(images) and failed == 0:
             status = "completed"
-            all_downloaded = self.db.image_statuses(job["profile"], detail["url"])
-            if len(all_downloaded.intersection(available)) >= len(available):
-                self.db.add_history(
+            if set(available).issubset(downloaded_urls):
+                await asyncio.to_thread(
+                    self.db.add_history,
                     detail["url"],
                     job["profile"],
                     detail["title"],
@@ -571,11 +666,19 @@ class DownloadManager:
             status = "completed_with_errors"
         else:
             status = "failed"
-        self.db.update_job(job_id, status=status)
-        self._publish_job_id(job_id)
+        summary = await asyncio.to_thread(
+            self.db.finish_job,
+            job_id,
+            status,
+            "; ".join(errors[-5:])[:1000],
+        )
+        self._publish_job(summary)
 
-    async def _run_pose_export_job(self, job: dict) -> None:
+    async def _run_pose_export_job(
+        self, job: dict, cancel_event: threading.Event | None = None
+    ) -> None:
         job_id = job["id"]
+        cancel_event = cancel_event or self._cancel_event(job_id)
         payload = job.get("payload") or {}
         controls = payload.get("controls") or {}
         targets = payload.get("targets") or []
@@ -593,13 +696,16 @@ class DownloadManager:
             {"url": url, "ordinal": index}
             for index, url in enumerate(ordered_urls, start=1)
         ]
-        self.db.create_job_items(job_id, images)
+        await asyncio.to_thread(self.db.create_job_items, job_id, images)
 
         pose_root = self.config.pose_root_path
-        pose_root.mkdir(parents=True, exist_ok=True)
-        staging = confined_path(pose_root, f".galleryflow-tmp/{job_id}")
-        staging.mkdir(parents=True, exist_ok=True)
-        self.db.update_job(
+        await asyncio.to_thread(pose_root.mkdir, parents=True, exist_ok=True)
+        staging = await asyncio.to_thread(
+            confined_path, pose_root, f".galleryflow-tmp/{job_id}"
+        )
+        await asyncio.to_thread(staging.mkdir, parents=True, exist_ok=True)
+        summary = await asyncio.to_thread(
+            self.db.update_job,
             job_id,
             status="downloading",
             total=len(images),
@@ -608,7 +714,7 @@ class DownloadManager:
             destination=str(pose_root),
             error="",
         )
-        self._publish_job_id(job_id)
+        self._publish_job(summary)
 
         completed = 0
         failed = 0
@@ -616,86 +722,108 @@ class DownloadManager:
         progress_lock = asyncio.Lock()
         cached: dict[str, Path] = {}
         previous_items = {
-            item["image_url"]: item for item in self.db.list_job_items(job_id)
+            item["image_url"]: item
+            for item in await asyncio.to_thread(self.db.list_job_items, job_id)
         }
 
-        async def fetch_one(position: int, url: str) -> None:
+        async def fetch_one(position: int, url: str) -> bool:
             nonlocal completed, failed
+            if cancel_event.is_set():
+                return False
+
+            item_status = "completed"
+            item_error = ""
+            attempts: int | None = None
+            byte_count = 0
+            relative_path = ""
+            previous_path: Path | None = None
             async with self._image_semaphore:
-                if self.db.job_cancel_requested(job_id):
-                    return
+                if cancel_event.is_set():
+                    return False
                 try:
                     previous = previous_items.get(url) or {}
-                    previous_path: Path | None = None
                     if previous.get("status") == "completed" and previous.get(
                         "relative_path"
                     ):
-                        candidate = confined_path(
-                            pose_root, str(previous["relative_path"])
+                        candidate = await asyncio.to_thread(
+                            confined_path,
+                            pose_root,
+                            str(previous["relative_path"]),
                         )
-                        if candidate.is_file():
+                        if await asyncio.to_thread(candidate.is_file):
                             previous_path = candidate
+                            relative_path = str(previous["relative_path"])
+                            byte_count = int(previous.get("byte_count") or 0)
                     if previous_path is None:
-                        self.db.update_job_item(
-                            job_id, url, status="downloading", attempts=1, error=""
+                        attempts = 1
+                        await asyncio.to_thread(
+                            self.db.update_job_item,
+                            job_id,
+                            url,
+                            status="downloading",
+                            attempts=attempts,
+                            error="",
                         )
+                        if cancel_event.is_set():
+                            return False
                         previous_path = await self._download_image(
                             url, staging, position, referer=job["gallery_url"]
                         )
+                        if cancel_event.is_set():
+                            return False
                         relative_path = str(previous_path.relative_to(pose_root))
-                        self.db.update_job_item(
-                            job_id,
-                            url,
-                            status="completed",
-                            attempts=1,
-                            byte_count=previous_path.stat().st_size,
-                            relative_path=relative_path,
-                            error="",
-                        )
-                    cached[canonicalize_url(url)] = previous_path
-                    async with progress_lock:
-                        completed += 1
+                        file_stat = await asyncio.to_thread(previous_path.stat)
+                        byte_count = file_stat.st_size
                 except Exception as exc:
-                    self.db.update_job_item(
-                        job_id, url, status="failed", error=str(exc)[:500]
-                    )
-                    async with progress_lock:
-                        failed += 1
-                        errors.append(f"Image {position}: {exc}")
-                finally:
-                    async with progress_lock:
-                        self.db.update_job(
-                            job_id,
-                            completed=completed,
-                            failed=failed,
-                            error="; ".join(errors[-5:])[:1000],
-                        )
-                        self._publish_job_id(job_id)
+                    item_status = "failed"
+                    item_error = str(exc)[:500]
 
-        await asyncio.gather(
-            *(
-                asyncio.create_task(fetch_one(index, url))
-                for index, url in enumerate(ordered_urls, start=1)
-            )
+            if cancel_event.is_set():
+                return False
+            async with progress_lock:
+                if cancel_event.is_set():
+                    return False
+                completed_delta = int(item_status == "completed")
+                failed_delta = int(item_status == "failed")
+                if failed_delta:
+                    errors.append(f"Image {position}: {item_error}")
+                summary, committed = await asyncio.to_thread(
+                    self.db.record_job_item_result,
+                    job_id,
+                    url,
+                    status=item_status,
+                    completed_delta=completed_delta,
+                    failed_delta=failed_delta,
+                    item_error=item_error,
+                    job_error="; ".join(errors[-5:])[:1000],
+                    attempts=attempts,
+                    byte_count=byte_count,
+                    relative_path=relative_path,
+                )
+                if not committed:
+                    cancel_event.set()
+                    self._publish_job(summary)
+                    return False
+                completed += completed_delta
+                failed += failed_delta
+                if previous_path is not None:
+                    cached[canonicalize_url(url)] = previous_path
+                self._publish_job(summary)
+            return True
+
+        await self._run_bounded_image_work(
+            list(enumerate(ordered_urls, start=1)),
+            fetch_one,
         )
 
-        if self.db.job_cancel_requested(job_id):
+        if cancel_event.is_set():
             status = "canceled"
         elif failed:
             status = "failed"
         else:
-            last_cancel_poll = 0.0
-            cancellation_seen = False
 
             def should_cancel_materialization() -> bool:
-                nonlocal last_cancel_poll, cancellation_seen
-                if self._stopping or cancellation_seen:
-                    return True
-                now = time.monotonic()
-                if now - last_cancel_poll >= 0.2:
-                    last_cancel_poll = now
-                    cancellation_seen = self.db.job_cancel_requested(job_id)
-                return cancellation_seen
+                return self._stopping or cancel_event.is_set()
 
             try:
                 await asyncio.to_thread(
@@ -707,23 +835,21 @@ class DownloadManager:
                     cached,
                     should_cancel_materialization,
                 )
-                status = (
-                    "canceled" if self.db.job_cancel_requested(job_id) else "completed"
-                )
+                status = "canceled" if cancel_event.is_set() else "completed"
             except PoseExportCanceled:
                 status = "canceled"
             except Exception as exc:
                 status = "failed"
                 errors.append(str(exc))
-        self.db.update_job(
+        summary = await asyncio.to_thread(
+            self.db.finish_job,
             job_id,
-            status=status,
-            error="; ".join(errors[-5:])[:1000],
+            status,
+            "; ".join(errors[-5:])[:1000],
         )
-        self._publish_job_id(job_id)
+        self._publish_job(summary)
         await asyncio.to_thread(shutil.rmtree, staging, ignore_errors=True)
-        for url in ordered_urls:
-            self.db.update_job_item(job_id, url, relative_path="")
+        await asyncio.to_thread(self.db.clear_job_item_paths, job_id)
 
     def _materialize_pose_pairs(
         self,
@@ -906,7 +1032,6 @@ class DownloadManager:
     async def _download_image(
         self, url: str, destination: Path, position: int, *, referer: str
     ) -> Path:
-        current = await asyncio.to_thread(validate_public_media_url, url)
         headers = {
             "User-Agent": self.config.user_agent,
             "Accept": "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8,*/*;q=0.5",
@@ -962,29 +1087,35 @@ class DownloadManager:
                                 extension = (
                                     mimetypes.guess_extension(content_type) or ".jpg"
                                 )
-                        final_path = confined_path(
-                            destination, f"{position:04d}{extension}"
+                        final_path = await asyncio.to_thread(
+                            confined_path,
+                            destination,
+                            f"{position:04d}{extension}",
                         )
-                        part_path = confined_path(
-                            destination, f".{position:04d}{extension}.part"
+                        part_path = await asyncio.to_thread(
+                            confined_path,
+                            destination,
+                            f".{position:04d}{extension}.part",
                         )
                         total = 0
                         try:
-                            with part_path.open("wb") as output:
-                                async for chunk in response.aiter_bytes(256 * 1024):
+                            output = await asyncio.to_thread(part_path.open, "wb")
+                            try:
+                                async for chunk in response.aiter_bytes(1024 * 1024):
                                     total += len(chunk)
                                     if total > self.config.max_image_bytes:
                                         raise RuntimeError(
                                             "Image exceeds configured size limit"
                                         )
-                                    output.write(chunk)
+                                    await asyncio.to_thread(output.write, chunk)
+                            finally:
+                                await asyncio.to_thread(output.close)
                             if total == 0:
                                 raise RuntimeError("Image response was empty")
                             await asyncio.to_thread(self._verify_image, part_path)
-                            os.replace(part_path, final_path)
+                            await asyncio.to_thread(os.replace, part_path, final_path)
                         finally:
-                            if part_path.exists():
-                                part_path.unlink()
+                            await asyncio.to_thread(part_path.unlink, missing_ok=True)
                         return final_path
                 raise RuntimeError("Too many image redirects")
             except (httpx.TransportError, httpx.HTTPStatusError) as exc:

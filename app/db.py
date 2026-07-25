@@ -91,9 +91,7 @@ class Database:
         initializers = (self._initialize_once, *additional_initializers)
         for retry, delay in enumerate((*DATABASE_INITIALIZE_RETRY_DELAYS, None)):
             try:
-                self._startup_connection_timeout = (
-                    DATABASE_STARTUP_CONNECTION_TIMEOUT
-                )
+                self._startup_connection_timeout = DATABASE_STARTUP_CONNECTION_TIMEOUT
                 try:
                     for initializer in initializers:
                         initializer()
@@ -663,6 +661,92 @@ class Database:
                 ),
             )
 
+    def record_job_item_result(
+        self,
+        job_id: str,
+        image_url: str,
+        *,
+        status: str,
+        completed_delta: int = 0,
+        failed_delta: int = 0,
+        item_error: str = "",
+        job_error: str = "",
+        attempts: int | None = None,
+        byte_count: int = 0,
+        relative_path: str = "",
+        profile: str | None = None,
+        gallery_url: str | None = None,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """Persist one transfer result and its job progress atomically."""
+
+        if status not in {"completed", "failed", "skipped"}:
+            raise ValueError("Invalid terminal job item status")
+        if completed_delta < 0 or failed_delta < 0:
+            raise ValueError("Job progress increments cannot be negative")
+        if profile is not None and (status != "completed" or not gallery_url):
+            raise ValueError(
+                "Completed profile images require a gallery URL and completed status"
+            )
+
+        item_values: dict[str, Any] = {
+            "status": status,
+            "byte_count": byte_count,
+            "relative_path": relative_path,
+            "error": item_error,
+        }
+        if attempts is not None:
+            item_values["attempts"] = attempts
+        item_columns = ", ".join(f"{key} = ?" for key in item_values)
+        now = utc_now()
+        with self._lock, self.connect() as db:
+            progress = db.execute(
+                """UPDATE jobs
+                   SET completed = completed + ?, failed = failed + ?,
+                       error = ?, updated_at = ?
+                   WHERE id = ? AND cancel_requested = 0""",
+                (completed_delta, failed_delta, job_error, now, job_id),
+            )
+            if progress.rowcount != 1:
+                row = self._job_summary_row(db, job_id)
+                summary = self._decode_job_summary(dict(row)) if row else None
+                return summary, False
+
+            updated = db.execute(
+                f"UPDATE job_items SET {item_columns} "
+                "WHERE job_id = ? AND image_url = ?",
+                [*item_values.values(), job_id, image_url],
+            )
+            if updated.rowcount != 1:
+                raise ValueError("Download job item not found")
+
+            if profile is not None:
+                assert gallery_url is not None
+                key = gallery_key(gallery_url)
+                db.execute(
+                    """INSERT INTO profile_images(
+                           profile, gallery_key, gallery_url, image_url, relative_path,
+                           byte_count, downloaded_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(profile, gallery_key, image_url) DO UPDATE SET
+                           gallery_url = excluded.gallery_url,
+                           relative_path = excluded.relative_path,
+                           byte_count = excluded.byte_count,
+                           downloaded_at = excluded.downloaded_at""",
+                    (
+                        profile,
+                        key,
+                        gallery_url,
+                        image_url,
+                        relative_path,
+                        byte_count,
+                        now,
+                    ),
+                )
+
+            row = self._job_summary_row(db, job_id)
+        summary = self._decode_job_summary(dict(row)) if row else None
+        return summary, True
+
     def create_job_items(self, job_id: str, images: list[dict[str, Any]]) -> None:
         with self._lock, self.connect() as db:
             for index, image in enumerate(images, start=1):
@@ -734,7 +818,7 @@ class Database:
                 ),
             )
 
-    def update_job(self, job_id: str, **values: Any) -> None:
+    def update_job(self, job_id: str, **values: Any) -> dict[str, Any] | None:
         allowed = {
             "title",
             "status",
@@ -747,13 +831,42 @@ class Database:
         }
         values = {key: value for key, value in values.items() if key in allowed}
         if not values:
-            return
+            return self.get_job_summary(job_id)
         values["updated_at"] = utc_now()
         columns = ", ".join(f"{key} = ?" for key in values)
         with self._lock, self.connect() as db:
             db.execute(
                 f"UPDATE jobs SET {columns} WHERE id = ?", [*values.values(), job_id]
             )
+            row = self._job_summary_row(db, job_id)
+        return self._decode_job_summary(dict(row)) if row else None
+
+    def finish_job(
+        self, job_id: str, status: str, error: str = ""
+    ) -> dict[str, Any] | None:
+        """Publish a terminal state without racing a concurrent cancellation."""
+
+        terminal = {"completed", "completed_with_errors", "failed", "canceled"}
+        if status not in terminal:
+            raise ValueError("Invalid terminal job status")
+        now = utc_now()
+        with self._lock, self.connect() as db:
+            db.execute(
+                """UPDATE jobs
+                   SET status = CASE
+                           WHEN cancel_requested = 1 THEN 'canceled'
+                           ELSE ?
+                       END,
+                       error = CASE
+                           WHEN cancel_requested = 1 THEN ''
+                           ELSE ?
+                       END,
+                       updated_at = ?
+                   WHERE id = ?""",
+                (status, error, now, job_id),
+            )
+            row = self._job_summary_row(db, job_id)
+        return self._decode_job_summary(dict(row)) if row else None
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         with self._lock, self.connect() as db:
@@ -799,14 +912,25 @@ class Database:
 
     def get_job_summary(self, job_id: str) -> dict[str, Any] | None:
         with self._lock, self.connect() as db:
-            row = db.execute(
-                """SELECT id, gallery_url, title, profile, status, total, completed,
-                          failed, destination, error, cancel_requested, kind,
-                          pair_count, pose_revision, created_at, updated_at
-                   FROM jobs WHERE id = ?""",
-                (job_id,),
-            ).fetchone()
+            row = self._job_summary_row(db, job_id)
         return self._decode_job_summary(dict(row)) if row else None
+
+    @staticmethod
+    def _job_summary_row(db: sqlite3.Connection, job_id: str) -> sqlite3.Row | None:
+        return db.execute(
+            """SELECT id, gallery_url, title, profile, status, total, completed,
+                      failed, destination, error, cancel_requested, kind,
+                      pair_count, pose_revision, created_at, updated_at
+               FROM jobs WHERE id = ?""",
+            (job_id,),
+        ).fetchone()
+
+    def clear_job_item_paths(self, job_id: str) -> None:
+        with self._lock, self.connect() as db:
+            db.execute(
+                "UPDATE job_items SET relative_path = '' WHERE job_id = ?",
+                (job_id,),
+            )
 
     def list_job_summaries(
         self, limit: int = 100, kind: str | None = None

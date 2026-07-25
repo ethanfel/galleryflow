@@ -43,6 +43,7 @@ def build_visual_app(
     finder_tag: bool = False,
     finder_retry: bool = False,
     finder_modal_review: bool = False,
+    queue_events: bool = False,
     mobile: bool = False,
 ):
     finder_source_exhausted = finder_exhausted or finder_continue
@@ -126,7 +127,9 @@ def build_visual_app(
             "items": [dict(item) for item in galleries[start : start + 6]],
             "source_url": "https://www.pornpics.com/",
             "next_url": (
-                "https://www.pornpics.com/?offset=20&limit=20" if page == 1 else None
+                "https://www.pornpics.com/?offset=20&limit=20"
+                if page == 1 and not queue_events
+                else None
             ),
             "previous_url": "https://www.pornpics.com/" if page > 1 else None,
         }
@@ -1472,12 +1475,107 @@ def build_visual_app(
         )
         return {"items": jobs}
 
+    queue_job = {
+        "id": "visual-download",
+        "gallery_url": galleries[2]["url"],
+        "title": galleries[2]["title"],
+        "profile": "Default",
+        "status": "queued",
+        "total": 8,
+        "completed": 0,
+        "failed": 0,
+        "kind": "download",
+        "created_at": "2026-07-25T12:00:00+00:00",
+        "updated_at": "2026-07-25T12:00:00+00:00",
+    }
+    queue_event_state = {
+        "start": False,
+        "download_calls": 0,
+        "download_active": 0,
+        "download_peak": 0,
+        "download_delay": 0.0,
+    }
+
+    async def fake_queue_downloads(**kwargs: object) -> dict:
+        queue_event_state["download_calls"] += 1
+        queue_event_state["download_active"] += 1
+        queue_event_state["download_peak"] = max(
+            queue_event_state["download_peak"],
+            queue_event_state["download_active"],
+        )
+        snapshot = dict(queue_job)
+        try:
+            await asyncio.sleep(float(queue_event_state["download_delay"]))
+            return {"items": [snapshot]}
+        finally:
+            queue_event_state["download_active"] -= 1
+
+    async def fake_queue_event_start() -> dict:
+        queue_event_state["start"] = True
+        queue_job.update(
+            {
+                "status": "completed",
+                "completed": 8,
+                "updated_at": "2026-07-25T12:00:08+00:00",
+            }
+        )
+        return {"started": True}
+
+    async def fake_queue_reconcile_start() -> dict:
+        queue_event_state["download_calls"] = 0
+        queue_event_state["download_active"] = 0
+        queue_event_state["download_peak"] = 0
+        queue_event_state["download_delay"] = 0.25
+        return {"started": True}
+
+    async def fake_queue_event_state() -> dict:
+        return {
+            key: value
+            for key, value in queue_event_state.items()
+            if key != "start"
+        }
+
     async def fake_events(request=None) -> Response:
         return Response(status_code=204)
 
     async def fake_bootstrap() -> Response:
         session_id = json.dumps(sort_session["id"])
         script = f"localStorage.setItem('galleryflow:sort-session', JSON.stringify({session_id}));"
+        if queue_events:
+            script += """
+class ManualQueueEventSource extends EventTarget {
+  constructor() {
+    super();
+    window.__manualQueueEventSource = this;
+    setTimeout(() => this.dispatchEvent(new Event('open')), 0);
+  }
+  close() {}
+}
+window.EventSource = ManualQueueEventSource;
+window.__emitManualQueueEvents = () => {
+  const source = window.__manualQueueEventSource;
+  for (let completed = 1; completed <= 8; completed += 1) {
+    setTimeout(() => {
+      const job = {
+        id: 'visual-download',
+        gallery_url: 'https://www.pornpics.com/galleries/sample-gallery-79186224/',
+        title: 'After-hours city gallery',
+        profile: 'Default',
+        status: completed === 8 ? 'completed' : 'downloading',
+        total: 8,
+        completed,
+        failed: 0,
+        kind: 'download',
+        created_at: '2026-07-25T12:00:00+00:00',
+        updated_at: `2026-07-25T12:00:${String(completed).padStart(2, '0')}+00:00`,
+      };
+      source.dispatchEvent(new MessageEvent('job', {
+        data: JSON.stringify({ type: 'job', job }),
+      }));
+    }, completed * 25);
+  }
+};
+"""
         if load_more:
             script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const button=document.querySelector('#page-next');if(button&&!button.hidden&&!button.disabled){button.click();clearInterval(poll)}},50)});"
         if open_gallery:
@@ -1551,6 +1649,133 @@ window.addEventListener('load', () => {
 """
         if open_pose:
             script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const modal=document.querySelector('#gallery-modal');const button=document.querySelector('[data-gallery-mode=pose]');const image=document.querySelector('.image-option:not(.skeleton-image)');if(modal?.open&&button&&image){button.click();clearInterval(poll)}},50)});"
+        if queue_events:
+            script += """
+window.addEventListener('load', () => {
+  let phase = 'waiting';
+  let firstCard = null;
+  let baselineCalls = -1;
+  let statePending = false;
+  let settledAt = 0;
+  const setPhase = value => {
+    phase = value;
+    document.documentElement.dataset.queueEventsPhase = value;
+  };
+  const fail = value => {
+    document.documentElement.dataset.queueEvents = 'fail';
+    setPhase(value);
+    clearInterval(poll);
+  };
+  const poll = setInterval(() => {
+    const cards = [...document.querySelectorAll('#gallery-grid .gallery-card')];
+    const row = document.querySelector(
+      '#job-list .job-row[data-job-id="visual-download"]'
+    );
+    const status = row?.querySelector('.job-state')?.textContent || '';
+    const progress = row?.querySelector('.job-progress-label')?.textContent || '';
+    document.documentElement.dataset.queueEventsDebug = [
+      phase,
+      cards.length,
+      Boolean(firstCard?.isConnected),
+      firstCard === cards[2],
+      status,
+      progress,
+      baselineCalls,
+    ].join('|');
+    if (
+      phase === 'waiting'
+      && cards.length === 6
+      && row
+      && status === 'queued'
+      && !statePending
+    ) {
+      firstCard = cards[2];
+      statePending = true;
+      fetch('/manual/queue-events/state')
+        .then(response => response.json())
+        .then(data => {
+          statePending = false;
+          baselineCalls = data.download_calls;
+          setPhase('events');
+          return fetch('/manual/queue-events/start', { method: 'POST' });
+        })
+        .then(response => {
+          if (!response.ok) throw new Error(`start HTTP ${response.status}`);
+          window.__emitManualQueueEvents();
+        })
+        .catch(() => fail('start-failed'));
+      return;
+    }
+    if (
+      phase === 'events'
+      && status === 'completed'
+      && progress === '8 / 8 images'
+      && !statePending
+    ) {
+      if (firstCard !== cards[2]) {
+        fail('gallery-rerendered');
+        return;
+      }
+      statePending = true;
+      fetch('/manual/queue-events/state')
+        .then(response => response.json())
+        .then(data => {
+          if (data.download_calls !== baselineCalls) {
+            fail(`event-refetched-${data.download_calls}`);
+            return null;
+          }
+          return fetch('/manual/queue-events/reconcile', { method: 'POST' });
+        })
+        .then(response => {
+          if (!response) return;
+          statePending = false;
+          if (!response.ok) {
+            fail(`reconcile-http-${response.status}`);
+            return;
+          }
+          const refresh = document.querySelector('#refresh-queue');
+          for (let index = 0; index < 6; index += 1) refresh?.click();
+          settledAt = Date.now();
+          setPhase('reconciling');
+        })
+        .catch(() => fail('event-state-failed'));
+      return;
+    }
+    if (
+      phase === 'reconciling'
+      && Date.now() - settledAt > 850
+      && !statePending
+    ) {
+      statePending = true;
+      fetch('/manual/queue-events/state')
+        .then(response => response.json())
+        .then(data => {
+          statePending = false;
+          const passed = (
+            data.download_calls === 2
+            && data.download_peak === 1
+            && firstCard === document.querySelectorAll(
+              '#gallery-grid .gallery-card'
+            )[2]
+          );
+          document.documentElement.dataset.queueEvents = passed
+            ? 'pass'
+            : 'fail';
+          setPhase(
+            passed
+              ? 'complete'
+              : `reconcile-${data.download_calls}-${data.download_peak}`
+          );
+          clearInterval(poll);
+        })
+        .catch(() => fail('reconcile-state-failed'));
+    }
+  }, 40);
+  setTimeout(() => {
+    if (!document.documentElement.dataset.queueEvents) fail('timeout');
+  }, 6000);
+});
+"""
         if open_finder and not finder_tag:
             script += "localStorage.setItem('galleryflow:finder-scan', JSON.stringify('visual-finder'));window.addEventListener('load',()=>{const poll=setInterval(()=>{const button=document.querySelector('.finder-overlay-toggle:not([hidden])');if(button){button.click();clearInterval(poll)}},50)});"
         if finder_retry:
@@ -3293,6 +3518,13 @@ window.addEventListener('load', () => {
         ):
             route.endpoint = fake_finder_modal_downloads
             route.dependant.call = fake_finder_modal_downloads
+        elif (
+            queue_events
+            and getattr(route, "path", None) == "/api/downloads"
+            and "GET" in getattr(route, "methods", set())
+        ):
+            route.endpoint = fake_queue_downloads
+            route.dependant.call = fake_queue_downloads
         elif open_finder and getattr(route, "path", None) == "/api/finder/status":
             route.endpoint = fake_finder_status
             route.dependant.call = fake_finder_status
@@ -3465,6 +3697,22 @@ window.addEventListener('load', () => {
             fake_finder_modal_prefetch_state,
             methods=["GET"],
         )
+    if queue_events:
+        app.add_api_route(
+            "/manual/queue-events/start",
+            fake_queue_event_start,
+            methods=["POST"],
+        )
+        app.add_api_route(
+            "/manual/queue-events/reconcile",
+            fake_queue_reconcile_start,
+            methods=["POST"],
+        )
+        app.add_api_route(
+            "/manual/queue-events/state",
+            fake_queue_event_state,
+            methods=["GET"],
+        )
     return app
 
 
@@ -3489,6 +3737,7 @@ def main() -> None:
     parser.add_argument("--finder-tag", action="store_true")
     parser.add_argument("--finder-retry", action="store_true")
     parser.add_argument("--finder-modal-review", action="store_true")
+    parser.add_argument("--queue-events", action="store_true")
     args = parser.parse_args()
     finder_mode = (
         args.finder
@@ -3506,7 +3755,9 @@ def main() -> None:
         or args.finder_modal_review
     )
     suffix = (
-        "finder-modal-review-mobile"
+        "queue-events"
+        if args.queue_events
+        else "finder-modal-review-mobile"
         if args.finder_modal_review and args.mobile
         else "finder-modal-review"
         if args.finder_modal_review
@@ -3604,6 +3855,7 @@ def main() -> None:
                     finder_tag=args.finder_tag,
                     finder_retry=args.finder_retry,
                     finder_modal_review=args.finder_modal_review,
+                    queue_events=args.queue_events,
                     mobile=args.mobile,
                 ),
                 host="127.0.0.1",
@@ -3636,7 +3888,7 @@ def main() -> None:
             "--disable-sync",
             "--force-prefers-reduced-motion",
             "--no-first-run",
-            f"--virtual-time-budget={80000 if args.finder_modal_review else 8500 if args.finder_tag or args.finder_switch_source else 7500 if args.finder_unusable_save or args.finder_continue or args.finder_pagination else 6500 if args.finder_direct_assign else 6000 if args.finder_retry else 4500 if args.finder_race or args.lightbox else 4000 if args.finder_pose_flow else 3000 if args.pose else 2000 if finder_mode else 1000}",
+            f"--virtual-time-budget={80000 if args.finder_modal_review else 8500 if args.finder_tag or args.finder_switch_source else 7500 if args.finder_unusable_save or args.finder_continue or args.finder_pagination else 7000 if args.queue_events else 6500 if args.finder_direct_assign else 6000 if args.finder_retry else 4500 if args.finder_race or args.lightbox else 4000 if args.finder_pose_flow else 3000 if args.pose else 2000 if finder_mode else 1000}",
             f"--user-data-dir={Path(directory) / 'chrome-profile'}",
             f"--window-size={viewport}",
             f"--screenshot={output}",
@@ -3653,6 +3905,7 @@ def main() -> None:
             or args.finder_tag
             or args.finder_retry
             or args.finder_modal_review
+            or args.queue_events
         ):
             command.insert(1, "--dump-dom")
         completed = subprocess.run(
@@ -3670,6 +3923,7 @@ def main() -> None:
                 or args.finder_tag
                 or args.finder_retry
                 or args.finder_modal_review
+                or args.queue_events
             ),
             text=(
                 args.lightbox
@@ -3682,6 +3936,7 @@ def main() -> None:
                 or args.finder_tag
                 or args.finder_retry
                 or args.finder_modal_review
+                or args.queue_events
             ),
         )
         if (
@@ -3694,6 +3949,21 @@ def main() -> None:
             raise AssertionError(
                 "closing the lightbox did not release its completed media Blob "
                 f"(debug={debug or 'none'})"
+            )
+        if (
+            args.queue_events
+            and 'data-queue-events="pass"' not in completed.stdout
+        ):
+            phase = completed.stdout.partition(
+                'data-queue-events-phase="'
+            )[2].partition('"')[0]
+            debug = completed.stdout.partition(
+                'data-queue-events-debug="'
+            )[2].partition('"')[0]
+            raise AssertionError(
+                "queue events refetched the full queue, rerendered gallery cards, "
+                "or allowed overlapping reconciliation requests "
+                f"(phase={phase or 'unknown'}, debug={debug or 'none'})"
             )
         if args.finder_race and 'data-finder-race="pass"' not in completed.stdout:
             raise AssertionError("stale Finder results overwrote the completed review")

@@ -61,9 +61,7 @@ def test_initialize_retries_a_transient_share_safe_lock(
             blocker.close()
 
     monkeypatch.setattr(db_module.sqlite3, "connect", immediate_connect)
-    monkeypatch.setattr(
-        db_module, "DATABASE_INITIALIZE_RETRY_DELAYS", (0.1, 0.2, 0.4)
-    )
+    monkeypatch.setattr(db_module, "DATABASE_INITIALIZE_RETRY_DELAYS", (0.1, 0.2, 0.4))
     monkeypatch.setattr(db_module.time, "sleep", release_after_second_retry)
 
     db.initialize()
@@ -94,9 +92,7 @@ def test_initialize_stops_after_bounded_share_safe_lock_retries(
         return real_connect(*args, **kwargs)
 
     monkeypatch.setattr(db_module.sqlite3, "connect", immediate_connect)
-    monkeypatch.setattr(
-        db_module, "DATABASE_INITIALIZE_RETRY_DELAYS", (0.1, 0.2, 0.4)
-    )
+    monkeypatch.setattr(db_module, "DATABASE_INITIALIZE_RETRY_DELAYS", (0.1, 0.2, 0.4))
     monkeypatch.setattr(db_module.time, "sleep", sleeps.append)
 
     try:
@@ -262,6 +258,130 @@ def test_per_image_partial_state(tmp_path: Path) -> None:
 
     db.add_history(GALLERY, "POV", "Sample", "POV/sample", 3)
     assert db.status_for_urls([GALLERY], "POV")[GALLERY]["state"] == "complete"
+
+
+def test_job_item_result_commits_image_and_progress_atomically(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    image_url = "https://cdni.pornpics.com/1280/x/1.jpg"
+    db.create_job(
+        {
+            "id": "atomic-result",
+            "gallery_url": GALLERY,
+            "profile": "POV",
+            "created_at": utc_now(),
+        }
+    )
+    db.create_job_items("atomic-result", [{"url": image_url, "ordinal": 1}])
+    db.update_job("atomic-result", status="downloading", total=1)
+
+    summary, committed = db.record_job_item_result(
+        "atomic-result",
+        image_url,
+        status="completed",
+        completed_delta=1,
+        byte_count=321,
+        relative_path="POV/sample/0001.jpg",
+        profile="POV",
+        gallery_url=GALLERY,
+    )
+
+    assert committed is True
+    assert summary and summary["completed"] == 1
+    assert summary["failed"] == 0
+    assert db.list_job_items("atomic-result")[0] == {
+        "job_id": "atomic-result",
+        "image_url": image_url,
+        "ordinal": 1,
+        "status": "completed",
+        "attempts": 0,
+        "byte_count": 321,
+        "relative_path": "POV/sample/0001.jpg",
+        "error": "",
+    }
+    assert db.image_statuses("POV", GALLERY) == {image_url}
+
+
+def test_job_item_result_rolls_back_all_progress_on_failure(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    image_url = "https://cdni.pornpics.com/1280/x/2.jpg"
+    db.create_job(
+        {
+            "id": "rollback-result",
+            "gallery_url": GALLERY,
+            "profile": "POV",
+            "created_at": utc_now(),
+        }
+    )
+    db.create_job_items("rollback-result", [{"url": image_url, "ordinal": 1}])
+    db.update_job("rollback-result", status="downloading", total=1)
+    with db.connect() as connection:
+        connection.executescript(
+            """
+            CREATE TRIGGER reject_profile_image
+            AFTER INSERT ON profile_images
+            BEGIN
+                SELECT RAISE(ABORT, 'test rollback');
+            END;
+            """
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="test rollback"):
+        db.record_job_item_result(
+            "rollback-result",
+            image_url,
+            status="completed",
+            completed_delta=1,
+            byte_count=321,
+            relative_path="POV/sample/0002.jpg",
+            profile="POV",
+            gallery_url=GALLERY,
+        )
+
+    assert db.get_job_summary("rollback-result")["completed"] == 0
+    assert db.list_job_items("rollback-result")[0]["status"] == "pending"
+    assert db.image_statuses("POV", GALLERY) == set()
+
+
+def test_job_result_does_not_commit_after_cancellation(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    image_url = "https://cdni.pornpics.com/1280/x/3.jpg"
+    db.create_job(
+        {
+            "id": "canceled-result",
+            "gallery_url": GALLERY,
+            "profile": "POV",
+            "created_at": utc_now(),
+        }
+    )
+    db.create_job_items("canceled-result", [{"url": image_url, "ordinal": 1}])
+    db.update_job(
+        "canceled-result",
+        status="canceling",
+        total=1,
+        cancel_requested=1,
+    )
+
+    summary, committed = db.record_job_item_result(
+        "canceled-result",
+        image_url,
+        status="completed",
+        completed_delta=1,
+        byte_count=321,
+        relative_path="POV/sample/0003.jpg",
+        profile="POV",
+        gallery_url=GALLERY,
+    )
+
+    assert committed is False
+    assert summary and summary["cancel_requested"] is True
+    assert summary["completed"] == 0
+    assert db.list_job_items("canceled-result")[0]["status"] == "pending"
+    assert db.image_statuses("POV", GALLERY) == set()
+    assert db.finish_job("canceled-result", "completed")["status"] == "canceled"
 
 
 def test_restart_requeues_work_but_finishes_interrupted_cancellation(

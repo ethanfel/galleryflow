@@ -91,6 +91,11 @@
     eventConnected: false,
     queueTimer: null,
     jobEventTimer: null,
+    jobLoadPromise: null,
+    jobLoadRequested: false,
+    jobLoadQuiet: true,
+    jobMutationVersion: 0,
+    jobMutations: new Map(),
     finderEventTimer: null,
     finderPollTimer: null,
     finderScanRequest: 0,
@@ -456,12 +461,12 @@
       state.eventConnected = false;
       scheduleJobPoll(5000);
     });
-    source.addEventListener('job', () => {
-      if (state.jobEventTimer !== null) return;
-      state.jobEventTimer = window.setTimeout(() => {
-        state.jobEventTimer = null;
-        loadJobs({ quiet: true });
-      }, 200);
+    source.addEventListener('job', event => {
+      try {
+        const change = JSON.parse(event.data || '{}');
+        if (applyJobEvent(change?.job)) return;
+      } catch (_) { /* malformed events fall back to reconciliation */ }
+      scheduleJobPoll(500);
     });
     source.addEventListener('gallery', event => {
       try {
@@ -1008,11 +1013,23 @@
   function observeMediaLoadDomRemovals() {
     if (!('MutationObserver' in window)) return;
     if (!state.mediaLoadDomObserver) {
-      state.mediaLoadDomObserver = new MutationObserver(() => {
-        state.mediaObjectUrlImages.forEach(image => {
-          if (!image.isConnected) revokeMediaElementObjectUrl(image);
+      state.mediaLoadDomObserver = new MutationObserver(records => {
+        const removedImages = new Set();
+        records.forEach(record => {
+          record.removedNodes.forEach(node => {
+            if (node.nodeType !== Node.ELEMENT_NODE) return;
+            if (node.matches?.('img')) removedImages.add(node);
+            node.querySelectorAll?.('img').forEach(image => removedImages.add(image));
+          });
         });
-        scheduleMediaLoadDrain();
+        let released = false;
+        removedImages.forEach(image => {
+          if (image.isConnected) return;
+          cancelMediaLoadForImage(image, { drain: false });
+          revokeMediaElementObjectUrl(image);
+          released = true;
+        });
+        if (released) scheduleMediaLoadDrain();
         maybeDisconnectMediaLoadDomObserver();
       });
     }
@@ -2353,16 +2370,133 @@
     }[job?.status] ?? 0;
   }
 
-  function upsertJob(item) {
+  function recordJobMutation(id, deleted = false) {
+    const key = String(id);
+    state.jobMutationVersion += 1;
+    state.jobMutations.set(key, {
+      version: state.jobMutationVersion,
+      deleted
+    });
+  }
+
+  function fresherJob(existing, incoming) {
+    if (!existing) return incoming;
+    const existingRank = jobProgressRank(existing);
+    const incomingRank = jobProgressRank(incoming);
+    if (
+      existingRank > incomingRank
+      || (
+        existingRank === incomingRank
+        && Number(existing.complete || 0) > Number(incoming.complete || 0)
+      )
+    ) {
+      return {
+        ...incoming,
+        ...existing,
+        poseRevision: existing.poseRevision ?? incoming.poseRevision
+      };
+    }
+    return incoming;
+  }
+
+  function upsertJob(item, { recordMutation = true } = {}) {
     if (!item) return null;
     const incoming = normalizeJob(item);
     if (incoming.id === undefined || incoming.id === null) return null;
-    const existing = state.jobs.find(job => String(job.id) === String(incoming.id));
-    const job = existing && jobProgressRank(existing) > jobProgressRank(incoming)
-      ? { ...incoming, ...existing, poseRevision: existing.poseRevision ?? incoming.poseRevision }
-      : incoming;
-    state.jobs = [job, ...state.jobs.filter(candidate => String(candidate.id) !== String(job.id))];
+    const key = String(incoming.id);
+    const index = state.jobs.findIndex(job => String(job.id) === key);
+    const existing = index >= 0 ? state.jobs[index] : null;
+    const job = fresherJob(existing, incoming);
+    if (index >= 0) {
+      state.jobs = state.jobs.map((candidate, candidateIndex) => (
+        candidateIndex === index ? job : candidate
+      ));
+    } else {
+      state.jobs = [job, ...state.jobs];
+    }
+    if (recordMutation) recordJobMutation(key);
     return job;
+  }
+
+  function jobMatchesGallery(job, gallery) {
+    if (!job || !gallery) return false;
+    return (
+      (
+        job.galleryId !== undefined
+        && job.galleryId !== null
+        && String(job.galleryId) === String(gallery.id)
+      )
+      || (
+        job.galleryUrl
+        && normalizeHistoryUrl(job.galleryUrl) === normalizeHistoryUrl(gallery.url)
+      )
+    );
+  }
+
+  function patchGalleryCardStatus(gallery) {
+    const status = galleryStatus(gallery);
+    $$('.gallery-card', $('#gallery-grid')).forEach(card => {
+      if (String(card.dataset.galleryId) !== String(gallery.id)) return;
+      card.classList.toggle('is-queued', gallery.queued);
+      const statusNode = $('.card-status', card);
+      if (!statusNode) return;
+      statusNode.textContent = status.label;
+      statusNode.className = `card-status ${status.className}`;
+    });
+  }
+
+  function syncGalleryQueuedState(gallery) {
+    const queued = state.jobs.some(job => (
+      !isTerminalJob(job) && jobMatchesGallery(job, gallery)
+    ));
+    if (gallery.queued === queued) return false;
+    gallery.queued = queued;
+    patchGalleryCardStatus(gallery);
+    return true;
+  }
+
+  function syncGalleryQueuedStates(jobs = null) {
+    const affected = Array.isArray(jobs) && jobs.length
+      ? state.galleries.filter(gallery => jobs.some(job => jobMatchesGallery(job, gallery)))
+      : state.galleries;
+    affected.forEach(syncGalleryQueuedState);
+  }
+
+  function invalidateJobGalleryDetail(job) {
+    if (!job) return;
+    if (job.galleryId !== undefined && job.galleryId !== null) {
+      invalidateGalleryDetailCache(job.galleryId);
+      return;
+    }
+    const listItem = state.galleries.find(gallery => jobMatchesGallery(job, gallery));
+    if (listItem) invalidateGalleryDetailCache(listItem.id);
+    else if (job.galleryUrl) invalidateGalleryDetailByUrl(job.galleryUrl);
+  }
+
+  function scheduleJobEventRender() {
+    if (state.jobEventTimer !== null) return;
+    state.jobEventTimer = window.setTimeout(() => {
+      state.jobEventTimer = null;
+      renderJobs();
+      renderOpenPoseExportState();
+    }, 80);
+  }
+
+  function applyJobEvent(item) {
+    if (!item || item.id === undefined || item.id === null) return false;
+    const key = String(item.id);
+    const previous = state.jobs.find(job => String(job.id) === key) || null;
+    let current = null;
+    if (item.deleted) {
+      state.jobs = state.jobs.filter(job => String(job.id) !== key);
+      recordJobMutation(key, true);
+    } else {
+      current = upsertJob(item);
+    }
+    invalidateJobGalleryDetail(current || previous || item);
+    syncGalleryQueuedStates([previous, current || item].filter(Boolean));
+    scheduleJobEventRender();
+    return true;
   }
 
   function renderOpenPoseExportState() {
@@ -3337,43 +3471,92 @@
     }
   }
 
-  async function loadJobs({ quiet = false } = {}) {
+  function reconcileJobs(items, requestMutationVersion) {
+    const previousJobs = state.jobs;
+    const previousById = new Map(
+      previousJobs.map(job => [String(job.id), job])
+    );
+    const reconciled = [];
+    const seen = new Set();
+    apiItems(items, 'downloads').map(normalizeJob).forEach(incoming => {
+      if (incoming.id === undefined || incoming.id === null) return;
+      const key = String(incoming.id);
+      if (seen.has(key)) return;
+      seen.add(key);
+      const mutation = state.jobMutations.get(key);
+      if (mutation && mutation.version > requestMutationVersion) {
+        if (!mutation.deleted && previousById.has(key)) {
+          reconciled.push(previousById.get(key));
+        }
+        return;
+      }
+      reconciled.push(incoming);
+    });
+    previousJobs.forEach(job => {
+      const key = String(job.id);
+      if (seen.has(key)) return;
+      const mutation = state.jobMutations.get(key);
+      if (
+        mutation
+        && mutation.version > requestMutationVersion
+        && !mutation.deleted
+      ) {
+        reconciled.push(job);
+      }
+    });
+    state.jobs = reconciled;
+    state.jobMutations.clear();
+    return previousJobs;
+  }
+
+  async function loadJobsOnce({ quiet = false } = {}) {
+    const requestMutationVersion = state.jobMutationVersion;
     try {
       const data = await api('/api/downloads');
-      const previousJobs = new Map(state.jobs.map(job => [String(job.id), job]));
-      const nextJobs = apiItems(data, 'downloads').map(normalizeJob);
-      nextJobs.forEach(job => {
-        const previous = previousJobs.get(String(job.id));
+      const previousJobs = reconcileJobs(data, requestMutationVersion);
+      const previousById = new Map(
+        previousJobs.map(job => [String(job.id), job])
+      );
+      state.jobs.forEach(job => {
+        const previous = previousById.get(String(job.id));
         if (
           previous
           && previous.status === job.status
           && previous.complete === job.complete
         ) return;
-        if (job.galleryId !== undefined && job.galleryId !== null) {
-          invalidateGalleryDetailCache(job.galleryId);
-          return;
+        invalidateJobGalleryDetail(job);
+      });
+      previousJobs.forEach(job => {
+        if (!state.jobs.some(candidate => String(candidate.id) === String(job.id))) {
+          invalidateJobGalleryDetail(job);
         }
-        const listItem = state.galleries.find(gallery => (
-          job.galleryUrl
-          && normalizeHistoryUrl(gallery.url) === normalizeHistoryUrl(job.galleryUrl)
-        ));
-        if (listItem) invalidateGalleryDetailCache(listItem.id);
       });
-      state.jobs = nextJobs;
-      state.galleries.forEach(gallery => {
-        gallery.queued = state.jobs.some(job => !isTerminalJob(job) && (
-          String(job.galleryId) === String(gallery.id) ||
-          (job.galleryUrl && normalizeHistoryUrl(job.galleryUrl) === normalizeHistoryUrl(gallery.url))
-        ));
-      });
+      syncGalleryQueuedStates();
       renderJobs();
-      renderGalleries();
       renderOpenPoseExportState();
       scheduleJobPoll();
     } catch (error) {
       if (!quiet) toast('Could not load queue', errorMessage(error), 'error');
       scheduleJobPoll(8000);
     }
+  }
+
+  function loadJobs({ quiet = false } = {}) {
+    state.jobLoadRequested = true;
+    if (!quiet) state.jobLoadQuiet = false;
+    if (state.jobLoadPromise) return state.jobLoadPromise;
+    const drainRequests = async () => {
+      while (state.jobLoadRequested) {
+        const requestQuiet = state.jobLoadQuiet;
+        state.jobLoadRequested = false;
+        state.jobLoadQuiet = true;
+        await loadJobsOnce({ quiet: requestQuiet });
+      }
+    };
+    state.jobLoadPromise = drainRequests().finally(() => {
+      state.jobLoadPromise = null;
+    });
+    return state.jobLoadPromise;
   }
 
   function scheduleJobPoll(delay = null) {
