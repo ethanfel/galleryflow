@@ -1,25 +1,34 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 import threading
+import time
 import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from .security import gallery_key
 
 
 POSE_ROLES = ("solo", "couple", "group")
+DATABASE_INITIALIZE_RETRY_DELAYS = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 15.0)
+DATABASE_STARTUP_CONNECTION_TIMEOUT = 1.0
+logger = logging.getLogger(__name__)
 
 
 class PoseRevisionConflict(RuntimeError):
     def __init__(self, current: dict[str, Any]):
         super().__init__("The pose draft was changed in another browser")
         self.current = current
+
+
+class DatabaseStartupLockedError(RuntimeError):
+    pass
 
 
 def pose_slug(label: str) -> str:
@@ -32,35 +41,110 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def is_sqlite_lock_error(error: sqlite3.OperationalError) -> bool:
+    error_code = getattr(error, "sqlite_errorcode", None)
+    if isinstance(error_code, int):
+        base_code = error_code & 0xFF
+        if base_code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+            return True
+    message = str(error).casefold()
+    return any(
+        phrase in message
+        for phrase in (
+            "database is locked",
+            "database table is locked",
+            "database schema is locked",
+        )
+    )
+
+
 class Database:
     def __init__(self, path: Path, vfs: str | None = None):
         self.path = path
         self.vfs = vfs
         self._lock = threading.RLock()
+        self._startup_connection_timeout: float | None = None
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
+        timeout = (
+            self._startup_connection_timeout
+            if self._startup_connection_timeout is not None
+            else 30.0
+        )
         if self.vfs:
             connection = sqlite3.connect(
-                f"file:{self.path.resolve()}?vfs={self.vfs}", uri=True, timeout=30
+                f"file:{self.path.resolve()}?vfs={self.vfs}", uri=True, timeout=timeout
             )
         else:
-            connection = sqlite3.connect(self.path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
+            connection = sqlite3.connect(self.path, timeout=timeout)
         try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA synchronous = NORMAL")
             yield connection
             connection.commit()
         finally:
             connection.close()
 
-    def initialize(self) -> None:
+    def initialize(self, *additional_initializers: Callable[[], None]) -> None:
+        initializers = (self._initialize_once, *additional_initializers)
+        for retry, delay in enumerate((*DATABASE_INITIALIZE_RETRY_DELAYS, None)):
+            try:
+                self._startup_connection_timeout = (
+                    DATABASE_STARTUP_CONNECTION_TIMEOUT
+                )
+                try:
+                    for initializer in initializers:
+                        initializer()
+                finally:
+                    self._startup_connection_timeout = None
+                return
+            except sqlite3.OperationalError as exc:
+                if not is_sqlite_lock_error(exc):
+                    raise
+                if delay is None:
+                    lock_hint = (
+                        f" If every instance is stopped, remove only the stale "
+                        f"lock directory {self.path}.lock; never delete the "
+                        "SQLite database."
+                        if self.vfs == "unix-dotfile"
+                        else ""
+                    )
+                    raise DatabaseStartupLockedError(
+                        f"SQLite database remained locked during startup: "
+                        f"{self.path}. Stop every GalleryFlow container and "
+                        f"SQLite tool that uses this database.{lock_hint}"
+                    ) from exc
+                logger.warning(
+                    "SQLite database is locked during startup; retrying in %.2fs "
+                    "(attempt %d/%d). Ensure only one GalleryFlow container uses %s.",
+                    delay,
+                    retry + 1,
+                    len(DATABASE_INITIALIZE_RETRY_DELAYS) + 1,
+                    self.path,
+                )
+                time.sleep(delay)
+
+    def _initialize_once(self) -> None:
         with self._lock, self.connect() as db:
             # Dot-file locks work on Unraid/NFS/FUSE mounts where POSIX byte-range
             # locks can fail. WAL remains available by setting SQLITE_VFS empty
             # on a local filesystem.
-            db.execute(f"PRAGMA journal_mode = {'DELETE' if self.vfs else 'WAL'}")
-            db.execute("PRAGMA synchronous = NORMAL")
+            desired_journal_mode = "delete" if self.vfs else "wal"
+            current_journal_mode = str(
+                db.execute("PRAGMA journal_mode").fetchone()[0]
+            ).casefold()
+            if current_journal_mode != desired_journal_mode:
+                applied_journal_mode = str(
+                    db.execute(
+                        f"PRAGMA journal_mode = {desired_journal_mode.upper()}"
+                    ).fetchone()[0]
+                ).casefold()
+                if applied_journal_mode != desired_journal_mode:
+                    raise sqlite3.OperationalError(
+                        f"could not set SQLite journal mode to {desired_journal_mode}"
+                    )
             db.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS profiles (

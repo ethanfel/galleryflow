@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
-from app.db import Database, utc_now
+import pytest
+
+import app.db as db_module
+from app.db import Database, DatabaseStartupLockedError, utc_now
 
 
 GALLERY = "https://www.pornpics.com/galleries/sample-gallery-79186222/"
@@ -20,6 +24,212 @@ def test_share_safe_sqlite_vfs_initializes(tmp_path: Path) -> None:
     db = Database(tmp_path / "share-safe.sqlite3", vfs="unix-dotfile")
     db.initialize()
     assert db.get_profile("Default")["directory"] == "Default"
+    with db.connect() as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+
+
+def test_local_sqlite_uses_wal(tmp_path: Path) -> None:
+    db = Database(tmp_path / "local.sqlite3")
+    db.initialize()
+    with db.connect() as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+
+def test_initialize_retries_a_transient_share_safe_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "transient-lock.sqlite3"
+    db = Database(path, vfs="unix-dotfile")
+    db.initialize()
+    real_connect = sqlite3.connect
+    blocker = real_connect(
+        f"file:{path.resolve()}?vfs=unix-dotfile", uri=True, timeout=0
+    )
+    blocker.execute("BEGIN EXCLUSIVE")
+    sleeps: list[float] = []
+    timeouts: list[float] = []
+
+    def immediate_connect(*args, **kwargs):
+        timeouts.append(float(kwargs["timeout"]))
+        kwargs["timeout"] = 0
+        return real_connect(*args, **kwargs)
+
+    def release_after_second_retry(delay: float) -> None:
+        sleeps.append(delay)
+        if len(sleeps) == 2:
+            blocker.rollback()
+            blocker.close()
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", immediate_connect)
+    monkeypatch.setattr(
+        db_module, "DATABASE_INITIALIZE_RETRY_DELAYS", (0.1, 0.2, 0.4)
+    )
+    monkeypatch.setattr(db_module.time, "sleep", release_after_second_retry)
+
+    db.initialize()
+
+    assert sleeps == [0.1, 0.2]
+    assert timeouts[:3] == [db_module.DATABASE_STARTUP_CONNECTION_TIMEOUT] * 3
+    assert db.get_profile("Default")["directory"] == "Default"
+    assert timeouts[-1] == 30.0
+
+
+def test_initialize_stops_after_bounded_share_safe_lock_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "persistent-lock.sqlite3"
+    db = Database(path, vfs="unix-dotfile")
+    db.initialize()
+    real_connect = sqlite3.connect
+    blocker = real_connect(
+        f"file:{path.resolve()}?vfs=unix-dotfile", uri=True, timeout=0
+    )
+    blocker.execute("BEGIN EXCLUSIVE")
+    sleeps: list[float] = []
+    timeouts: list[float] = []
+
+    def immediate_connect(*args, **kwargs):
+        timeouts.append(float(kwargs["timeout"]))
+        kwargs["timeout"] = 0
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", immediate_connect)
+    monkeypatch.setattr(
+        db_module, "DATABASE_INITIALIZE_RETRY_DELAYS", (0.1, 0.2, 0.4)
+    )
+    monkeypatch.setattr(db_module.time, "sleep", sleeps.append)
+
+    try:
+        with pytest.raises(
+            DatabaseStartupLockedError,
+            match=r"Stop every GalleryFlow container.*persistent-lock.sqlite3.lock",
+        ) as raised:
+            db.initialize()
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    assert sleeps == [0.1, 0.2, 0.4]
+    assert timeouts == [db_module.DATABASE_STARTUP_CONNECTION_TIMEOUT] * 4
+    assert isinstance(raised.value.__cause__, sqlite3.OperationalError)
+
+
+def test_initialize_never_removes_an_orphaned_dotfile_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "orphaned.sqlite3"
+    db = Database(path, vfs="unix-dotfile")
+    db.initialize()
+    lock_directory = Path(f"{path}.lock")
+    lock_directory.mkdir()
+
+    monkeypatch.setattr(db_module, "DATABASE_INITIALIZE_RETRY_DELAYS", ())
+    monkeypatch.setattr(db_module, "DATABASE_STARTUP_CONNECTION_TIMEOUT", 0)
+
+    with pytest.raises(DatabaseStartupLockedError, match="orphaned.sqlite3.lock"):
+        db.initialize()
+
+    assert lock_directory.is_dir()
+
+
+def test_initialize_retries_the_complete_startup_schema_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "startup-group.sqlite3")
+    calls = 0
+    sleeps: list[float] = []
+
+    def initialize_additional_schema() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("database is locked")
+        with db.connect() as connection:
+            connection.execute("CREATE TABLE extra_startup_schema(id INTEGER)")
+
+    monkeypatch.setattr(db_module, "DATABASE_INITIALIZE_RETRY_DELAYS", (0.1,))
+    monkeypatch.setattr(db_module.time, "sleep", sleeps.append)
+
+    db.initialize(initialize_additional_schema)
+
+    assert calls == 2
+    assert sleeps == [0.1]
+    with db.connect() as connection:
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'extra_startup_schema'"
+        ).fetchone()
+
+
+def test_initialize_does_not_reassign_an_existing_journal_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "journal-mode.sqlite3"
+    db = Database(path)
+    real_connect = sqlite3.connect
+    statements: list[str] = []
+
+    def traced_connect(*args, **kwargs):
+        connection = real_connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", traced_connect)
+
+    db.initialize()
+    db.initialize()
+
+    assignments = [
+        statement
+        for statement in statements
+        if statement.casefold().startswith("pragma journal_mode =")
+    ]
+    assert len(assignments) == 1
+
+
+def test_initialize_does_not_retry_non_lock_operational_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "non-lock.sqlite3")
+    sleeps: list[float] = []
+
+    def fail_once() -> None:
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(db, "_initialize_once", fail_once)
+    monkeypatch.setattr(db_module.time, "sleep", sleeps.append)
+
+    with pytest.raises(sqlite3.OperationalError, match="unable to open"):
+        db.initialize()
+
+    assert sleeps == []
+
+
+def test_connect_closes_when_connection_setup_is_locked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class LockedSetupConnection:
+        row_factory = None
+        closed = False
+
+        def execute(self, statement: str):
+            if statement == "PRAGMA synchronous = NORMAL":
+                raise sqlite3.OperationalError("database is locked")
+            return None
+
+        def close(self) -> None:
+            self.closed = True
+
+    connection = LockedSetupConnection()
+    monkeypatch.setattr(
+        db_module.sqlite3, "connect", lambda *args, **kwargs: connection
+    )
+    db = Database(tmp_path / "setup-lock.sqlite3")
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        with db.connect():
+            pass
+
+    assert connection.closed is True
 
 
 def test_saved_is_per_profile_but_ignore_is_global(tmp_path: Path) -> None:

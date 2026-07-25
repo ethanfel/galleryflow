@@ -91,7 +91,7 @@ docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
 
 `auto` prefers CUDA for DINOv2, RTMO-L, and JoyTag and falls back to CPU if CUDA cannot initialize. Use `cuda` when a missing GPU should be treated as an error, or `cpu` to force CPU inference.
 
-State and downloads are stored in the Docker-managed `galleryflow-data` volume. To place the library directly on another disk, replace that volume with a bind mount such as `/path/to/library:/data` and make the host directory writable by container UID/GID `10001:10001`.
+State, models, and default downloads are stored in the Docker-managed `galleryflow-data` volume. Keep `/data` on a local Docker volume or local cache-backed path whenever possible. Mount a large or shared image library separately at `/library`, then point the download, sorter, or pose roots there; this keeps SQLite away from Unraid user shares, NFS, and FUSE while the bulk images remain on the desired disk.
 
 An existing sort library can instead be mounted separately:
 
@@ -278,6 +278,10 @@ Environment variables:
 | `PORNPIC_WEBUI_SQLITE_VFS` | `unix-dotfile` on Linux | SQLite locking mode; set `default` for local-disk WAL |
 
 Concurrency and theme can also be adjusted in the WebUI. A changed gallery-worker count takes effect after restart; image concurrency and request timeout apply immediately.
+
+Only one GalleryFlow container may use a given `/data` database. On Linux, the default share-safe `unix-dotfile` mode creates `/data/pornpic_webui.sqlite3.lock/`. A killed container or interrupted host move can leave that lock directory behind. If startup reports that the database is locked, stop every GalleryFlow container and SQLite tool using the database first. Only after all of them are stopped, remove the stale **lock directory** with `rmdir`; never remove `pornpic_webui.sqlite3`. Startup automatically retries brief container-replacement overlap for roughly 30–40 seconds and reports the exact lock path if it remains blocked.
+
+`PORNPIC_WEBUI_SQLITE_VFS=default` enables WAL and is preferable when `/data` is guaranteed to be on a local filesystem such as a Docker-managed volume or local XFS/ext4 cache. Stop every instance before changing VFS, and use the same setting consistently for every process that opens the database. Default Unix and `unix-dotfile` locking must not be mixed concurrently.
 
 ## Data layout
 

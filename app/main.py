@@ -73,9 +73,7 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
     async def lifespan(application: FastAPI):
         nonlocal media_client
         app_config.ensure_directories()
-        database.initialize()
-        sorter.ensure_schema()
-        finder.ensure_schema()
+        database.initialize(sorter.ensure_schema, finder.ensure_schema)
         stored = database.settings()
         request_timeout = stored.get("request_timeout")
         image_workers = stored.get("image_workers")
