@@ -602,7 +602,7 @@
           <div class="summary-cover" id="summary-cover"><div class="image-placeholder"><svg><use href="#i-image"></use></svg></div></div>
           <div class="summary-meta">
             <div class="summary-status" id="summary-status"></div>
-            <dl><div><dt>Images</dt><dd id="summary-image-count">—</dd></div><div><dt>Source</dt><dd id="summary-source">—</dd></div><div><dt>Profile</dt><dd id="summary-profile">Not saved</dd></div></dl>
+            <dl><div><dt>Images</dt><dd id="summary-image-count">—</dd></div><div><dt>Source</dt><dd id="summary-source">—</dd></div><div><dt>Profile</dt><dd id="summary-profile">Not saved</dd></div><div id="summary-pose-outputs-row" hidden><dt>Pose exports</dt><dd id="summary-pose-outputs">—</dd></div></dl>
           </div>
           <button class="button button-quiet button-full" id="modal-ignore" type="button"><svg><use href="#i-eye-off"></use></svg><span>Ignore gallery</span></button>
         </aside>
@@ -623,6 +623,7 @@
               <div><span class="modal-kicker">Dataset preparation</span><h4 id="pose-toolbar-title">Assign checked images</h4></div>
               <span class="pose-save-status" id="pose-save-status" role="status">Draft not loaded</span>
             </div>
+            <div class="pose-export-history" id="pose-export-history" hidden><svg><use href="#i-check"></use></svg><span>Already exported from this gallery</span><strong></strong></div>
             <div class="pose-role-switch" role="group" aria-label="Assignment type">
               <button class="is-active" type="button" data-pose-assignment="target" aria-pressed="true" title="Apply the checked images as targets when the pose and control are ready"><b>T</b><span>Apply targets</span></button>
               <button type="button" data-pose-assignment="solo" aria-pressed="false" title="Set the one checked image as the solo control"><b>C</b><span>Set solo</span></button>
@@ -630,7 +631,7 @@
               <button type="button" data-pose-assignment="group" aria-pressed="false" title="Set the one checked image as the group control"><b>C</b><span>Set group</span></button>
             </div>
             <div class="pose-target-fields" id="pose-target-fields">
-              <label><span>Pose</span><input id="pose-tag-input" type="text" list="pose-tag-options" maxlength="80" placeholder="Search or create a pose…" autocomplete="off"></label>
+              <label class="pose-tag-field"><span>Pose</span><span class="pose-tag-combobox"><input id="pose-tag-input" type="text" maxlength="80" placeholder="Search or create a pose…" autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="pose-tag-suggestions" aria-expanded="false"><button class="pose-tag-toggle" type="button" aria-label="Show saved poses" title="Show saved poses">⌄</button><span class="pose-tag-suggestions" id="pose-tag-suggestions" role="listbox" hidden></span></span></label>
               <label><span>Use control</span><select id="pose-control-role"><option value="solo">Solo</option><option value="couple">Couple</option><option value="group">Group</option></select></label>
             </div>
             <p class="pose-control-hint" id="pose-control-hint" hidden>Choose exactly one checked image for this control slot. Reassigning a slot replaces its current image.</p>
@@ -694,7 +695,7 @@
           <button type="button" data-lightbox-control="group"><b>C</b> Group</button>
         </div>
         <div class="lightbox-target-action">
-          <label><span>Pose target</span><input id="lightbox-pose-tag-input" type="text" list="pose-tag-options" maxlength="80" placeholder="Pose name…" autocomplete="off"></label>
+          <label class="pose-tag-field"><span>Pose target</span><span class="pose-tag-combobox"><input id="lightbox-pose-tag-input" type="text" maxlength="80" placeholder="Pose name…" autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="lightbox-pose-tag-suggestions" aria-expanded="false"><button class="pose-tag-toggle" type="button" aria-label="Show saved poses" title="Show saved poses">⌄</button><span class="pose-tag-suggestions" id="lightbox-pose-tag-suggestions" role="listbox" hidden></span></span></label>
           <select id="lightbox-pose-control-role" aria-label="Control used by this target"><option value="solo">Solo control</option><option value="couple">Couple control</option><option value="group">Group control</option></select>
           <button class="button button-primary" id="lightbox-set-target" type="button"><svg><use href="#i-tag"></use></svg><span>Set target</span></button>
         </div>
@@ -745,6 +746,7 @@
         <span class="finder-rank"></span>
         <span class="finder-match-kind" hidden></span>
         <span class="finder-indexed-badge" title="Found in the saved Local Gallery Index before live source exploration" hidden>Indexed</span>
+        <span class="finder-exported-badge" title="This gallery already produced pose dataset images" hidden></span>
         <span class="finder-similarity"></span>
       </header>
       <div class="finder-match-gallery" aria-label="Top matching images"></div>

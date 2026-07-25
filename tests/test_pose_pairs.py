@@ -72,8 +72,9 @@ def test_pose_tags_keep_slug_and_drafts_use_optimistic_revisions(
 ) -> None:
     _, database = make_database(tmp_path)
     database.create_profile("Training", "Training")
-    tag = database.create_pose_tag("Standing pose", "solo")
+    tag = database.create_pose_tag("Standing pose/", "solo")
     assert tag["slug"] == "standing-pose"
+    assert tag["label"] == "Standing pose"
 
     renamed = database.update_pose_tag(
         tag["id"], label="Upright pose", default_role="couple"
@@ -924,6 +925,7 @@ async def test_pose_api_contract_and_validation(tmp_path: Path, monkeypatch) -> 
     images = [
         {"url": CONTROL, "ordinal": 1, "filename": "control.jpg"},
         {"url": TARGET_A, "ordinal": 2, "filename": "target-a.jpg"},
+        {"url": TARGET_B, "ordinal": 3, "filename": "target-b.jpg"},
     ]
 
     async def fake_gallery(url: str) -> dict:
@@ -1084,3 +1086,145 @@ async def test_pose_api_contract_and_validation(tmp_path: Path, monkeypatch) -> 
             assert public_job["pair_count"] == 1
             assert public_job["pose_revision"] == 1
             assert "payload" not in public_job and "image_urls" not in public_job
+
+            app.state.db.record_pose_outputs(
+                GALLERY,
+                "Default",
+                "completed-pose-job",
+                draft["targets"],
+            )
+            mixed = await client.put(
+                f"/api/galleries/{gallery_id}/pose-draft",
+                json={
+                    "expected_revision": 2,
+                    "controls": {"solo": CONTROL},
+                    "targets": [
+                        {
+                            "image_url": TARGET_A,
+                            "pose_tag_id": tag["id"],
+                            "role": "solo",
+                        },
+                        {
+                            "image_url": TARGET_B,
+                            "pose_tag_id": tag["id"],
+                            "role": "solo",
+                        },
+                    ],
+                },
+            )
+            assert mixed.status_code == 200
+            mixed_export = await client.post(
+                "/api/pose-exports",
+                json={
+                    "gallery_id": gallery_id,
+                    "profile": "Default",
+                    "expected_revision": 3,
+                },
+            )
+            assert mixed_export.status_code == 202
+            assert mixed_export.json()["duplicates_skipped"] == 1
+            assert [
+                target["image_url"] for target in captured["draft"]["targets"]
+            ] == [TARGET_B]
+
+            duplicate_only = await client.put(
+                f"/api/galleries/{gallery_id}/pose-draft",
+                json={
+                    "expected_revision": 3,
+                    "controls": {"solo": CONTROL},
+                    "targets": [
+                        {
+                            "image_url": TARGET_A,
+                            "pose_tag_id": tag["id"],
+                            "role": "solo",
+                        }
+                    ],
+                },
+            )
+            assert duplicate_only.status_code == 200
+            duplicate_export = await client.post(
+                "/api/pose-exports",
+                json={
+                    "gallery_id": gallery_id,
+                    "profile": "Default",
+                    "expected_revision": 4,
+                },
+            )
+            assert duplicate_export.status_code == 409
+            assert "already exported" in duplicate_export.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_existing_pose_folders_become_tags_and_gallery_history(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = AppConfig(
+        data_dir=tmp_path / "data",
+        download_root=tmp_path / "downloads",
+        sort_root=tmp_path / "library",
+        sqlite_vfs=None,
+    )
+    exported = (
+        config.pose_root_path
+        / "pov-ballsucking"
+        / "selected_target"
+        / "g79186222-0002_target.jpg"
+    )
+    exported.parent.mkdir(parents=True)
+    exported.write_bytes(b"existing target")
+    (config.pose_root_path / "mating-press").mkdir()
+    hidden = config.pose_root_path / ".galleryflow-tmp" / "ignored"
+    hidden.mkdir(parents=True)
+
+    app = create_app(config)
+
+    async def fake_gallery(url: str) -> dict:
+        return {
+            "url": url,
+            "title": "Existing output",
+            "thumbnail_remote_url": TARGET_A,
+            "images": [
+                {
+                    "url": TARGET_A,
+                    "ordinal": 2,
+                    "filename": "target-a.jpg",
+                    "preview_remote_url": TARGET_A,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(app.state.scraper, "gallery", fake_gallery)
+    gallery_id = encode_gallery_id(GALLERY)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            first_tags = (await client.get("/api/pose-tags")).json()["items"]
+            second_tags = (await client.get("/api/pose-tags")).json()["items"]
+            assert {tag["label"] for tag in first_tags} == {
+                "pov-ballsucking",
+                "mating-press",
+            }
+            assert second_tags == first_tags
+
+            detail = (
+                await client.get(
+                    f"/api/galleries/{gallery_id}",
+                    params={"profile": "Default"},
+                )
+            ).json()
+            assert detail["pose_outputs"] == [
+                {
+                    "gallery_key": "pornpics:gallery:79186222",
+                    "gallery_url": "",
+                    "ordinal": 2,
+                    "image_url": "",
+                    "pose_slug": "pov-ballsucking",
+                    "pose_label": "pov-ballsucking",
+                    "role": "solo",
+                    "profile": "",
+                    "job_id": "",
+                    "exported_at": detail["pose_outputs"][0]["exported_at"],
+                }
+            ]

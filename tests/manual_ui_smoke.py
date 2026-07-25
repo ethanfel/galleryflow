@@ -61,6 +61,15 @@ def build_visual_app(
     config.ensure_directories()
     db.initialize()
     pose_tag = db.create_pose_tag("mating press - backview", "couple")
+    if open_pose:
+        existing_pose_target = (
+            config.pose_root_path
+            / pose_tag["slug"]
+            / "selected_target"
+            / "g79186222-0001_target.jpg"
+        )
+        existing_pose_target.parent.mkdir(parents=True)
+        Image.new("RGB", (900, 1200), "#453a76").save(existing_pose_target)
     target_dir = config.sort_root_path / "visual-sort/targets"
     control_dir = config.sort_root_path / "visual-sort/references"
     target_dir.mkdir(parents=True)
@@ -1648,7 +1657,42 @@ window.addEventListener('load', () => {
 });
 """
         if open_pose:
-            script += "window.addEventListener('load',()=>{const poll=setInterval(()=>{const modal=document.querySelector('#gallery-modal');const button=document.querySelector('[data-gallery-mode=pose]');const image=document.querySelector('.image-option:not(.skeleton-image)');if(modal?.open&&button&&image){button.click();clearInterval(poll)}},50)});"
+            script += """
+window.addEventListener('load', () => {
+  let poseModeOpened = false;
+  const poll = setInterval(() => {
+    const modal = document.querySelector('#gallery-modal');
+    const mode = document.querySelector('[data-gallery-mode=pose]');
+    const image = document.querySelector('.image-option:not(.skeleton-image)');
+    const status = document.querySelector('#pose-save-status')?.textContent || '';
+    if (!poseModeOpened && modal?.open && mode && image) {
+      mode.click();
+      poseModeOpened = true;
+      return;
+    }
+    if (
+      poseModeOpened
+      && !status.includes('Loading')
+      && document.querySelector('#pose-export-history:not([hidden])')
+    ) {
+      document.querySelector('#pose-tag-input')?.focus();
+      const option = document.querySelector(
+        '#pose-tag-suggestions [data-pose-tag-id]'
+      );
+      const passed = option?.textContent.includes('mating press - backview')
+        && document.querySelector('.pose-output-badge')
+        && document.querySelector('#summary-pose-outputs-row:not([hidden])');
+      document.documentElement.dataset.poseLibrary = passed ? 'pass' : 'fail';
+      clearInterval(poll);
+    }
+  }, 50);
+  setTimeout(() => {
+    if (!document.documentElement.dataset.poseLibrary) {
+      document.documentElement.dataset.poseLibrary = 'fail';
+    }
+  }, 2600);
+});
+"""
         if queue_events:
             script += """
 window.addEventListener('load', () => {
@@ -3895,7 +3939,8 @@ def main() -> None:
             f"http://127.0.0.1:18101/{'#finder' if finder_mode else '#sort' if args.sort else ''}",
         ]
         if (
-            args.lightbox
+            args.pose
+            or args.lightbox
             or args.finder_race
             or args.finder_direct_assign
             or args.finder_unusable_save
@@ -3913,7 +3958,8 @@ def main() -> None:
             check=True,
             timeout=45,
             capture_output=(
-                args.lightbox
+                args.pose
+                or args.lightbox
                 or args.finder_race
                 or args.finder_direct_assign
                 or args.finder_unusable_save
@@ -3926,7 +3972,8 @@ def main() -> None:
                 or args.queue_events
             ),
             text=(
-                args.lightbox
+                args.pose
+                or args.lightbox
                 or args.finder_race
                 or args.finder_direct_assign
                 or args.finder_unusable_save
@@ -3939,6 +3986,10 @@ def main() -> None:
                 or args.queue_events
             ),
         )
+        if args.pose and 'data-pose-library="pass"' not in completed.stdout:
+            raise AssertionError(
+                "saved pose suggestions or gallery export history were not visible"
+            )
         if (
             args.lightbox
             and 'data-lightbox-media-cleanup="pass"' not in completed.stdout

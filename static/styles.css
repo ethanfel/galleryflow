@@ -784,11 +784,12 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .finder-card.is-accepted { border-color: rgba(79,210,160,.32); }
 .finder-card.is-rejected { opacity: .72; }
 .finder-card-head { display: flex; min-height: 42px; padding: 8px 10px; gap: 7px; align-items: center; border-bottom: 1px solid var(--border); background: rgba(255,255,255,.012); }
-.finder-rank, .finder-similarity, .finder-match-kind, .finder-indexed-badge { display: inline-flex; min-height: 23px; padding: 0 7px; align-items: center; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2); font-size: 8px; font-weight: 720; white-space: nowrap; }
+.finder-rank, .finder-similarity, .finder-match-kind, .finder-indexed-badge, .finder-exported-badge { display: inline-flex; min-height: 23px; padding: 0 7px; align-items: center; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2); font-size: 8px; font-weight: 720; white-space: nowrap; }
 .finder-rank { color: var(--text-soft); }
 .finder-similarity { margin-left: auto; color: var(--amber); font-variant-numeric: tabular-nums; }
 .finder-match-kind { border-color: rgba(155,123,250,.22); background: rgba(155,123,250,.1); color: #cbbfff; }
 .finder-indexed-badge { border-color: rgba(98,168,250,.18); background: rgba(98,168,250,.07); color: #9bc6f7; }
+.finder-exported-badge { max-width: 130px; overflow: hidden; border-color: rgba(79,210,160,.24); background: var(--green-soft); color: var(--green); text-overflow: ellipsis; }
 .finder-card:has(.finder-match-kind:not([hidden])) .finder-rank { color: var(--muted); }
 .finder-card.is-high .finder-similarity { color: var(--green); }
 .finder-card.is-likely .finder-similarity { color: #c9bcff; }
@@ -920,11 +921,13 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .lightbox-control-actions button.is-active b { background: var(--green); color: #07150f; }
 .lightbox-target-action { display: grid; min-width: 0; grid-template-columns: minmax(140px, 1fr) 130px auto; align-items: end; }
 .lightbox-target-action label { min-width: 0; }
-.lightbox-target-action label span { display: block; margin: 0 0 3px 8px; color: var(--muted); font-size: 8px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.lightbox-target-action label > span:first-child { display: block; margin: 0 0 3px 8px; color: var(--muted); font-size: 8px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
 .lightbox-target-action input, .lightbox-target-action select { width: 100%; height: 38px; border: 1px solid var(--border-strong); outline: 0; background: #111118; color: var(--text); font-size: 11px; }
 .lightbox-target-action input { padding: 0 10px; border-radius: 9px 0 0 9px; }
 .lightbox-target-action select { padding: 0 8px; border-left: 0; }
 .lightbox-target-action .button { min-height: 38px; border-radius: 0 9px 9px 0; }
+.lightbox-target-action .pose-tag-toggle { height: 36px; }
+.lightbox-target-action .pose-tag-suggestions { top: auto; bottom: calc(100% + 5px); }
 .lightbox-clear-pose { color: var(--muted); }
 .lightbox-clear-pose:disabled { cursor: not-allowed; opacity: .35; }
 .modal-header { display: flex; min-height: 72px; padding: 13px 16px 13px 22px; gap: 18px; flex: none; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); background: rgba(18,18,25,.95); }
@@ -990,6 +993,10 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .pose-toolbar-heading h4 { margin: 0; font-size: 13px; }
 .pose-save-status { display: inline-flex; min-height: 24px; padding: 0 8px; align-items: center; border-radius: 999px; background: var(--green-soft); color: var(--green); font-size: 9px; font-weight: 650; }
 .pose-save-status.is-saving { background: var(--amber-soft); color: var(--amber); }
+.pose-export-history { display: flex; min-height: 34px; padding: 7px 10px; gap: 7px; grid-column: 1 / -1; align-items: center; overflow: hidden; border: 1px solid rgba(79,210,160,.18); border-radius: 9px; background: rgba(79,210,160,.06); color: var(--muted); font-size: 9px; }
+.pose-export-history[hidden] { display: none; }
+.pose-export-history svg { width: 13px; height: 13px; flex: none; color: var(--green); }
+.pose-export-history strong { overflow: hidden; color: var(--green); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .pose-role-switch { display: grid; padding: 3px; grid-template-columns: repeat(4, minmax(0, 1fr)); border: 1px solid var(--border); border-radius: 10px; background: rgba(8,8,12,.5); }
 .pose-role-switch button { display: flex; min-height: 42px; padding: 4px 7px; gap: 6px; align-items: center; justify-content: center; border: 0; border-radius: 7px; background: transparent; color: var(--muted); font-size: 9px; font-weight: 650; white-space: nowrap; }
 .pose-role-switch button:hover { color: var(--text); }
@@ -998,11 +1005,22 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .pose-role-switch button.is-active b { background: var(--violet); color: white; }
 .pose-target-fields { display: grid; min-width: 0; grid-template-columns: minmax(150px, 1fr) 125px; }
 .pose-target-fields label { min-width: 0; }
-.pose-target-fields label > span { display: block; margin: 0 0 3px 8px; color: var(--muted); font-size: 8px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.pose-target-fields label > span:first-child { display: block; margin: 0 0 3px 8px; color: var(--muted); font-size: 8px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
 .pose-target-fields input, .pose-target-fields select { width: 100%; height: 42px; border: 1px solid var(--border-strong); outline: 0; background: #111118; color: var(--text); font-size: 11px; }
 .pose-target-fields input { padding: 0 11px; border-radius: 9px 0 0 9px; }
 .pose-target-fields select { padding: 0 8px; border-left: 0; border-radius: 0 9px 9px 0; }
 .pose-target-fields input:focus, .pose-target-fields select:focus { position: relative; z-index: 1; border-color: rgba(155,123,250,.7); }
+.pose-tag-combobox { position: relative; display: block; min-width: 0; }
+.pose-tag-combobox input { padding-right: 34px; }
+.pose-tag-toggle { position: absolute; z-index: 2; top: 1px; right: 1px; display: grid; width: 32px; height: 40px; padding: 0 0 4px; place-items: center; border: 0; border-left: 1px solid var(--border); border-radius: 0 8px 8px 0; background: #111118; color: var(--muted); font-size: 15px; }
+.pose-tag-toggle:hover { color: var(--text); }
+.pose-tag-suggestions { position: absolute; z-index: 30; top: calc(100% + 5px); left: 0; display: grid; width: max(100%, 270px); max-height: 260px; padding: 5px; gap: 2px; overflow-y: auto; border: 1px solid var(--border-strong); border-radius: 10px; background: rgba(19,18,27,.99); box-shadow: 0 18px 45px rgba(0,0,0,.46); text-transform: none; }
+.pose-tag-suggestions[hidden] { display: none; }
+.pose-tag-suggestions button { display: flex; min-height: 36px; padding: 6px 9px; gap: 10px; align-items: center; justify-content: space-between; border: 0; border-radius: 7px; background: transparent; color: var(--text-soft); text-align: left; }
+.pose-tag-suggestions button:hover, .pose-tag-suggestions button:focus-visible { outline: 0; background: rgba(155,123,250,.14); color: white; }
+.pose-tag-suggestions button strong { overflow: hidden; font-size: 10px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.pose-tag-suggestions button small { flex: none; color: var(--muted); font-size: 8px; }
+.pose-tag-suggestions-empty, .pose-tag-suggestions-more { display: block; padding: 9px; color: var(--muted); font-size: 8px; line-height: 1.4; }
 .pose-control-hint { min-width: 0; margin: 0; align-self: center; color: var(--muted); font-size: 10px; }
 .pose-toolbar-actions { display: flex; gap: 8px; align-items: flex-end; justify-content: flex-end; }
 .pose-toolbar-actions .button { min-width: 145px; }
@@ -1050,6 +1068,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .pose-role-badge { position: absolute; z-index: 4; top: 7px; left: 7px; display: inline-flex; max-width: calc(100% - 49px); height: 24px; padding: 0 7px 0 4px; gap: 5px; align-items: center; border: 1px solid rgba(255,255,255,.13); border-radius: 7px; background: rgba(8,8,12,.84); color: white; font-size: 8px; font-weight: 700; pointer-events: none; backdrop-filter: blur(8px); }
 .pose-role-badge b { display: grid; width: 16px; height: 16px; flex: none; place-items: center; border-radius: 5px; font-size: 8px; }
 .pose-role-badge span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pose-output-badge { position: absolute; z-index: 4; right: 6px; bottom: 6px; display: inline-flex; max-width: calc(100% - 12px); min-height: 21px; padding: 0 7px; align-items: center; overflow: hidden; border: 1px solid rgba(79,210,160,.3); border-radius: 999px; background: rgba(10,35,28,.9); color: #78e1b8; font-size: 7px; font-weight: 720; text-overflow: ellipsis; white-space: nowrap; backdrop-filter: blur(8px); }
 .pose-role-badge.target { border-color: rgba(155,123,250,.35); color: #d7cdff; }
 .pose-role-badge.target b { background: var(--violet); color: white; }
 .pose-role-badge.control { border-color: rgba(79,210,160,.35); color: #a7ebd1; }

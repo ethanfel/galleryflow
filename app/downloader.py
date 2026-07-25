@@ -835,7 +835,17 @@ class DownloadManager:
                     cached,
                     should_cancel_materialization,
                 )
-                status = "canceled" if cancel_event.is_set() else "completed"
+                if cancel_event.is_set():
+                    status = "canceled"
+                else:
+                    await asyncio.to_thread(
+                        self.db.record_pose_outputs,
+                        job["gallery_url"],
+                        job["profile"],
+                        job_id,
+                        targets,
+                    )
+                    status = "completed"
             except PoseExportCanceled:
                 status = "canceled"
             except Exception as exc:

@@ -285,6 +285,37 @@
     return '';
   }
 
+  function normalizePoseOutputs(value) {
+    return (Array.isArray(value) ? value : []).map(item => ({
+      ordinal: Math.max(0, Number(item?.ordinal || 0)),
+      imageUrl: String(item?.image_url || ''),
+      poseSlug: String(item?.pose_slug || ''),
+      poseLabel: String(item?.pose_label || item?.pose_slug || 'Pose'),
+      role: POSE_ROLES.includes(item?.role) ? item.role : 'solo',
+      exportedAt: String(item?.exported_at || '')
+    })).filter(item => item.ordinal && item.poseSlug);
+  }
+
+  function poseOutputSummary(outputs = []) {
+    const groups = new Map();
+    outputs.forEach(output => {
+      const key = output.poseSlug;
+      const current = groups.get(key) || {
+        label: output.poseLabel || output.poseSlug,
+        count: 0
+      };
+      current.count += 1;
+      groups.set(key, current);
+    });
+    return [...groups.values()];
+  }
+
+  function poseOutputSummaryCopy(outputs = []) {
+    return poseOutputSummary(outputs)
+      .map(group => `${group.label} (${formatNumber(group.count)})`)
+      .join(', ');
+  }
+
   function normalizeGallery(item, { useHistory = true } = {}) {
     const gallery = { ...item };
     const serverState = String(item.state || '').toLowerCase();
@@ -304,6 +335,7 @@
     );
     gallery.partial = Boolean(item.partial || serverState === 'partial' || (gallery.downloadedImages && !gallery.saved));
     gallery.ignored = Boolean(item.ignored || serverState === 'ignored');
+    gallery.poseOutputs = normalizePoseOutputs(item.pose_outputs ?? item.poseOutputs);
     gallery.queued = serverState === 'queued' || state.jobs.some(job => !isTerminalJob(job) && (
       String(job.galleryId) === String(gallery.id) ||
       (job.galleryUrl && normalizeHistoryUrl(job.galleryUrl) === normalizeHistoryUrl(gallery.url))
@@ -2279,6 +2311,14 @@
     $('#summary-image-count').textContent = gallery.imageCount ? formatNumber(gallery.imageCount) : '—';
     $('#summary-source').textContent = displayHost(gallery.url);
     $('#summary-profile').textContent = gallery.saved ? state.activeProfile || 'Saved' : 'Not saved';
+    const outputGroups = poseOutputSummary(gallery.poseOutputs);
+    const outputRow = $('#summary-pose-outputs-row');
+    outputRow.hidden = !outputGroups.length;
+    const outputCopy = poseOutputSummaryCopy(gallery.poseOutputs);
+    $('#summary-pose-outputs').textContent = outputGroups.length
+      ? `${formatNumber(gallery.poseOutputs.length)} image${gallery.poseOutputs.length === 1 ? '' : 's'} · ${formatNumber(outputGroups.length)} pose${outputGroups.length === 1 ? '' : 's'}`
+      : '—';
+    $('#summary-pose-outputs').title = outputCopy;
     const sourceLink = $('#gallery-source-link');
     const sourceUrl = safeUrl(gallery.url);
     sourceLink.href = sourceUrl || '#';
@@ -2294,8 +2334,13 @@
       id: item?.id,
       label: String(item?.label || item?.name || '').trim(),
       slug: String(item?.slug || ''),
-      defaultRole: POSE_ROLES.includes(item?.default_role) ? item.default_role : 'solo'
+      defaultRole: POSE_ROLES.includes(item?.default_role) ? item.default_role : 'solo',
+      updatedAt: String(item?.updated_at || '')
     };
+  }
+
+  function cleanPoseTagLabel(value) {
+    return String(value || '').trim().replace(/[\\/]+$/, '').trim().replace(/\s+/g, ' ');
   }
 
   function normalizePoseDraft(item) {
@@ -2522,7 +2567,7 @@
   }
 
   function poseTagForInput(value) {
-    const query = String(value || '').trim().toLocaleLowerCase();
+    const query = cleanPoseTagLabel(value).toLocaleLowerCase();
     if (!query) return null;
     return state.poseTags.find(tag => tag.label.toLocaleLowerCase() === query || tag.slug.toLocaleLowerCase() === query) || null;
   }
@@ -2530,17 +2575,157 @@
   function renderPoseTagOptions() {
     const list = $('#pose-tag-options');
     list.replaceChildren();
-    [...state.poseTags].sort((a, b) => a.label.localeCompare(b.label)).forEach(tag => {
+    state.poseTags.forEach(tag => {
       const option = document.createElement('option');
       option.value = tag.label;
       option.label = `${tag.label} · ${poseRoleLabel(tag.defaultRole)} control`;
       list.append(option);
     });
+    $$('.pose-tag-combobox input[aria-expanded="true"]').forEach(input => {
+      renderPoseTagSuggestions(input, { showAll: !cleanPoseTagLabel(input.value) });
+    });
+  }
+
+  function closePoseTagSuggestions(input) {
+    const menu = input?.closest('.pose-tag-combobox')?.querySelector('.pose-tag-suggestions');
+    if (!menu) return;
+    menu.hidden = true;
+    input.setAttribute('aria-expanded', 'false');
+  }
+
+  function renderPoseTagSuggestions(input, { showAll = false } = {}) {
+    const menu = input?.closest('.pose-tag-combobox')?.querySelector('.pose-tag-suggestions');
+    if (!menu) return;
+    const query = showAll ? '' : cleanPoseTagLabel(input.value).toLocaleLowerCase();
+    const ranked = state.poseTags
+      .map((tag, index) => {
+        const label = tag.label.toLocaleLowerCase();
+        const slug = tag.slug.toLocaleLowerCase();
+        let rank = 4;
+        if (!query) rank = 0;
+        else if (label === query || slug === query) rank = 0;
+        else if (label.startsWith(query) || slug.startsWith(query)) rank = 1;
+        else if (label.includes(query) || slug.includes(query)) rank = 2;
+        return { tag, index, rank };
+      })
+      .filter(item => !query || item.rank < 4)
+      .sort((left, right) => left.rank - right.rank || left.index - right.index);
+    const visible = ranked.slice(0, 14);
+    menu.replaceChildren();
+    visible.forEach(({ tag }) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.role = 'option';
+      button.dataset.poseTagId = String(tag.id);
+      const name = document.createElement('strong');
+      name.textContent = tag.label;
+      const detail = document.createElement('small');
+      detail.textContent = `${poseRoleLabel(tag.defaultRole)} control`;
+      button.append(name, detail);
+      menu.append(button);
+    });
+    if (ranked.length > visible.length) {
+      const more = document.createElement('span');
+      more.className = 'pose-tag-suggestions-more';
+      more.textContent = `${ranked.length - visible.length} more saved poses — keep typing to filter`;
+      menu.append(more);
+    } else if (!visible.length) {
+      const empty = document.createElement('span');
+      empty.className = 'pose-tag-suggestions-empty';
+      empty.textContent = query
+        ? `No saved pose matches “${cleanPoseTagLabel(input.value)}” — applying will create it`
+        : 'No saved poses yet — type a name to create the first one';
+      menu.append(empty);
+    }
+    menu.hidden = false;
+    input.setAttribute('aria-expanded', 'true');
+  }
+
+  function choosePoseTagSuggestion(input, tag) {
+    if (!tag) return;
+    input.value = tag.label;
+    const roleSelect = input.id === 'lightbox-pose-tag-input'
+      ? $('#lightbox-pose-control-role')
+      : $('#pose-control-role');
+    roleSelect.value = tag.defaultRole;
+    closePoseTagSuggestions(input);
+    syncPoseTagDefault(input, roleSelect);
+    input.focus();
+  }
+
+  function bindPoseTagCombobox(input, roleSelect) {
+    const combo = input.closest('.pose-tag-combobox');
+    const menu = $('.pose-tag-suggestions', combo);
+    const toggle = $('.pose-tag-toggle', combo);
+    input.addEventListener('focus', () => renderPoseTagSuggestions(input, { showAll: true }));
+    input.addEventListener('input', () => {
+      syncPoseTagDefault(input, roleSelect);
+      renderPoseTagSuggestions(input);
+    });
+    input.addEventListener('change', () => syncPoseTagDefault(input, roleSelect));
+    input.addEventListener('keydown', event => {
+      if (event.key === 'Escape') {
+        closePoseTagSuggestions(input);
+        return;
+      }
+      if (event.key !== 'ArrowDown') return;
+      if (menu.hidden) renderPoseTagSuggestions(input, { showAll: true });
+      const first = $('button', menu);
+      if (first) {
+        event.preventDefault();
+        first.focus();
+      }
+    });
+    toggle.addEventListener('click', event => {
+      event.stopPropagation();
+      if (menu.hidden) {
+        renderPoseTagSuggestions(input, { showAll: true });
+        input.focus({ preventScroll: true });
+      } else {
+        closePoseTagSuggestions(input);
+      }
+    });
+    menu.addEventListener('click', event => {
+      const button = event.target.closest('[data-pose-tag-id]');
+      if (!button) return;
+      event.stopPropagation();
+      const tag = state.poseTags.find(item => String(item.id) === button.dataset.poseTagId);
+      choosePoseTagSuggestion(input, tag);
+    });
+    menu.addEventListener('keydown', event => {
+      if (!event.target.matches('button')) return;
+      const buttons = $$('button', menu);
+      const index = buttons.indexOf(event.target);
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closePoseTagSuggestions(input);
+        input.focus();
+      } else if (event.key === 'ArrowDown' && buttons[index + 1]) {
+        event.preventDefault();
+        buttons[index + 1].focus();
+      } else if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        if (buttons[index - 1]) buttons[index - 1].focus();
+        else input.focus();
+      }
+    });
   }
 
   function renderPoseBadge(option, image) {
     $('.pose-role-badge', option)?.remove();
+    $('.pose-output-badge', option)?.remove();
     option.classList.remove('has-pose-target', 'has-pose-control');
+    const priorOutput = (state.gallery?.poseOutputs || []).find(output => (
+      output.ordinal === Number(image.ordinal)
+      || (output.imageUrl && output.imageUrl === image.url)
+    ));
+    if (priorOutput) {
+      const history = document.createElement('span');
+      history.className = 'pose-output-badge';
+      history.textContent = `Exported · ${priorOutput.poseLabel}`;
+      history.title = `This image was already exported as ${priorOutput.poseLabel}`;
+      option.append(history);
+    }
     if (state.galleryMode !== 'pose') return;
     const assignment = poseAssignmentFor(image.url);
     if (!assignment) return;
@@ -2562,13 +2747,34 @@
     const targets = state.poseDraft.targets;
     const assignedControls = POSE_ROLES.filter(role => state.poseDraft.controls[role]);
     const issues = [];
+    const outputByOrdinal = new Map(
+      (state.gallery?.poseOutputs || []).map(output => [output.ordinal, output])
+    );
+    const duplicateTargets = [];
+    const conflictingTargets = [];
     if (!targets.length) issues.push('Add at least one target');
     targets.forEach(target => {
       if (!target.poseTagId) issues.push('A target has no pose');
       if (!state.poseDraft.controls[target.role]) issues.push(`${poseRoleLabel(target.role)} control is missing`);
+      const prior = outputByOrdinal.get(Number(target.ordinal));
+      if (!prior) return;
+      if (prior.poseSlug === target.poseSlug) duplicateTargets.push(target);
+      else conflictingTargets.push({ target, prior });
     });
+    if (conflictingTargets.length) {
+      const { target, prior } = conflictingTargets[0];
+      issues.push(`Image ${String(target.ordinal).padStart(2, '0')} was already exported as ${prior.poseLabel}`);
+    } else if (targets.length && duplicateTargets.length === targets.length) {
+      issues.push('Every assigned target was already exported');
+    }
     if (!($('#modal-profile-select')?.value || state.activeProfile)) issues.push('Choose a destination profile');
-    return { targets: targets.length, controls: assignedControls.length, issues: [...new Set(issues)] };
+    return {
+      targets: targets.length,
+      freshTargets: targets.length - duplicateTargets.length - conflictingTargets.length,
+      duplicateTargets: duplicateTargets.length,
+      controls: assignedControls.length,
+      issues: [...new Set(issues)]
+    };
   }
 
   function renderPosePreflight() {
@@ -2577,7 +2783,10 @@
     const priorExport = poseExportForDraft();
     const blocksExport = ['queued', 'active'].includes(priorExport?.state)
       || (priorExport?.state === 'exported' && !state.poseDirty);
-    let detail = `Ready to build ${formatNumber(result.targets)} paired image${result.targets === 1 ? '' : 's'}.`;
+    let detail = `Ready to build ${formatNumber(result.freshTargets)} paired image${result.freshTargets === 1 ? '' : 's'}.`;
+    if (!result.issues.length && result.duplicateTargets) {
+      detail += ` ${formatNumber(result.duplicateTargets)} already exported target${result.duplicateTargets === 1 ? '' : 's'} will be skipped.`;
+    }
     if (result.issues.length) detail = result.issues.join(' · ');
     else if (priorExport?.state === 'queued') detail = 'This saved draft already has a pose dataset queued.';
     else if (priorExport?.state === 'active') detail = 'Another pose export for this gallery is still active.';
@@ -2669,6 +2878,11 @@
 
   function renderPoseWorkspace() {
     renderPoseTagOptions();
+    const outputHistory = $('#pose-export-history');
+    const outputCopy = poseOutputSummaryCopy(state.gallery?.poseOutputs || []);
+    outputHistory.hidden = !outputCopy;
+    $('strong', outputHistory).textContent = outputCopy;
+    outputHistory.title = outputCopy;
     renderPoseToolbar();
     renderLightboxPoseDock();
   }
@@ -2885,7 +3099,7 @@
   }
 
   async function ensurePoseTag(label, defaultRole) {
-    const cleanLabel = String(label || '').trim().replace(/\s+/g, ' ');
+    const cleanLabel = cleanPoseTagLabel(label);
     if (!cleanLabel) throw new ApiError('Enter a pose name first.');
     const existing = poseTagForInput(cleanLabel);
     if (existing) return existing;
@@ -3425,6 +3639,7 @@
         body: { gallery_id: gallery.id, profile, expected_revision: expectedRevision }
       });
       const pairs = Number(data?.job?.pair_count ?? preflight.targets);
+      const skipped = Number(data?.duplicates_skipped || 0);
       const queuedJob = upsertJob(data?.job);
       if (queuedJob) {
         renderJobs();
@@ -3436,7 +3651,11 @@
         renderPoseWorkspace();
         renderFinderGalleryReview();
       }
-      toast('Pose dataset queued', `${formatNumber(pairs)} pair${pairs === 1 ? '' : 's'} will download and organize in “${profile}”. Use Next when you are ready for another gallery.`, 'success');
+      toast(
+        'Pose dataset queued',
+        `${formatNumber(pairs)} new pair${pairs === 1 ? '' : 's'} will download and organize in “${profile}”.${skipped ? ` ${formatNumber(skipped)} existing pair${skipped === 1 ? '' : 's'} skipped.` : ''} Use Next when you are ready for another gallery.`,
+        'success'
+      );
       await loadJobs({ quiet: true });
     } catch (error) {
       const activeJob = error instanceof ApiError && error.status === 409
@@ -4318,7 +4537,8 @@
       url: galleryUrl,
       title: item?.title || source.title || source.name || 'Untitled gallery',
       thumbnail_url: primaryMatch.previewUrl || primaryMatch.imageUrl || source.thumbnail_url || source.thumbnail || '',
-      image_count: item?.image_count ?? source.image_count ?? source.total_images ?? 0
+      image_count: item?.image_count ?? source.image_count ?? source.total_images ?? 0,
+      pose_outputs: item?.pose_outputs ?? source.pose_outputs ?? []
     });
     const score = firstFinderScore(item?.score, item?.similarity, item?.combined_score, primaryMatch.score, fallback.score) ?? 0;
     const rankingTier = normalizeFinderTier(item?.ranking_tier ?? item?.rank_tier, primaryMatch.rankingTier);
@@ -5822,6 +6042,15 @@
       $('.finder-rank', card).textContent = `#${String(resultRank).padStart(2, '0')}`;
       $('.finder-similarity', card).textContent = finderEvidenceLabel(result);
       $('.finder-indexed-badge', card).hidden = !result.indexedOnly;
+      const exportedBadge = $('.finder-exported-badge', card);
+      const exportedGroups = poseOutputSummary(result.poseOutputs);
+      exportedBadge.hidden = !exportedGroups.length;
+      exportedBadge.textContent = exportedGroups.length
+        ? `Exported · ${formatNumber(result.poseOutputs.length)}`
+        : '';
+      exportedBadge.title = exportedGroups.length
+        ? `Already exported: ${poseOutputSummaryCopy(result.poseOutputs)}`
+        : '';
       const matchKind = $('.finder-match-kind', card);
       const kindCopy = finderEvidenceKind(result);
       matchKind.hidden = !kindCopy;
@@ -8415,8 +8644,11 @@
     $('#finder-feedback-gallery-save').addEventListener('click', saveFinderGalleryFeedbackSelection);
     $('#finder-feedback-prepare-pose').addEventListener('click', prepareFinderPoseFromFeedback);
     $$('[data-pose-assignment]').forEach(button => button.addEventListener('click', () => handlePoseAssignmentButton(button)));
-    $('#pose-tag-input').addEventListener('input', event => syncPoseTagDefault(event.currentTarget, $('#pose-control-role')));
-    $('#pose-tag-input').addEventListener('change', event => syncPoseTagDefault(event.currentTarget, $('#pose-control-role')));
+    bindPoseTagCombobox($('#pose-tag-input'), $('#pose-control-role'));
+    document.addEventListener('click', event => {
+      if (event.target.closest('.pose-tag-combobox')) return;
+      $$('.pose-tag-combobox input').forEach(closePoseTagSuggestions);
+    });
     $('#pose-control-role').addEventListener('change', updateSelectionUi);
     $('#pose-apply-checked').addEventListener('click', event => applyPoseAssignment(
       state.poseSelectedImages,
@@ -8443,8 +8675,7 @@
       const image = state.gallery?.images?.[state.lightboxIndex];
       if (image) applyPoseAssignment([image.url], event.currentTarget.dataset.lightboxControl, { button: event.currentTarget });
     }));
-    $('#lightbox-pose-tag-input').addEventListener('input', event => syncPoseTagDefault(event.currentTarget, $('#lightbox-pose-control-role')));
-    $('#lightbox-pose-tag-input').addEventListener('change', event => syncPoseTagDefault(event.currentTarget, $('#lightbox-pose-control-role')));
+    bindPoseTagCombobox($('#lightbox-pose-tag-input'), $('#lightbox-pose-control-role'));
     $('#lightbox-pose-control-role').addEventListener('change', updateLightboxTargetAvailability);
     $('#lightbox-set-target').addEventListener('click', event => {
       const image = state.gallery?.images?.[state.lightboxIndex];

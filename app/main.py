@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
+import threading
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from urllib.parse import quote
 
 import httpx
@@ -50,6 +53,7 @@ from .security import (
     confined_path,
     decode_gallery_id,
     encode_gallery_id,
+    gallery_key,
     safe_folder_name,
     sign_media_url,
     validate_public_media_url,
@@ -68,6 +72,86 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
     sorter = SorterService(app_config, database)
     finder = FinderService(app_config, database, scraper, events)
     media_client: httpx.AsyncClient | None = None
+    pose_output_index_lock = threading.Lock()
+    pose_output_indexed = False
+
+    def discover_pose_folder_tags() -> list[dict]:
+        try:
+            folder_names = [
+                child.name
+                for child in app_config.pose_root_path.iterdir()
+                if not child.name.startswith(".")
+                and not child.is_symlink()
+                and child.is_dir()
+            ]
+        except OSError:
+            return database.list_pose_tags()
+        return database.ensure_pose_folder_tags(folder_names)
+
+    def sync_pose_output_index() -> None:
+        """Backfill durable export history from an existing pose output tree once."""
+
+        nonlocal pose_output_indexed
+        if pose_output_indexed:
+            return
+        with pose_output_index_lock:
+            if pose_output_indexed:
+                return
+            tags = discover_pose_folder_tags()
+            labels = {str(tag["slug"]): str(tag["label"]) for tag in tags}
+            records: list[dict] = []
+            try:
+                pose_directories = [
+                    child
+                    for child in app_config.pose_root_path.iterdir()
+                    if not child.name.startswith(".")
+                    and not child.is_symlink()
+                    and child.is_dir()
+                ]
+            except OSError:
+                return
+            for pose_directory in pose_directories:
+                target_directory = pose_directory / "selected_target"
+                try:
+                    targets = list(target_directory.iterdir())
+                except OSError:
+                    continue
+                for target in targets:
+                    if target.is_symlink() or not target.is_file():
+                        continue
+                    match = re.fullmatch(
+                        r"g(?P<gallery>\d+)-(?P<ordinal>\d+)_target\.[^.]+",
+                        target.name,
+                        flags=re.IGNORECASE,
+                    )
+                    if not match:
+                        continue
+                    try:
+                        modified = datetime.fromtimestamp(
+                            target.stat().st_mtime, timezone.utc
+                        ).isoformat()
+                    except OSError:
+                        continue
+                    identity = match.group("gallery")
+                    records.append(
+                        {
+                            "gallery_key": f"pornpics:gallery:{identity}",
+                            "ordinal": int(match.group("ordinal")),
+                            "pose_slug": pose_directory.name,
+                            "pose_label": labels.get(
+                                pose_directory.name, pose_directory.name
+                            ),
+                            "exported_at": modified,
+                        }
+                    )
+            database.import_pose_outputs(records)
+            pose_output_indexed = True
+
+    def pose_outputs_for_urls(
+        gallery_urls: list[str],
+    ) -> dict[str, list[dict]]:
+        sync_pose_output_index()
+        return database.pose_outputs_for_urls(gallery_urls)
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -183,7 +267,9 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
         draft["gallery_id"] = encode_gallery_id(draft["gallery_url"])
         return draft
 
-    def decorate_finder_result(item: dict) -> dict:
+    def decorate_finder_result(
+        item: dict, pose_outputs: list[dict] | None = None
+    ) -> dict:
         result = dict(item)
         preview = result.pop("best_preview_remote_url", "")
         thumbnail = result.pop("thumbnail_remote_url", "")
@@ -197,6 +283,7 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
         result["best_preview_url"] = media_url(preview) if preview else None
         result["thumbnail_url"] = media_url(thumbnail) if thumbnail else None
         result["gallery_id"] = encode_gallery_id(result["gallery_url"])
+        result["pose_outputs"] = pose_outputs or []
         return result
 
     def persist_gallery_detail(
@@ -326,6 +413,8 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
             image["preview_url"] = media_url(remote)
             image["full_url"] = media_url(image["url"])
             image["downloaded"] = image["url"] in downloaded_images
+        outputs = await asyncio.to_thread(pose_outputs_for_urls, [detail["url"]])
+        detail["pose_outputs"] = outputs.get(gallery_key(detail["url"]), [])
         detail.update(status)
         return detail
 
@@ -340,7 +429,7 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
 
     @app.get("/api/pose-tags")
     async def list_pose_tags() -> dict:
-        return {"items": database.list_pose_tags()}
+        return {"items": await asyncio.to_thread(discover_pose_folder_tags)}
 
     @app.post("/api/pose-tags", status_code=201)
     async def create_pose_tag(payload: PoseTagCreate) -> dict:
@@ -445,12 +534,48 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
                 raise HTTPException(
                     422, "A pose tag used by this draft no longer exists"
                 )
+        output_map = await asyncio.to_thread(pose_outputs_for_urls, [gallery_url])
+        prior_outputs = output_map.get(gallery_key(gallery_url), [])
+        by_ordinal = {int(item["ordinal"]): item for item in prior_outputs}
+        duplicate_targets: list[dict] = []
+        conflicting_targets: list[tuple[dict, dict]] = []
+        fresh_targets: list[dict] = []
+        for target in draft["targets"]:
+            prior = by_ordinal.get(int(target["ordinal"]))
+            if prior is None:
+                fresh_targets.append(target)
+            elif prior["pose_slug"] == target["pose_slug"]:
+                duplicate_targets.append(target)
+            else:
+                conflicting_targets.append((target, prior))
+        if conflicting_targets:
+            target, prior = conflicting_targets[0]
+            raise HTTPException(
+                409,
+                (
+                    f"Image {int(target['ordinal']):02d} was already exported as "
+                    f"“{prior['pose_label']}”. Remove that output first before "
+                    f"reassigning it to “{target['pose_label']}”."
+                ),
+            )
+        if not fresh_targets:
+            poses = ", ".join(
+                dict.fromkeys(target["pose_label"] for target in duplicate_targets)
+            )
+            raise HTTPException(
+                409,
+                f"Every selected target was already exported{f' for {poses}' if poses else ''}.",
+            )
+        export_draft = {**draft, "targets": fresh_targets}
         job = downloads.enqueue_pose_export(
             gallery_url=gallery_url,
             profile=profile,
-            draft=draft,
+            draft=export_draft,
         )
-        return {"job": downloads.public_job(job)}
+        return {
+            "job": downloads.public_job(job),
+            "duplicates_skipped": len(duplicate_targets),
+        }
 
     @app.get("/api/pose-exports")
     async def list_pose_exports(
@@ -560,9 +685,18 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
             limit=limit,
             offset=offset,
         )
+        output_map = await asyncio.to_thread(
+            pose_outputs_for_urls, [item["gallery_url"] for item in items]
+        )
         page_count = (total + limit - 1) // limit
         return {
-            "items": [decorate_finder_result(item) for item in items],
+            "items": [
+                decorate_finder_result(
+                    item,
+                    output_map.get(gallery_key(item["gallery_url"]), []),
+                )
+                for item in items
+            ],
             "total": total,
             "counts": counts,
             "limit": limit,
@@ -586,8 +720,14 @@ def create_app(app_config: AppConfig | None = None) -> FastAPI:
         )
         scan = finder.get_scan(scan_id) or {}
         pose_tag_id = int((scan.get("pose_tag") or {}).get("id") or 0)
+        output_map = await asyncio.to_thread(
+            pose_outputs_for_urls, [item["gallery_url"]]
+        )
         return {
-            "result": decorate_finder_result(item),
+            "result": decorate_finder_result(
+                item,
+                output_map.get(gallery_key(item["gallery_url"]), []),
+            ),
             "feedback": finder.feedback_status(pose_tag_id),
         }
 

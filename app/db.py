@@ -244,10 +244,26 @@ class Database:
                     FOREIGN KEY (profile) REFERENCES profiles(name)
                         ON UPDATE CASCADE ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS pose_outputs (
+                    gallery_key TEXT NOT NULL,
+                    gallery_url TEXT NOT NULL DEFAULT '',
+                    ordinal INTEGER NOT NULL,
+                    image_url TEXT NOT NULL DEFAULT '',
+                    pose_slug TEXT NOT NULL,
+                    pose_label TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'solo'
+                        CHECK(role IN ('solo', 'couple', 'group')),
+                    profile TEXT NOT NULL DEFAULT '',
+                    job_id TEXT NOT NULL DEFAULT '',
+                    exported_at TEXT NOT NULL,
+                    PRIMARY KEY (gallery_key, ordinal)
+                );
                 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_history_profile ON history(profile, completed_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_profile_images_gallery
                     ON profile_images(profile, gallery_key);
+                CREATE INDEX IF NOT EXISTS idx_pose_outputs_pose
+                    ON pose_outputs(pose_slug, exported_at DESC);
                 """
             )
             job_columns = {
@@ -462,9 +478,49 @@ class Database:
         with self._lock, self.connect() as db:
             return self._rows(
                 db.execute(
-                    "SELECT * FROM pose_tags ORDER BY label COLLATE NOCASE"
+                    """SELECT * FROM pose_tags
+                       ORDER BY updated_at DESC, label COLLATE NOCASE"""
                 ).fetchall()
             )
+
+    def ensure_pose_folder_tags(self, folder_names: list[str]) -> list[dict[str, Any]]:
+        """Import existing first-level pose output folders as reusable tags."""
+
+        candidates: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for folder_name in folder_names:
+            slug = str(folder_name)
+            label = " ".join(slug.split())
+            folded = label.casefold()
+            if (
+                not label
+                or len(label) > 80
+                or slug.startswith(".")
+                or any(ord(character) < 32 for character in slug)
+                or folded in seen
+            ):
+                continue
+            seen.add(folded)
+            candidates.append((label, slug))
+
+        if candidates:
+            now = utc_now()
+            with self._lock, self.connect() as db:
+                rows = db.execute("SELECT label, slug FROM pose_tags").fetchall()
+                labels = {str(row["label"]).casefold() for row in rows}
+                slugs = {str(row["slug"]) for row in rows}
+                for label, slug in candidates:
+                    if label.casefold() in labels or slug in slugs:
+                        continue
+                    db.execute(
+                        """INSERT INTO pose_tags(
+                               label, slug, default_role, created_at, updated_at
+                           ) VALUES (?, ?, 'solo', ?, ?)""",
+                        (label, slug, now, now),
+                    )
+                    labels.add(label.casefold())
+                    slugs.add(slug)
+        return self.list_pose_tags()
 
     def get_pose_tag(self, tag_id: int) -> dict[str, Any] | None:
         with self._lock, self.connect() as db:
@@ -474,7 +530,7 @@ class Database:
             return dict(row) if row else None
 
     def create_pose_tag(self, label: str, default_role: str) -> dict[str, Any]:
-        label = " ".join(label.split())
+        label = " ".join(label.split()).rstrip("/\\").rstrip()
         if not label:
             raise ValueError("Pose label cannot be empty")
         if default_role not in POSE_ROLES:
@@ -497,6 +553,93 @@ class Database:
             tag_id = int(db.execute("SELECT last_insert_rowid()").fetchone()[0])
         return self.get_pose_tag(tag_id) or {}
 
+    def import_pose_outputs(self, records: list[dict[str, Any]]) -> None:
+        """Remember pose files discovered in an existing output library."""
+
+        if not records:
+            return
+        with self._lock, self.connect() as db:
+            db.executemany(
+                """INSERT INTO pose_outputs(
+                       gallery_key, gallery_url, ordinal, image_url, pose_slug,
+                       pose_label, role, profile, job_id, exported_at
+                   ) VALUES (?, '', ?, '', ?, ?, 'solo', '', '', ?)
+                   ON CONFLICT(gallery_key, ordinal) DO NOTHING""",
+                (
+                    (
+                        record["gallery_key"],
+                        int(record["ordinal"]),
+                        record["pose_slug"],
+                        record["pose_label"],
+                        record["exported_at"],
+                    )
+                    for record in records
+                ),
+            )
+
+    def record_pose_outputs(
+        self,
+        gallery_url: str,
+        profile: str,
+        job_id: str,
+        targets: list[dict[str, Any]],
+    ) -> None:
+        if not targets:
+            return
+        key = gallery_key(gallery_url)
+        now = utc_now()
+        with self._lock, self.connect() as db:
+            db.executemany(
+                """INSERT INTO pose_outputs(
+                       gallery_key, gallery_url, ordinal, image_url, pose_slug,
+                       pose_label, role, profile, job_id, exported_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(gallery_key, ordinal) DO UPDATE SET
+                       gallery_url = excluded.gallery_url,
+                       image_url = excluded.image_url,
+                       pose_slug = excluded.pose_slug,
+                       pose_label = excluded.pose_label,
+                       role = excluded.role,
+                       profile = excluded.profile,
+                       job_id = excluded.job_id,
+                       exported_at = excluded.exported_at""",
+                (
+                    (
+                        key,
+                        gallery_url,
+                        int(target["ordinal"]),
+                        target["image_url"],
+                        target["pose_slug"],
+                        target.get("pose_label") or target["pose_slug"],
+                        target.get("role") or "solo",
+                        profile,
+                        job_id,
+                        now,
+                    )
+                    for target in targets
+                ),
+            )
+
+    def pose_outputs_for_urls(
+        self, gallery_urls: list[str]
+    ) -> dict[str, list[dict[str, Any]]]:
+        keys = list(dict.fromkeys(gallery_key(url) for url in gallery_urls))
+        if not keys:
+            return {}
+        placeholders = ",".join("?" for _ in keys)
+        with self._lock, self.connect() as db:
+            rows = db.execute(
+                f"""SELECT * FROM pose_outputs
+                    WHERE gallery_key IN ({placeholders})
+                    ORDER BY exported_at DESC, ordinal""",
+                keys,
+            ).fetchall()
+        result = {key: [] for key in keys}
+        for row in rows:
+            item = dict(row)
+            result[item["gallery_key"]].append(item)
+        return result
+
     def update_pose_tag(
         self,
         tag_id: int,
@@ -506,7 +649,7 @@ class Database:
     ) -> dict[str, Any] | None:
         values: dict[str, Any] = {}
         if label is not None:
-            label = " ".join(label.split())
+            label = " ".join(label.split()).rstrip("/\\").rstrip()
             if not label:
                 raise ValueError("Pose label cannot be empty")
             values["label"] = label
@@ -617,6 +760,16 @@ class Database:
                     now,
                 ),
             )
+            pose_tag_ids = {
+                int(target["pose_tag_id"])
+                for target in targets
+                if target.get("pose_tag_id") is not None
+            }
+            if pose_tag_ids:
+                db.executemany(
+                    "UPDATE pose_tags SET updated_at = ? WHERE id = ?",
+                    ((now, tag_id) for tag_id in pose_tag_ids),
+                )
         return self.get_pose_draft(gallery_url, profile)
 
     def image_statuses(self, profile: str, gallery_url: str) -> set[str]:
